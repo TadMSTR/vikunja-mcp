@@ -15,3 +15,5 @@ htmlcov/
 .coverage
 coverage.xml
 *.log
+core.*
+*.core

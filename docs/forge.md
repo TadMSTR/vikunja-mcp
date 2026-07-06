@@ -26,6 +26,7 @@ the token untouched — it stores nothing.
 
 ```bash
 #!/bin/bash
+set -euo pipefail                     # fail closed if the env file is missing/unreadable
 set -a
 source /opt/appdata/vikunja-mcp/env   # VIKUNJA_URL etc. — NO token here
 set +a
