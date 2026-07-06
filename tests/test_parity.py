@@ -158,6 +158,19 @@ async def test_task_relation_remove_encodes_kind_and_other(_patch_calls):
     assert _patch_calls.call_args.args[:2] == ("DELETE", "/tasks/7/relations/blocking/8")
 
 
+async def test_relation_kind_path_traversal_is_encoded(_patch_calls):
+    # IV-01: a malicious kind must not break out of its path segment.
+    await call(server.task_relation_remove, task_id=7, relation_kind="../../user", other_task_id=8)
+    _, path = _patch_calls.call_args.args[:2]
+    assert "../" not in path
+    assert path == "/tasks/7/relations/..%2F..%2Fuser/8"
+
+
+async def test_team_member_remove_username_is_encoded(_patch_calls):
+    await call(server.team_member_remove, team_id=3, username="a/b")
+    assert _patch_calls.call_args.args[:2] == ("DELETE", "/teams/3/members/a%2Fb")
+
+
 # --- reminders ------------------------------------------------------------
 
 

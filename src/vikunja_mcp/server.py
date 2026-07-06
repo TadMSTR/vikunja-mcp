@@ -22,6 +22,7 @@ import functools
 import inspect
 from collections.abc import Callable
 from typing import Any
+from urllib.parse import quote
 
 import structlog
 from fastmcp import FastMCP
@@ -402,9 +403,11 @@ async def task_relation_add(task_id: int, other_task_id: int, relation_kind: str
 @tool
 async def task_relation_remove(task_id: int, relation_kind: str, other_task_id: int) -> dict:
     """Remove a relation between two tasks. `relation_kind` must match the existing relation."""
+    # relation_kind is a free-text path segment — percent-encode it so a value like
+    # "../.." cannot traverse to a different API path (IV-01).
     return await request(
         "DELETE",
-        f"/tasks/{task_id}/relations/{relation_kind}/{other_task_id}",
+        f"/tasks/{task_id}/relations/{quote(relation_kind, safe='')}/{other_task_id}",
         caller_token(),
     )
 
@@ -553,7 +556,10 @@ async def team_member_add(team_id: int, username: str, admin: bool = False) -> d
 @tool
 async def team_member_remove(team_id: int, username: str) -> dict:
     """Remove a user from a team."""
-    return await request("DELETE", f"/teams/{team_id}/members/{username}", caller_token())
+    # username is a free-text path segment — percent-encode it (IV-01).
+    return await request(
+        "DELETE", f"/teams/{team_id}/members/{quote(username, safe='')}", caller_token()
+    )
 
 
 @tool
