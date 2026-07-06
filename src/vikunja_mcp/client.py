@@ -63,6 +63,7 @@ async def request(
     *,
     params: dict[str, Any] | None = None,
     json: Any = None,
+    files: Any = None,
 ) -> Any:
     """Make one authenticated request to Vikunja and return the decoded JSON.
 
@@ -72,6 +73,8 @@ async def request(
         token: the caller's Vikunja bearer token (see auth.caller_token).
         params: query string parameters.
         json: request body, serialized as JSON.
+        files: multipart file payload (attachment upload). Mutually exclusive with ``json``;
+            when set, httpx encodes a ``multipart/form-data`` body instead of JSON.
 
     Raises:
         VikunjaAPIError: on a network failure (status 0) or any 4xx/5xx response.
@@ -82,7 +85,12 @@ async def request(
     clean_params = {k: v for k, v in (params or {}).items() if v is not None}
     try:
         resp = await client.request(
-            method, path.lstrip("/"), headers=headers, params=clean_params or None, json=json
+            method,
+            path.lstrip("/"),
+            headers=headers,
+            params=clean_params or None,
+            json=json,
+            files=files,
         )
     except httpx.RequestError as exc:
         log.warning("vikunja_request_failed", method=method, path=path, error=str(exc))
