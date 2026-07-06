@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "vikunja-mcp"
-version = "0.1.0"
+version = "0.2.0"
 description = "FastMCP server exposing the Vikunja REST API as scoped, per-agent MCP tools"
 readme = "README.md"
 license = { text = "MIT" }
@@ -31,6 +31,9 @@ dependencies = [
 telemetry = [
     "opentelemetry-sdk>=1.20",
     "opentelemetry-exporter-otlp-proto-grpc>=1.20",
+    # forge runs influxdb:3-core — the v3 write API (imports as influxdb_client_3).
+    "influxdb3-python>=0.9",
+    "nats-py>=2.6",
 ]
 dev = [
     "pytest>=8.0",
