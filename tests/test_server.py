@@ -116,10 +116,11 @@ async def test_filter_create_wraps_query(_patch_calls):
 
 
 async def test_webhook_create_is_project_scoped(_patch_calls):
+    # 8.8.8.8 is a public IP literal → passes the SSRF guard with no DNS lookup.
     await call(
         server.webhook_create,
         project_id=1,
-        target_url="https://hooks.example.com/vikunja",
+        target_url="https://8.8.8.8/vikunja",
         events=["task.created"],
         secret="s3cret",
     )

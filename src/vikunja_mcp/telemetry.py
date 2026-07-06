@@ -171,6 +171,26 @@ async def _nats_publish(tool: str, duration: float, error: str | None) -> None:
 
 _initialized = False
 
+# Strong refs to in-flight fire-and-forget sink tasks. asyncio holds only a weak reference
+# to a bare create_task() result, so without this the task can be GC'd mid-flight and the
+# metric silently dropped (F-03). Tasks discard themselves on completion.
+_bg_tasks: set[asyncio.Task] = set()
+
+
+def _schedule(coro: Any) -> None:
+    """Fire-and-forget a coroutine on the running loop, retaining a strong ref.
+
+    No-op (and closes the coroutine) when no loop is running — e.g. a synchronous caller.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        coro.close()
+        return
+    task = loop.create_task(coro)
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+
 
 def init() -> None:
     """Initialise every enabled backend. Idempotent; safe to call at import time."""
@@ -192,12 +212,15 @@ def _emit(tool: str, duration: float, error: str | None) -> None:
     if error and _errors_counter is not None:
         _errors_counter.add(1, {"tool": tool, "error": error})
 
-    _influx_write(tool, duration, error)
+    # InfluxDB's write() is synchronous and blocking — offload it to a worker thread so a
+    # slow/hung endpoint can't stall the event loop (and every concurrent tool call) behind
+    # it (F-01). Skipped cleanly when the sink is disabled or no loop is running.
+    if _influx_client is not None:
+        _schedule(asyncio.to_thread(_influx_write, tool, duration, error))
 
-    # NATS publish is async; schedule it fire-and-forget if a loop is running.
+    # NATS publish is async; schedule it fire-and-forget on the running loop.
     if os.getenv("VIKUNJA_NATS_URL", "").strip():
-        with contextlib.suppress(RuntimeError):
-            asyncio.get_running_loop().create_task(_nats_publish(tool, duration, error))
+        _schedule(_nats_publish(tool, duration, error))
 
 
 @contextlib.asynccontextmanager

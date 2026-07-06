@@ -18,11 +18,14 @@ Permission integers used by the sharing tools follow Vikunja's ``Right``:
 from __future__ import annotations
 
 import base64
+import binascii
 import functools
 import inspect
+import ipaddress
+import socket
 from collections.abc import Callable
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import structlog
 from fastmcp import FastMCP
@@ -31,6 +34,7 @@ from . import __version__, telemetry
 from .auth import caller_token
 from .client import request
 from .config import get_settings
+from .exceptions import VikunjaAPIError
 from .hooks import run_after_hooks, run_before_hooks
 
 # ---------------------------------------------------------------------------
@@ -93,6 +97,69 @@ def _drop_none(**fields: Any) -> dict[str, Any]:
     untouched; sending it as null would clobber it. Keep only non-None values.
     """
     return {k: v for k, v in fields.items() if v is not None}
+
+
+# Base64 attachment size ceiling — reject before decoding a huge blob into memory (F-04).
+_MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
+
+# Hostname suffixes that only ever name internal resources — refuse webhook delivery there.
+_INTERNAL_HOST_SUFFIXES = (".local", ".internal", ".lan", ".home", ".corp")
+
+
+def _ip_is_blocked(ip: ipaddress._BaseAddress) -> bool:
+    """True if an address is non-routable / internal and unsafe as a webhook target."""
+    return (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_reserved
+        or ip.is_multicast
+        or ip.is_unspecified
+    )
+
+
+def _host_is_blocked(host: str) -> bool:
+    """True if a webhook host is loopback/private/link-local/internal (SSRF guard, F-02)."""
+    h = host.strip().rstrip(".").lower().strip("[]")
+    if not h or h == "localhost" or h.endswith(_INTERNAL_HOST_SUFFIXES):
+        return True
+    try:
+        return _ip_is_blocked(ipaddress.ip_address(h))
+    except ValueError:
+        pass  # not an IP literal — it's a hostname; resolve it best-effort below
+    try:
+        infos = socket.getaddrinfo(h, None)
+    except OSError:
+        # Unresolvable here — can't classify; Vikunja re-resolves at delivery. Allow.
+        return False
+    for info in infos:
+        addr = info[4][0].split("%")[0]  # strip any zone id
+        try:
+            if _ip_is_blocked(ipaddress.ip_address(addr)):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def _validate_webhook_target(url: str) -> None:
+    """Reject a webhook target_url that points at an internal address (SSRF guard, F-02).
+
+    The MCP enforces this independently of Vikunja's own outgoing-request filter, which is
+    disabled in the forge deployment (`OUTGOINGREQUESTS_ALLOWNONROUTABLEIPS=true`).
+    """
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise VikunjaAPIError(
+            0, f"webhook target_url must be http(s); got scheme {parsed.scheme!r}"
+        )
+    host = parsed.hostname
+    if not host or _host_is_blocked(host):
+        raise VikunjaAPIError(
+            0,
+            f"webhook target_url host {host!r} is loopback/private/link-local/internal and "
+            "is refused (SSRF guard). Use a public SWAG hostname.",
+        )
 
 
 # ===========================================================================
@@ -445,7 +512,13 @@ async def attachment_upload(task_id: int, filename: str, content_base64: str) ->
 
     `content_base64` is the file's bytes, base64-encoded (keeps the transport JSON-safe).
     """
-    raw = base64.b64decode(content_base64)
+    # Reject before decoding so a huge payload can't be inflated into memory (F-04).
+    if len(content_base64) > _MAX_ATTACHMENT_BYTES // 3 * 4 + 4:
+        raise VikunjaAPIError(0, "attachment exceeds the 25 MiB size limit")
+    try:
+        raw = base64.b64decode(content_base64, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise VikunjaAPIError(0, f"attachment content is not valid base64: {exc}") from exc
     files = {"files": (filename, raw)}
     return await request("PUT", f"/tasks/{task_id}/attachments", caller_token(), files=files)
 
@@ -662,6 +735,14 @@ async def project_share_create(
     `permission`: 0=read, 1=write, 2=admin. `sharing_type`: 0=without-password,
     1=with-password, 2=authenticated. Set `password` when `sharing_type=1`.
     """
+    # Couple password and sharing_type so a share can't end up less protected than intended
+    # (F-05): with-password requires a password; a password with any other type is a mistake.
+    if sharing_type == 1 and not password:
+        raise VikunjaAPIError(0, "sharing_type=1 (with-password) requires a non-empty password")
+    if password and sharing_type != 1:
+        raise VikunjaAPIError(
+            0, "a password is only meaningful with sharing_type=1 (with-password)"
+        )
     body = _drop_none(
         permission=permission,
         password=password or None,
@@ -833,6 +914,7 @@ async def webhook_create(
     never a raw internal IP. `secret` is the HMAC key Vikunja signs deliveries with
     (X-Vikunja-Signature) — set it so the listener can verify authenticity.
     """
+    _validate_webhook_target(target_url)
     body = _drop_none(target_url=target_url, events=events, secret=secret or None)
     return await request("PUT", f"/projects/{project_id}/webhooks", caller_token(), json=body)
 

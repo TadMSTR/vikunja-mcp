@@ -41,6 +41,20 @@ All notable changes to this project are documented here. Format follows
 ### Changed
 - `client.request` gained a `files` parameter for multipart attachment uploads.
 
+### Security
+Remediations from the pre-merge security audit (0C/0H/1M/1L/3Info):
+- **webhook_create** now enforces an MCP-side SSRF guard — rejects `target_url` hosts that
+  are loopback/RFC1918/link-local/reserved or `.local`/`.internal` (resolving hostnames
+  best-effort), independent of Vikunja's own outgoing-request filter (F-02, Medium).
+- Telemetry: the blocking InfluxDB write is offloaded to a worker thread so a hung endpoint
+  can't stall the event loop; fire-and-forget sink tasks are retained to avoid GC dropping
+  them (F-01/F-03).
+- **attachment_upload** validates base64 (`binascii.Error` → `VikunjaAPIError`) and caps
+  decoded size at 25 MiB (F-04).
+- **project_share_create** couples `password`↔`sharing_type` so a share can't be created
+  weaker than intended (F-05).
+- Path-segment encoding for `relation_kind`/`username` (IV-01, from the pre-audit baseline).
+
 ### Notes
 - Vikunja exposes **no** `GET /filters` list endpoint; saved filters appear as pseudo-
   projects (negative IDs) via `project_list`, so no `filter_list` tool was added.
