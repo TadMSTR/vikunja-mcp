@@ -1,9 +1,9 @@
-# Vikunja structure — project taxonomy contract (proposal)
+# Vikunja structure — project taxonomy contract
 
-**Status:** proposed (Phase D design, `vikunja-mcp-capability` build 2026-07-06). No code
-depends on this yet. Intended to be published to `host-forge/vikunja-structure.md` (qmd) as
-the **single source of truth** once ratified, so both the MCP provisioning tools (Phase B)
-and the future CloudCLI plugin read the same contract and cannot drift.
+**Status:** RATIFIED (2026-07-07, decided in-session with research; provisioned
+2026-07-14, build task `60b7a44b`). Published to `host-forge/vikunja-structure.md` (qmd)
+as the **single source of truth**, so both the MCP provisioning tools (Phase B) and the
+future CloudCLI plugin read the same contract and cannot drift.
 
 > Data-plane decision (locked): the CloudCLI plugin talks **directly to the Vikunja REST
 > API**, not through vikunja-mcp. The MCP is the agent interface; the plugin is the human
@@ -11,39 +11,26 @@ and the future CloudCLI plugin read the same contract and cannot drift.
 
 ## 1. Project taxonomy
 
-One Vikunja project per tracked unit, mirroring the Plane project set
-(`host-forge/plane-projects.md`). Group them under parent projects that match the Plane
-sections:
+**Flat model — one shared project, not a per-repo hierarchy.** The PROPOSED
+project-per-repo taxonomy (parent projects mirroring the Plane project set) was rejected:
+Vikunja isn't scoped to code-repo work the way Plane is — it's the general place any agent
+opens an item for anything forge/homelab-agent related (infra, ops, ideas, docs, code)
+without a per-repo provisioning step.
 
-```
-Repos — Personal        (parent)
-  ├─ agent-bus
-  ├─ dockhand-mcp
-  └─ … one child per ~/repos/personal/ repo
-Repos — Gitea           (parent)
-Infrastructure          (parent)   e.g. sandbox-db
-Upstream                (parent)   e.g. plane-mcp-server
-```
+One shared project: **`Homelab-Agent`** (id 7). Writable by all agent roles via the
+`agents-write` team (§5). Covers everything — no sub-project split by domain.
 
-Provisioning uses `project_create(parent_project_id=…)` for the children and
-`project_team_add` / `project_user_add` to grant agents access (see §5).
+Per-agent personal Inboxes (each agent has its own — e.g. developer = project id 3) are
+kept as-is, untouched by this taxonomy. No defined use case yet.
 
-## 2. Identifier scheme
+Child projects (Vikunja supports real parent/child hierarchy) are reserved **only** for
+genuinely large multi-phase efforts. None are pre-created — add one later only if a
+specific effort needs it.
 
-Vikunja has no native `PROJ-N` identifier. Preserve the existing **5-char uppercase Plane
-codes** (`AGBUS`, `DHAND`, `GHOST`, …) as the canonical cross-system identifier so links
-and references survive the migration:
+## 2. Label set
 
-- Store the code as a **prefix in the project title**: `"[DHAND] dockhand mcp"`.
-- Keep the mapping table (code → Vikunja project id) in this doc, updated on each new
-  project. `project_list` is the runtime lookup.
-- New projects allocate the next code following the current convention (short, unique,
-  uppercase, memorable).
-
-## 3. Label set
-
-A fixed label vocabulary, created once via `label_create` and attached with
-`task_label_add`. Hex colours are advisory.
+Existing label vocabulary, created via `label_create` and attached with `task_label_add`.
+Hex colours are advisory.
 
 | Label | Purpose | Hex |
 |-------|---------|-----|
@@ -54,46 +41,43 @@ A fixed label vocabulary, created once via `label_create` and attached with
 | `type:security` | security finding | `b23c17` |
 | `agent-filed` | opened by an agent, not a human | `f4b400` |
 | `blocked` | waiting on an external dependency | `ea4335` |
+| `source:github` | task relates to a GitHub-hosted code repo | `2088ff` |
+| `source:gitea` | task relates to a Gitea-hosted docs/config repo | `609926` |
+
+Absence of a `source:*` label means a pure homelab/infra/ops item with no repo attached.
+Per-repo labels (e.g. `repo:vikunja-mcp`) are **not** pre-provisioned — create ad hoc, on
+demand, only if filtering by a specific repo is actually needed.
 
 Priority is **not** a label — it maps to Vikunja's native task priority integer
 (0=unset … 5=DO NOW), set via `task_create`/`task_update`. Plane priority → Vikunja:
 `urgent→4/5, high→3, medium→2, low→1`.
 
-## 4. Views & buckets (kanban)
+## 3. Views & buckets (kanban)
 
-Each project keeps Vikunja's four auto-created views (`list`, `gantt`, `table`, `kanban`).
-The **kanban** view carries the workflow, mapping Plane states → buckets in this order:
+Use Vikunja's auto-created default kanban columns as-is — no custom bucket set, no
+Plane-state-to-bucket mapping, no `In Review` bucket. If a code task needs a "PR open"
+signal, the PR itself is the source of truth; that state is not duplicated in Vikunja.
 
-| Bucket (column) | Maps from Plane state |
-|-----------------|-----------------------|
-| `Backlog` | Backlog |
-| `Todo` | Unstarted / Todo |
-| `In Progress` | Started |
-| `In Review` | *(new — PR open)* |
-| `Done` | Completed → **done-bucket** |
-| `Cancelled` | Cancelled |
+## 4. Sharing & roles
 
-Set `Done` as the view's done-bucket via `view_update(done_bucket_id=…)` so dropping a task
-there marks it complete. Buckets are created with `bucket_create`; status changes on
-migration/automation use `task_bucket_move`.
+Projects are shared to agents by **team**, not per-user, so role changes are one edit.
+Provisioned 2026-07-14 (build task `60b7a44b`):
 
-## 5. Sharing & roles
+| Team | Vikunja team id | Permission (`Right`) | Members |
+|------|-----------------|-----------------------|---------|
+| `agents-read` | 1 | 0 (read) | security, writer |
+| `agents-write` | 2 | 1 (write) | research, developer, writer |
+| `agents-admin` | 3 | 2 (admin) | sysadmin |
 
-Projects are shared to agents by **team**, not per-user, so role changes are one edit:
-
-| Team | Permission (Vikunja `Right`) | Members |
-|------|------------------------------|---------|
-| `agents-read` | 0 (read) | security, writer (read scope) |
-| `agents-write` | 1 (write) | research, developer, writer |
-| `agents-admin` | 2 (admin) | sysadmin |
+`Homelab-Agent` (project id 7) is shared to `agents-write`. Team creators are
+auto-added as team admin by Vikunja on `team_create` — developer (who provisioned these
+teams) is an admin member of all three in addition to the roles listed above.
 
 Provision with `team_create` + `team_member_add`, then `project_team_add(project_id,
-team_id, permission)`. Link shares (`project_share_create`) are reserved for external,
-human, read-only access and must set a password (`sharing_type=1`) — never used for agents.
+team_id, permission)`. Note: Vikunja Personal Access Tokens are scoped per route-group at
+creation — `teams`, `projects_teams`, and `teams_members` are three **separate** scope
+groups that must each be explicitly granted, or the corresponding endpoints 401 even with
+an otherwise-valid token (see `HLAGNT-9`/`HLAGNT-10`).
 
-## 6. Open questions (resolve before ratifying)
-
-- Confirm the parent-project grouping is desired vs. a flat list + a `type:` label.
-- Decide whether the `[CODE]` title prefix or a dedicated saved filter is the primary way
-  humans navigate by identifier.
-- Confirm the `In Review` bucket is wanted (no Plane equivalent — it is new workflow).
+Link shares (`project_share_create`) are reserved for external, human, read-only access
+and must set a password (`sharing_type=1`) — never used for agents.
