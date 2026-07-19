@@ -6,6 +6,8 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.2.2] — 2026-07-19
+
 ### Fixed
 - **Task/project descriptions and comments now render correctly.** Vikunja's description
   and comment fields are HTML (TipTap), not markdown — agent-authored markdown (`##`
