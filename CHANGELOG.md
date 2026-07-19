@@ -6,6 +6,13 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+### Fixed
+- **task_update / task_reminders_set no longer wipe untouched fields.** Vikunja's
+  `POST /tasks/{id}` is a full replace, not a merge-patch; a partial call silently reset
+  description/priority/due_date/percent_done (and title) to their zero values. Both tools
+  now read-merge-write: fetch the task, overlay the changed fields, re-post the full
+  object. (ticket #173 / task 183)
+
 ## [0.2.1]
 
 ### Fixed
