@@ -12,6 +12,11 @@ All notable changes to this project are documented here. Format follows
   headers, `- ` lists, blank-line paragraphs) was being stored and displayed verbatim,
   producing an unreadable wall of text. `task_create`/`task_update`/`comment_create`/
   `project_create`/`project_update` now convert markdown to HTML before writing.
+- **task_update / task_reminders_set no longer wipe untouched fields.** Vikunja's
+  `POST /tasks/{id}` is a full replace, not a merge-patch; a partial call silently reset
+  description/priority/due_date/percent_done (and title) to their zero values. Both tools
+  now read-merge-write: fetch the task, overlay the changed fields, re-post the full
+  object. (ticket #173 / task 183)
 
 ### Security
 - **Sanitize markdown-converted HTML before writing to Vikunja.** Python-Markdown passes

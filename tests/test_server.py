@@ -63,10 +63,22 @@ async def test_task_create_targets_project_subpath_with_put(_patch_calls):
     assert _patch_calls.call_args.kwargs["json"] == {"title": "Ship it", "priority": 4}
 
 
-async def test_task_update_marks_done_via_post(_patch_calls):
+async def test_task_update_reads_merges_writes_full_body(_patch_calls):
+    # GET returns the current task; the POST must carry the *merged* full object so
+    # description/priority survive a done-only update (regression for ticket #173).
+    current = {"id": 5, "title": "Ship it", "description": "keep me", "priority": 4, "done": False}
+    _patch_calls.side_effect = [current, {"ok": True}]
+
     await call(server.task_update, task_id=5, done=True)
-    assert _patch_calls.call_args.args[:2] == ("POST", "/tasks/5")
-    assert _patch_calls.call_args.kwargs["json"] == {"done": True}
+
+    assert _patch_calls.call_count == 2
+    get_call, post_call = _patch_calls.call_args_list
+    assert get_call.args[:2] == ("GET", "/tasks/5")
+    assert post_call.args[:2] == ("POST", "/tasks/5")
+    body = post_call.kwargs["json"]
+    assert body["done"] is True
+    assert body["description"] == "keep me"  # preserved, not wiped
+    assert body["priority"] == 4  # preserved, not wiped
 
 
 async def test_task_search_uses_s_param(_patch_calls):

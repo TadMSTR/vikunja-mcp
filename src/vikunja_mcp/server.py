@@ -95,8 +95,11 @@ def tool(fn: Callable[..., Any]) -> Callable[..., Any]:
 def _drop_none(**fields: Any) -> dict[str, Any]:
     """Build a request body from only the fields the caller actually supplied.
 
-    Vikunja's update endpoints merge the posted object, so omitting a field leaves it
-    untouched; sending it as null would clobber it. Keep only non-None values.
+    Vikunja's *generic* update endpoints (projects, labels, teams, filters, views,
+    buckets) only write the fields present in the posted object, so omitting a field
+    leaves it untouched. NOTE: the **task** update endpoint (`POST /tasks/{id}`) is the
+    exception — it is a full replace. Task writes must not rely on this helper alone;
+    see ``_apply_task_update``.
     """
     return {k: v for k, v in fields.items() if v is not None}
 
@@ -121,6 +124,30 @@ def _md_to_html(text: str | None) -> str | None:
         return text
     html = _markdown_lib.markdown(text, extensions=["fenced_code", "nl2br"])
     return nh3.clean(html)
+
+
+async def _apply_task_update(task_id: int, token: str, changes: dict[str, Any]) -> dict:
+    """Merge ``changes`` over the current task and POST the full object.
+
+    Vikunja's ``POST /tasks/{id}`` is a **full replace**: any column the body omits is
+    reset to its zero value. Unlike the generic project/label/etc. update endpoints, a
+    partial POST here silently wipes untouched fields (ticket #173 / task 183). To honor
+    the partial-update contract, fetch the task, overlay the caller's changed fields, and
+    re-post the whole object so untouched columns survive.
+    """
+    # SECURITY[accepted]: GET-then-POST TOCTOU window — a concurrent writer's change to
+    # this task between our GET and re-POST is silently overwritten by our stale re-post.
+    # Accepted given forge's low-concurrency, agent-driven, per-agent-token write pattern;
+    # no locking/ETag/version check added. Revisit if forge moves to higher-concurrency
+    # multi-agent writes on shared tasks, or Vikunja exposes cheap If-Match support.
+    # Audit: 2026-07-19/vikunja-mcp-task-update-full-replace-2026-07.
+    if not changes:
+        return await request("GET", f"/tasks/{task_id}", token)
+    current = await request("GET", f"/tasks/{task_id}", token)
+    if not isinstance(current, dict):
+        return await request("POST", f"/tasks/{task_id}", token, json=changes)
+    current.update(changes)
+    return await request("POST", f"/tasks/{task_id}", token, json=current)
 
 
 # Base64 attachment size ceiling — reject before decoding a huge blob into memory (F-04).
@@ -336,8 +363,12 @@ async def task_update(
     due_date: str | None = None,
     percent_done: float | None = None,
 ) -> dict:
-    """Update a task. Only the fields you pass change. Set `done=true` to complete it."""
-    body = _drop_none(
+    """Update a task. Only the fields you pass change. Set `done=true` to complete it.
+
+    Implemented as read-merge-write: Vikunja's task endpoint is a full replace, so we
+    fetch the task and overlay your fields before posting (see ``_apply_task_update``).
+    """
+    changes = _drop_none(
         title=title,
         description=_md_to_html(description),
         done=done,
@@ -345,7 +376,7 @@ async def task_update(
         due_date=due_date,
         percent_done=percent_done,
     )
-    return await request("POST", f"/tasks/{task_id}", caller_token(), json=body)
+    return await _apply_task_update(task_id, caller_token(), changes)
 
 
 @tool
@@ -518,11 +549,12 @@ async def task_relation_remove(task_id: int, relation_kind: str, other_task_id: 
 async def task_reminders_set(task_id: int, reminders: list[str]) -> dict:
     """Set a task's reminders. `reminders` is a list of RFC3339 timestamps.
 
-    This replaces the task's reminder set (Vikunja stores reminders on the task object).
-    Pass an empty list to clear all reminders.
+    Replaces the task's reminder set (Vikunja stores reminders on the task object). Pass
+    an empty list to clear all reminders. Read-merge-write so the task's other fields are
+    preserved — the task endpoint is a full replace (see ``_apply_task_update``).
     """
-    body = {"reminders": [{"reminder": r} for r in reminders]}
-    return await request("POST", f"/tasks/{task_id}", caller_token(), json=body)
+    changes = {"reminders": [{"reminder": r} for r in reminders]}
+    return await _apply_task_update(task_id, caller_token(), changes)
 
 
 # ===========================================================================
