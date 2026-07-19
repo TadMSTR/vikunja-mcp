@@ -100,7 +100,53 @@ async def test_task_label_add_sends_label_id(_patch_calls):
 async def test_comment_create(_patch_calls):
     await call(server.comment_create, task_id=4, comment="looks good")
     assert _patch_calls.call_args.args[:2] == ("PUT", "/tasks/4/comments")
-    assert _patch_calls.call_args.kwargs["json"] == {"comment": "looks good"}
+    # comment is converted to Vikunja's HTML rich-text format on the way in.
+    assert _patch_calls.call_args.kwargs["json"] == {"comment": "<p>looks good</p>"}
+
+
+async def test_comment_create_converts_markdown(_patch_calls):
+    await call(server.comment_create, task_id=4, comment="- a\n- b")
+    body = _patch_calls.call_args.kwargs["json"]
+    assert "<li>a</li>" in body["comment"]
+    assert "<li>b</li>" in body["comment"]
+
+
+# --- markdown-to-HTML conversion -------------------------------------------
+
+
+def test_md_to_html_converts_headers_and_lists():
+    html = server._md_to_html("## Context\nsomething\n\n- one\n- two")
+    assert "<h2>Context</h2>" in html
+    assert "<li>one</li>" in html
+
+
+def test_md_to_html_passthrough_for_none_and_empty():
+    assert server._md_to_html(None) is None
+    assert server._md_to_html("") == ""
+
+
+async def test_task_create_converts_description(_patch_calls):
+    await call(server.task_create, project_id=1, title="T", description="## H\nbody")
+    body = _patch_calls.call_args.kwargs["json"]
+    assert "<h2>H</h2>" in body["description"]
+
+
+async def test_task_update_converts_description(_patch_calls):
+    await call(server.task_update, task_id=5, description="## H\nbody")
+    body = _patch_calls.call_args.kwargs["json"]
+    assert "<h2>H</h2>" in body["description"]
+
+
+async def test_project_create_converts_description(_patch_calls):
+    await call(server.project_create, title="Roadmap", description="## H\nbody")
+    body = _patch_calls.call_args.kwargs["json"]
+    assert "<h2>H</h2>" in body["description"]
+
+
+async def test_project_update_converts_description(_patch_calls):
+    await call(server.project_update, project_id=3, description="## H\nbody")
+    body = _patch_calls.call_args.kwargs["json"]
+    assert "<h2>H</h2>" in body["description"]
 
 
 # --- filters --------------------------------------------------------------

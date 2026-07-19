@@ -6,6 +6,13 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+### Fixed
+- **Task/project descriptions and comments now render correctly.** Vikunja's description
+  and comment fields are HTML (TipTap), not markdown — agent-authored markdown (`##`
+  headers, `- ` lists, blank-line paragraphs) was being stored and displayed verbatim,
+  producing an unreadable wall of text. `task_create`/`task_update`/`comment_create`/
+  `project_create`/`project_update` now convert markdown to HTML before writing.
+
 ## [0.2.1]
 
 ### Fixed

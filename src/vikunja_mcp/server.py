@@ -27,6 +27,7 @@ from collections.abc import Callable
 from typing import Any
 from urllib.parse import quote, urlparse
 
+import markdown as _markdown_lib
 import structlog
 from fastmcp import FastMCP
 
@@ -97,6 +98,19 @@ def _drop_none(**fields: Any) -> dict[str, Any]:
     untouched; sending it as null would clobber it. Keep only non-None values.
     """
     return {k: v for k, v in fields.items() if v is not None}
+
+
+def _md_to_html(text: str | None) -> str | None:
+    """Render markdown to the HTML Vikunja's rich-text fields expect.
+
+    Vikunja's task/project description and comment fields are TipTap rich text (HTML),
+    not markdown — a raw markdown string stored verbatim renders as literal `##`/`-`
+    characters with collapsed whitespace (no <p>/<h2>/<br> tags). Agents author these
+    fields in plain markdown, so convert on the way in.
+    """
+    if not text:
+        return text
+    return _markdown_lib.markdown(text, extensions=["fenced_code", "nl2br"])
 
 
 # Base64 attachment size ceiling — reject before decoding a huge blob into memory (F-04).
@@ -213,7 +227,7 @@ async def project_create(
     """Create a new project. `title` is required."""
     body = _drop_none(
         title=title,
-        description=description or None,
+        description=_md_to_html(description) or None,
         parent_project_id=parent_project_id,
         hex_color=hex_color or None,
     )
@@ -230,7 +244,10 @@ async def project_update(
 ) -> dict:
     """Update a project. Only the fields you pass are changed."""
     body = _drop_none(
-        title=title, description=description, hex_color=hex_color, is_archived=is_archived
+        title=title,
+        description=_md_to_html(description),
+        hex_color=hex_color,
+        is_archived=is_archived,
     )
     return await request("POST", f"/projects/{project_id}", caller_token(), json=body)
 
@@ -292,7 +309,7 @@ async def task_create(
     """Create a task in a project. `title` is required. `due_date` is RFC3339 (or omit)."""
     body = _drop_none(
         title=title,
-        description=description or None,
+        description=_md_to_html(description) or None,
         priority=priority,
         due_date=due_date or None,
     )
@@ -312,7 +329,7 @@ async def task_update(
     """Update a task. Only the fields you pass change. Set `done=true` to complete it."""
     body = _drop_none(
         title=title,
-        description=description,
+        description=_md_to_html(description),
         done=done,
         priority=priority,
         due_date=due_date,
@@ -408,9 +425,12 @@ async def comment_list(task_id: int) -> Any:
 
 @tool
 async def comment_create(task_id: int, comment: str) -> dict:
-    """Add a comment to a task. `comment` may contain HTML."""
+    """Add a comment to a task. `comment` may contain markdown or HTML."""
     return await request(
-        "PUT", f"/tasks/{task_id}/comments", caller_token(), json={"comment": comment}
+        "PUT",
+        f"/tasks/{task_id}/comments",
+        caller_token(),
+        json={"comment": _md_to_html(comment)},
     )
 
 
