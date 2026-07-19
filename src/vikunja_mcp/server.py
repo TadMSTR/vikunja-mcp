@@ -111,6 +111,12 @@ async def _apply_task_update(task_id: int, token: str, changes: dict[str, Any]) 
     the partial-update contract, fetch the task, overlay the caller's changed fields, and
     re-post the whole object so untouched columns survive.
     """
+    # SECURITY[accepted]: GET-then-POST TOCTOU window — a concurrent writer's change to
+    # this task between our GET and re-POST is silently overwritten by our stale re-post.
+    # Accepted given forge's low-concurrency, agent-driven, per-agent-token write pattern;
+    # no locking/ETag/version check added. Revisit if forge moves to higher-concurrency
+    # multi-agent writes on shared tasks, or Vikunja exposes cheap If-Match support.
+    # Audit: 2026-07-19/vikunja-mcp-task-update-full-replace-2026-07.
     if not changes:
         return await request("GET", f"/tasks/{task_id}", token)
     current = await request("GET", f"/tasks/{task_id}", token)
