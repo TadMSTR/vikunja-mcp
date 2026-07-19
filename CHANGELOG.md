@@ -6,6 +6,13 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.2.1]
+
+### Fixed
+- `label_update()` sent `PUT /labels/{id}`, which Vikunja 2.3.0 rejects with 405 at the
+  router (before auth). Changed to `POST`, matching every other update-by-id route.
+  `label_create` (`PUT /labels`) was unaffected. (#4)
+
 ## [0.2.0]
 
 ### Added
