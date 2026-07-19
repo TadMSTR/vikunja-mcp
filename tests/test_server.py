@@ -125,6 +125,14 @@ def test_md_to_html_passthrough_for_none_and_empty():
     assert server._md_to_html("") == ""
 
 
+def test_md_to_html_strips_script_and_event_handlers():
+    # Regression for the audit's stored-XSS finding: Python-Markdown passes embedded raw
+    # HTML through unmodified, so _md_to_html must sanitize the rendered output.
+    html = server._md_to_html("<script>alert(1)</script>\n\n<img src=x onerror=alert(1)>")
+    assert "<script>" not in html
+    assert "onerror" not in html
+
+
 async def test_task_create_converts_description(_patch_calls):
     await call(server.task_create, project_id=1, title="T", description="## H\nbody")
     body = _patch_calls.call_args.kwargs["json"]

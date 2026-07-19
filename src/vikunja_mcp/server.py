@@ -28,6 +28,7 @@ from typing import Any
 from urllib.parse import quote, urlparse
 
 import markdown as _markdown_lib
+import nh3
 import structlog
 from fastmcp import FastMCP
 
@@ -107,10 +108,19 @@ def _md_to_html(text: str | None) -> str | None:
     not markdown — a raw markdown string stored verbatim renders as literal `##`/`-`
     characters with collapsed whitespace (no <p>/<h2>/<br> tags). Agents author these
     fields in plain markdown, so convert on the way in.
+
+    # SECURITY[control]: Python-Markdown passes embedded raw HTML through unmodified (no
+    # safe_mode since 3.0) — `<script>`, `onerror=`, etc. would otherwise be stored
+    # verbatim and execute in whoever's browser next opens the task in Vikunja's TipTap
+    # UI. `nh3.clean()` (allowlist-based, Rust `ammonia` bindings) strips disallowed
+    # tags/attributes (script, event handlers, javascript: URLs) while preserving the
+    # structural HTML markdown legitimately produces. Audit: 2026-07-19/
+    # vikunja-mcp-markdown-html-render-2026-07.
     """
     if not text:
         return text
-    return _markdown_lib.markdown(text, extensions=["fenced_code", "nl2br"])
+    html = _markdown_lib.markdown(text, extensions=["fenced_code", "nl2br"])
+    return nh3.clean(html)
 
 
 # Base64 attachment size ceiling — reject before decoding a huge blob into memory (F-04).
