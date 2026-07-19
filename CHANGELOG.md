@@ -7,11 +7,26 @@ All notable changes to this project are documented here. Format follows
 ## [Unreleased]
 
 ### Fixed
+- **Task/project descriptions and comments now render correctly.** Vikunja's description
+  and comment fields are HTML (TipTap), not markdown — agent-authored markdown (`##`
+  headers, `- ` lists, blank-line paragraphs) was being stored and displayed verbatim,
+  producing an unreadable wall of text. `task_create`/`task_update`/`comment_create`/
+  `project_create`/`project_update` now convert markdown to HTML before writing.
 - **task_update / task_reminders_set no longer wipe untouched fields.** Vikunja's
   `POST /tasks/{id}` is a full replace, not a merge-patch; a partial call silently reset
   description/priority/due_date/percent_done (and title) to their zero values. Both tools
   now read-merge-write: fetch the task, overlay the changed fields, re-post the full
   object. (ticket #173 / task 183)
+
+### Security
+- **Sanitize markdown-converted HTML before writing to Vikunja.** Python-Markdown passes
+  embedded raw HTML through unmodified (no `safe_mode` since 3.0), so `_md_to_html()`
+  could be used to store `<script>`/event-handler HTML that executes in whoever's browser
+  next opens the task. Output is now run through `nh3.clean()` (allowlist-based) before
+  being written.
+- Bumped `markdown` dependency floor to `>=3.8.1` — versions up to 3.8 are affected by
+  CVE-2025-69534 (GHSA-5wmx-573v-2qwq), an unauthenticated DoS via malformed HTML-like
+  markdown input.
 
 ## [0.2.1]
 
