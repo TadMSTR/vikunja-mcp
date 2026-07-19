@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "vikunja-mcp"
-version = "0.2.0"
+version = "0.2.2"
 description = "FastMCP server exposing the Vikunja REST API as scoped, per-agent MCP tools"
 readme = "README.md"
 license = { text = "MIT" }
