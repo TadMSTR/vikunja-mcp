@@ -154,7 +154,7 @@ async def test_whoami(_patch_calls):
         (server.task_get, {"task_id": 2}, ("GET", "/tasks/2")),
         (server.task_list, {}, ("GET", "/tasks")),
         (server.label_get, {"label_id": 3}, ("GET", "/labels/3")),
-        (server.label_update, {"label_id": 3, "title": "x"}, ("PUT", "/labels/3")),
+        (server.label_update, {"label_id": 3, "title": "x"}, ("POST", "/labels/3")),
         (server.label_delete, {"label_id": 3}, ("DELETE", "/labels/3")),
         (server.label_list, {}, ("GET", "/labels")),
         (server.task_label_remove, {"task_id": 2, "label_id": 3}, ("DELETE", "/tasks/2/labels/3")),

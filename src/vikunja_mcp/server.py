@@ -372,7 +372,7 @@ async def label_update(
 ) -> dict:
     """Update a label. Only the fields you pass change."""
     body = _drop_none(title=title, description=description, hex_color=hex_color)
-    return await request("PUT", f"/labels/{label_id}", caller_token(), json=body)
+    return await request("POST", f"/labels/{label_id}", caller_token(), json=body)
 
 
 @tool
