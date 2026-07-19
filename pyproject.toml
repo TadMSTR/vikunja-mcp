@@ -25,7 +25,7 @@ dependencies = [
     "pydantic>=2.0",
     "pydantic-settings>=2.0",
     "structlog>=24.0",
-    "markdown>=3.6",
+    "markdown>=3.8.1",
 ]
 
 [project.optional-dependencies]
