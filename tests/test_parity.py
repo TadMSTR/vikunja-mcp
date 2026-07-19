@@ -174,12 +174,43 @@ async def test_team_member_remove_username_is_encoded(_patch_calls):
 # --- reminders ------------------------------------------------------------
 
 
-async def test_task_reminders_set_wraps_timestamps(_patch_calls):
+async def test_task_reminders_set_preserves_other_fields(_patch_calls):
+    current = {"id": 7, "title": "T", "description": "keep me", "priority": 3}
+    _patch_calls.side_effect = [current, {"ok": True}]
+
     await call(server.task_reminders_set, task_id=7, reminders=["2026-07-10T09:00:00Z"])
-    assert _patch_calls.call_args.args[:2] == ("POST", "/tasks/7")
-    assert _patch_calls.call_args.kwargs["json"] == {
-        "reminders": [{"reminder": "2026-07-10T09:00:00Z"}]
-    }
+
+    get_call, post_call = _patch_calls.call_args_list
+    assert get_call.args[:2] == ("GET", "/tasks/7")
+    assert post_call.args[:2] == ("POST", "/tasks/7")
+    body = post_call.kwargs["json"]
+    assert body["reminders"] == [{"reminder": "2026-07-10T09:00:00Z"}]
+    assert body["description"] == "keep me"  # preserved
+
+
+async def test_task_reminders_set_empty_clears_and_preserves(_patch_calls):
+    current = {"id": 7, "title": "T", "description": "keep me", "reminders": [{"reminder": "x"}]}
+    _patch_calls.side_effect = [current, {"ok": True}]
+
+    await call(server.task_reminders_set, task_id=7, reminders=[])
+
+    get_call, post_call = _patch_calls.call_args_list
+    assert get_call.args[:2] == ("GET", "/tasks/7")
+    assert post_call.args[:2] == ("POST", "/tasks/7")
+    body = post_call.kwargs["json"]
+    assert body["reminders"] == []
+    assert body["description"] == "keep me"
+
+
+async def test_task_update_no_fields_is_get_only_no_op(_patch_calls):
+    current = {"id": 5, "title": "Ship it"}
+    _patch_calls.return_value = current
+
+    result = await call(server.task_update, task_id=5)
+
+    assert _patch_calls.call_count == 1
+    assert _patch_calls.call_args.args[:2] == ("GET", "/tasks/5")
+    assert result == current
 
 
 # --- attachments ----------------------------------------------------------
