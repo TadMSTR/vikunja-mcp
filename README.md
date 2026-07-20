@@ -66,6 +66,15 @@ Notes:
 - Attachments upload base64 (multipart on the wire); `attachment_upload` handles the
   encoding.
 
+## Markdown descriptions & comments
+
+`description` on `task_create`/`task_update`/`project_create`/`project_update`, and the
+comment body on `comment_create`, accept plain **markdown**. Vikunja itself stores these
+fields as HTML (TipTap rich text), so the server converts markdown to HTML server-side
+before writing, then sanitizes the result with an allowlist HTML cleaner (`nh3.clean()`) —
+raw HTML embedded in agent-authored markdown (e.g. a stray `<script>` tag) is stripped, not
+passed through. No caller-side conversion is needed; just write normal markdown.
+
 ## Extension hooks
 
 Every tool is wrapped by `server.instrument`, which fires a **pre/post hook** chain around
