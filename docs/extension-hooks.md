@@ -39,11 +39,13 @@ fire around every invocation of it — including calls that arrive over MCP.
 ```python
 from vikunja_mcp.hooks import register_before
 
+
 async def enforce_public_webhook(kwargs: dict) -> dict:
     url = kwargs.get("target_url", "")
     if url.startswith("http://10.") or "localhost" in url:
         raise PermissionError("webhook target must be a public SWAG hostname")
     return kwargs
+
 
 register_before("webhook_create", enforce_public_webhook)
 ```
