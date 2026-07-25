@@ -24,16 +24,20 @@ Do it once, at process start (e.g. from your own launcher before `server.main()`
 ```python
 from vikunja_mcp.hooks import register_before, register_after
 
+
 async def redact_secret(kwargs: dict) -> dict:
-    kwargs.pop("secret", None)   # inspect / mutate arguments
+    kwargs.pop("secret", None)  # inspect / mutate arguments
     return kwargs
 
+
 register_before("webhook_create", redact_secret)
+
 
 async def stamp(result):
     if isinstance(result, dict):
         result["_audited"] = True
     return result
+
 
 register_after("task_get", stamp)
 ```
@@ -46,12 +50,20 @@ never logs argument values or the bearer token in the clear:
 ```python
 from vikunja_mcp.contrib.audit_log import register_audit_log
 
-register_audit_log([
-    "task_create", "task_update", "task_delete",
-    "project_create", "project_delete",
-    "team_create", "project_team_add", "project_user_add",
-    "project_share_create", "webhook_create",
-])
+register_audit_log(
+    [
+        "task_create",
+        "task_update",
+        "task_delete",
+        "project_create",
+        "project_delete",
+        "team_create",
+        "project_team_add",
+        "project_user_add",
+        "project_share_create",
+        "webhook_create",
+    ]
+)
 ```
 
 Each call emits a structured line:
