@@ -30,6 +30,87 @@ async def test_none_query_params_are_dropped():
     assert route.calls.last.request.url.params["page"] == "1"
 
 
+# --- pagination envelope --------------------------------------------------
+
+_MULTI = {"x-pagination-total-pages": "7", "x-pagination-result-count": "50"}
+_SINGLE = {"x-pagination-total-pages": "1", "x-pagination-result-count": "38"}
+
+
+@respx.mock
+async def test_truncated_list_is_wrapped_with_pagination():
+    respx.get(f"{BASE}/tasks").mock(
+        return_value=httpx.Response(200, json=[{"id": 1}, {"id": 2}], headers=_MULTI)
+    )
+    out = await client.request("GET", "/tasks", "t", params={"page": 2, "per_page": 50})
+    assert out["items"] == [{"id": 1}, {"id": 2}]
+    assert out["pagination"] == {
+        "page": 2,
+        "total_pages": 7,
+        "count": 2,
+        "truncated": True,
+    }
+
+
+@respx.mock
+async def test_single_page_list_is_returned_unwrapped():
+    """The envelope must not become the default shape — it signals truncation only."""
+    respx.get(f"{BASE}/labels").mock(
+        return_value=httpx.Response(200, json=[{"id": 1}], headers=_SINGLE)
+    )
+    out = await client.request("GET", "/labels", "t")
+    assert out == [{"id": 1}]
+
+
+@respx.mock
+async def test_page_defaults_to_one_when_caller_sent_no_page():
+    """Tools without a page argument (comment_list, view_list) still report a page."""
+    respx.get(f"{BASE}/tasks/5/comments").mock(
+        return_value=httpx.Response(200, json=[{"id": 1}], headers=_MULTI)
+    )
+    out = await client.request("GET", "/tasks/5/comments", "t")
+    assert out["pagination"]["page"] == 1
+
+
+@respx.mock
+async def test_dict_body_is_never_wrapped_even_when_headers_present():
+    """A single task carries the headers too; wrapping it would break every read path."""
+    respx.get(f"{BASE}/tasks/5").mock(
+        return_value=httpx.Response(200, json={"id": 5, "title": "t"}, headers=_MULTI)
+    )
+    out = await client.request("GET", "/tasks/5", "t")
+    assert out == {"id": 5, "title": "t"}
+
+
+@respx.mock
+async def test_list_without_pagination_headers_is_unwrapped():
+    respx.get(f"{BASE}/webhooks/events").mock(
+        return_value=httpx.Response(200, json=["task.created", "task.done"])
+    )
+    out = await client.request("GET", "/webhooks/events", "t")
+    assert out == ["task.created", "task.done"]
+
+
+@respx.mock
+async def test_unparsable_pagination_header_degrades_to_unwrapped():
+    """A malformed header must not turn a working list call into a crash."""
+    respx.get(f"{BASE}/tasks").mock(
+        return_value=httpx.Response(
+            200, json=[{"id": 1}], headers={"x-pagination-total-pages": "not-a-number"}
+        )
+    )
+    out = await client.request("GET", "/tasks", "t")
+    assert out == [{"id": 1}]
+
+
+@respx.mock
+async def test_non_numeric_page_param_falls_back_to_one():
+    respx.get(f"{BASE}/tasks").mock(
+        return_value=httpx.Response(200, json=[{"id": 1}], headers=_MULTI)
+    )
+    out = await client.request("GET", "/tasks", "t", params={"page": "abc"})
+    assert out["pagination"]["page"] == 1
+
+
 @respx.mock
 async def test_error_body_message_is_surfaced():
     respx.post(f"{BASE}/projects/9").mock(

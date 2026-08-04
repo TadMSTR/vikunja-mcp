@@ -126,6 +126,16 @@ def _md_to_html(text: str | None) -> str | None:
     return nh3.clean(html)
 
 
+# Collections Vikunja returns on a task but stores in their own tables, not as task
+# columns. They are not affected by the full-replace behaviour of POST /tasks/{id}, so
+# read-merge-write does not need to echo them back — and echoing `related_tasks` is
+# actively expensive, because Vikunja inlines the *entire* body of every related task
+# (one task_search over a well-linked ticket returned 155k characters). Dropped from the
+# merged body before re-posting; verified by probe that relations, labels and assignees
+# all survive their omission.
+_READ_ONLY_TASK_COLLECTIONS = ("related_tasks", "attachments", "reactions")
+
+
 async def _apply_task_update(task_id: int, token: str, changes: dict[str, Any]) -> dict:
     """Merge ``changes`` over the current task and POST the full object.
 
@@ -146,6 +156,8 @@ async def _apply_task_update(task_id: int, token: str, changes: dict[str, Any]) 
     current = await request("GET", f"/tasks/{task_id}", token)
     if not isinstance(current, dict):
         return await request("POST", f"/tasks/{task_id}", token, json=changes)
+    for heavy in _READ_ONLY_TASK_COLLECTIONS:
+        current.pop(heavy, None)
     current.update(changes)
     return await request("POST", f"/tasks/{task_id}", token, json=current)
 
@@ -243,6 +255,9 @@ async def project_list(
 
     Saved filters appear here as pseudo-projects with negative IDs — Vikunja has no
     separate "list filters" endpoint.
+
+    Capped at `per_page` (default 50). When more pages exist the result becomes
+    `{"items": [...], "pagination": {"truncated": true, ...}}` — raise `page` to read on.
     """
     params = {"page": page, "per_page": per_page, "s": search or None, "is_archived": is_archived}
     return await request("GET", "/projects", caller_token(), params=params)
@@ -311,6 +326,10 @@ async def task_list(
     """List tasks across all projects the caller can access.
 
     `filter` accepts Vikunja's filter syntax, e.g. `done = false && priority >= 3`.
+
+    Capped at `per_page` (default 50). When more pages exist the result becomes
+    `{"items": [...], "pagination": {"truncated": true, ...}}` — raise `page` to read on.
+    Do not treat one page as the whole answer.
     """
     params = {
         "page": page,
@@ -324,7 +343,12 @@ async def task_list(
 
 @tool
 async def task_search(query: str, page: int = 1, per_page: int = 50) -> Any:
-    """Full-text search tasks by title/description (ParadeDB BM25 index)."""
+    """Full-text search tasks by title/description (ParadeDB BM25 index).
+
+    Capped at `per_page` (default 50). When more pages exist the result becomes
+    `{"items": [...], "pagination": {"truncated": true, ...}}` — raise `page` to read on.
+    A "find every ticket about X" question is not answered by page 1 alone.
+    """
     params = {"s": query, "page": page, "per_page": per_page}
     return await request("GET", "/tasks", caller_token(), params=params)
 
@@ -453,7 +477,11 @@ async def tasks_bulk_update(task_ids: list[int], values: dict) -> dict:
 
 @tool
 async def label_list(page: int = 1, per_page: int = 50, search: str = "") -> Any:
-    """List labels the caller can access. `search` filters by title."""
+    """List labels the caller can access. `search` filters by title.
+
+    Capped at `per_page` (default 50). When more pages exist the result becomes
+    `{"items": [...], "pagination": {"truncated": true, ...}}` — raise `page` to read on.
+    """
     params = {"page": page, "per_page": per_page, "s": search or None}
     return await request("GET", "/labels", caller_token(), params=params)
 
@@ -510,7 +538,13 @@ async def task_label_remove(task_id: int, label_id: int) -> dict:
 
 @tool
 async def comment_list(task_id: int) -> Any:
-    """List comments on a task."""
+    """List comments on a task.
+
+    Vikunja paginates this endpoint but the tool exposes no `page` argument, so a task
+    with more than ~50 comments returns the first page only. That case is now visible —
+    the result becomes `{"items": [...], "pagination": {"truncated": true, ...}}` — rather
+    than silently short. Tracked as vikunja#341 (id 357).
+    """
     return await request("GET", f"/tasks/{task_id}/comments", caller_token())
 
 
@@ -538,7 +572,11 @@ async def comment_delete(task_id: int, comment_id: int) -> dict:
 
 @tool
 async def task_assignee_list(task_id: int) -> Any:
-    """List the users assigned to a task."""
+    """List the users assigned to a task.
+
+    No `page` argument — a truncated result is reported via the `pagination` envelope
+    rather than silently cut. See vikunja#341 (id 357).
+    """
     return await request("GET", f"/tasks/{task_id}/assignees", caller_token())
 
 
@@ -614,7 +652,11 @@ async def task_reminders_set(task_id: int, reminders: list[str]) -> dict:
 
 @tool
 async def attachment_list(task_id: int) -> Any:
-    """List attachments on a task."""
+    """List attachments on a task.
+
+    No `page` argument — a truncated result is reported via the `pagination` envelope
+    rather than silently cut. See vikunja#341 (id 357).
+    """
     return await request("GET", f"/tasks/{task_id}/attachments", caller_token())
 
 
@@ -695,7 +737,11 @@ async def filter_delete(filter_id: int) -> dict:
 
 @tool
 async def team_list(page: int = 1, per_page: int = 50, search: str = "") -> Any:
-    """List teams the caller belongs to. `search` filters by name."""
+    """List teams the caller belongs to. `search` filters by name.
+
+    Capped at `per_page` (default 50). When more pages exist the result becomes
+    `{"items": [...], "pagination": {"truncated": true, ...}}` — raise `page` to read on.
+    """
     params = {"page": page, "per_page": per_page, "s": search or None}
     return await request("GET", "/teams", caller_token(), params=params)
 
@@ -761,7 +807,11 @@ async def team_member_toggle_admin(team_id: int, user_id: int) -> dict:
 
 @tool
 async def project_team_list(project_id: int, page: int = 1, per_page: int = 50) -> Any:
-    """List teams a project is shared with."""
+    """List teams a project is shared with.
+
+    Capped at `per_page` (default 50). When more pages exist the result becomes
+    `{"items": [...], "pagination": {"truncated": true, ...}}` — raise `page` to read on.
+    """
     params = {"page": page, "per_page": per_page}
     return await request("GET", f"/projects/{project_id}/teams", caller_token(), params=params)
 
@@ -792,7 +842,11 @@ async def project_team_remove(project_id: int, team_id: int) -> dict:
 
 @tool
 async def project_user_list(project_id: int, page: int = 1, per_page: int = 50) -> Any:
-    """List users a project is shared with directly."""
+    """List users a project is shared with directly.
+
+    Capped at `per_page` (default 50). When more pages exist the result becomes
+    `{"items": [...], "pagination": {"truncated": true, ...}}` — raise `page` to read on.
+    """
     params = {"page": page, "per_page": per_page}
     return await request("GET", f"/projects/{project_id}/users", caller_token(), params=params)
 
@@ -823,7 +877,11 @@ async def project_user_remove(project_id: int, user_id: int) -> dict:
 
 @tool
 async def project_share_list(project_id: int, page: int = 1, per_page: int = 50) -> Any:
-    """List link shares configured on a project."""
+    """List link shares configured on a project.
+
+    Capped at `per_page` (default 50). When more pages exist the result becomes
+    `{"items": [...], "pagination": {"truncated": true, ...}}` — raise `page` to read on.
+    """
     params = {"page": page, "per_page": per_page}
     return await request("GET", f"/projects/{project_id}/shares", caller_token(), params=params)
 
@@ -877,7 +935,11 @@ async def project_share_delete(project_id: int, share_id: int) -> dict:
 
 @tool
 async def view_list(project_id: int) -> Any:
-    """List the views configured on a project (the 4 auto-created ones by default)."""
+    """List the views configured on a project (the 4 auto-created ones by default).
+
+    No `page` argument — a truncated result is reported via the `pagination` envelope
+    rather than silently cut. See vikunja#341 (id 357).
+    """
     return await request("GET", f"/projects/{project_id}/views", caller_token())
 
 
@@ -932,7 +994,11 @@ async def view_delete(project_id: int, view_id: int) -> dict:
 
 @tool
 async def bucket_list(project_id: int, view_id: int, page: int = 1, per_page: int = 50) -> Any:
-    """List the kanban buckets (columns) of a project view."""
+    """List the kanban buckets (columns) of a project view.
+
+    Capped at `per_page` (default 50). When more pages exist the result becomes
+    `{"items": [...], "pagination": {"truncated": true, ...}}` — raise `page` to read on.
+    """
     params = {"page": page, "per_page": per_page}
     return await request(
         "GET",
@@ -1006,7 +1072,11 @@ async def webhook_events() -> Any:
 
 @tool
 async def webhook_list(project_id: int, page: int = 1, per_page: int = 50) -> Any:
-    """List webhook targets configured on a project."""
+    """List webhook targets configured on a project.
+
+    Capped at `per_page` (default 50). When more pages exist the result becomes
+    `{"items": [...], "pagination": {"truncated": true, ...}}` — raise `page` to read on.
+    """
     params = {"page": page, "per_page": per_page}
     return await request("GET", f"/projects/{project_id}/webhooks", caller_token(), params=params)
 

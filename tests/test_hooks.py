@@ -120,9 +120,7 @@ def _builtins():
     server.register_builtin_hooks()
 
 
-async def test_task_create_response_strips_index_keeps_id_and_identifier(
-    monkeypatch, _builtins
-):
+async def test_task_create_response_strips_index_keeps_id_and_identifier(monkeypatch, _builtins):
     """`index` is the field #331 misused; `identifier` must survive (five consumers)."""
     mock = AsyncMock(return_value={"id": 344, "identifier": "#1", "index": 1, "title": "t"})
     monkeypatch.setattr(server, "request", mock)
