@@ -85,7 +85,23 @@ async def run_after_hooks(tool: str, result: Any) -> Any:
     return result
 
 
+def after_handlers(tool: str) -> list[Callable[..., Any]]:
+    """Return the post-call handlers currently registered for ``tool``.
+
+    Exposed so a caller can register a handler idempotently (``if h not in
+    after_handlers(t)``) without reaching into this module's private state.
+    """
+    return list(_after.get(tool, []))
+
+
 def clear_hooks() -> None:
-    """Remove all registered hooks. Intended for tests only."""
+    """Remove all registered hooks. Intended for tests only.
+
+    This also drops the hooks the server itself registers at import (see
+    ``server.register_builtin_hooks``) — those are ordinary registrations, not a
+    privileged tier. A test that clears hooks and then exercises a tool whose behaviour
+    depends on a built-in guardrail must call ``server.register_builtin_hooks()`` to put
+    them back, or it will pass or fail depending on test ordering.
+    """
     _before.clear()
     _after.clear()

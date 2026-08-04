@@ -111,6 +111,56 @@ async def test_before_hook_exception_prevents_upstream_call(_patch_calls):
     _patch_calls.assert_not_called()
 
 
+# --- built-in guardrail: task_create strips the ambiguous `index` (vikunja#331) --------
+
+
+@pytest.fixture
+def _builtins():
+    """Restore the server's built-in hooks, which the autouse _clean fixture wipes."""
+    server.register_builtin_hooks()
+
+
+async def test_task_create_response_strips_index_keeps_id_and_identifier(
+    monkeypatch, _builtins
+):
+    """`index` is the field #331 misused; `identifier` must survive (five consumers)."""
+    mock = AsyncMock(return_value={"id": 344, "identifier": "#1", "index": 1, "title": "t"})
+    monkeypatch.setattr(server, "request", mock)
+    monkeypatch.setattr(server, "caller_token", lambda: "TOK")
+
+    out = await _run(server.task_create, project_id=7, title="t")
+
+    assert "index" not in out
+    assert out["id"] == 344
+    assert out["identifier"] == "#1"
+
+
+async def test_task_get_still_returns_index(monkeypatch, _builtins):
+    """The guardrail is create-only — task_get remains the way to read `index` back."""
+    mock = AsyncMock(return_value={"id": 344, "identifier": "#1", "index": 1})
+    monkeypatch.setattr(server, "request", mock)
+    monkeypatch.setattr(server, "caller_token", lambda: "TOK")
+
+    out = await _run(server.task_get, task_id=344)
+
+    assert out["index"] == 1
+    assert out["id"] == 344
+
+
+async def test_register_builtin_hooks_is_idempotent(_builtins):
+    """Repeated calls must not stack duplicate handlers on task_create."""
+    before = len(hooks.after_handlers("task_create"))
+    server.register_builtin_hooks()
+    server.register_builtin_hooks()
+    assert len(hooks.after_handlers("task_create")) == before
+
+
+async def test_strip_index_tolerates_non_dict_result():
+    """A list/None result must pass through rather than raise inside the hook."""
+    assert await server._strip_ambiguous_task_index(None) is None
+    assert await server._strip_ambiguous_task_index([1, 2]) == [1, 2]
+
+
 def _fn(tool):
     return tool if callable(tool) and not hasattr(tool, "fn") else tool.fn
 

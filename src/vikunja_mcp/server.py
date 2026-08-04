@@ -37,7 +37,7 @@ from .auth import caller_token
 from .client import request
 from .config import get_settings
 from .exceptions import VikunjaAPIError
-from .hooks import run_after_hooks, run_before_hooks
+from .hooks import after_handlers, register_after, run_after_hooks, run_before_hooks
 
 # ---------------------------------------------------------------------------
 # Logging — JSON structlog, on by default (forge MCP convention)
@@ -351,6 +351,43 @@ async def task_create(
         due_date=due_date or None,
     )
     return await request("PUT", f"/projects/{project_id}/tasks", caller_token(), json=body)
+
+
+async def _strip_ambiguous_task_index(result: Any) -> Any:
+    """Drop the bare ``index`` from task_create's response.
+
+    Vikunja returns three identifiers on a created task: ``id`` (the global int every
+    other tool takes), ``index`` (a per-project int) and ``identifier`` (the display
+    string ``"#N"``). ``index`` is indistinguishable from a task id at a glance, and
+    misreading it is what caused vikunja#331 (id 342): an agent passed it to
+    task_label_add and silently mutated three unrelated tickets, briefly closing an open
+    security ticket among them.
+
+    ``identifier`` is deliberately kept. It is a string, so it cannot be passed where an
+    int id is expected without an obvious type error, and five forge consumers display it
+    (the ``[TRACKER] task #N (id M)`` line in four agents' CLAUDE.md, plus
+    research-plan-create). Stripping it would break every agent's ticket-filing output.
+
+    Read ``index`` back with task_get if you genuinely need it — this hook is create-only.
+    """
+    if isinstance(result, dict):
+        result.pop("index", None)
+    return result
+
+
+def register_builtin_hooks() -> None:
+    """Register the hooks this server ships with. Idempotent.
+
+    Called at import so the guardrails are on by default in every deployment. Kept as a
+    callable (rather than a bare ``register_after`` at module scope) because
+    ``hooks.clear_hooks()`` wipes built-ins along with test-registered handlers — a test
+    that clears hooks calls this to restore them instead of depending on import order.
+    """
+    if _strip_ambiguous_task_index not in after_handlers("task_create"):
+        register_after("task_create", _strip_ambiguous_task_index)
+
+
+register_builtin_hooks()
 
 
 @tool
