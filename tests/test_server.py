@@ -92,6 +92,27 @@ async def test_task_delete(_patch_calls):
     assert _patch_calls.call_args.args[:2] == ("DELETE", "/tasks/9")
 
 
+async def test_tasks_bulk_update_restricts_write_to_named_fields(_patch_calls):
+    """#333: without `fields`, POST /tasks/bulk zeroes every column absent from `values`."""
+    await call(server.tasks_bulk_update, task_ids=[1, 2], values={"done": True})
+    assert _patch_calls.call_args.args[:2] == ("POST", "/tasks/bulk")
+    assert _patch_calls.call_args.kwargs["json"] == {
+        "task_ids": [1, 2],
+        "fields": ["done"],
+        "values": {"done": True},
+    }
+
+
+async def test_tasks_bulk_update_serialises_multi_key_values_in_order(_patch_calls):
+    """`fields` must list every key in `values`, preserving the caller's ordering."""
+    values = {"done": True, "priority": 4}
+    await call(server.tasks_bulk_update, task_ids=[7], values=values)
+    body = _patch_calls.call_args.kwargs["json"]
+    assert body["fields"] == ["done", "priority"]
+    assert body["values"] == values
+    assert set(body["fields"]) == set(body["values"])
+
+
 # --- labels ---------------------------------------------------------------
 
 

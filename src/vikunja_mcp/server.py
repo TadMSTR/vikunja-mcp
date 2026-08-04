@@ -390,9 +390,22 @@ async def tasks_bulk_update(task_ids: list[int], values: dict) -> dict:
     """Apply the same field changes to many tasks in one call (migration throughput).
 
     `values` is a partial task object, e.g. `{"done": true}` or `{"priority": 4}`; it is
-    applied to every task in `task_ids`.
+    applied to every task in `task_ids` as a **targeted field write** — naming a key in
+    `values` is what makes that column eligible to be written, and columns you do not name
+    are left alone.
+
+    This is the bulk counterpart to ``_apply_task_update``: both exist because Vikunja's
+    task writes are full replaces by default. The single-task path solves it with
+    read-merge-write; the bulk path solves it with the ``fields`` array below, which does
+    the same job server-side without N GETs and N TOCTOU windows.
     """
-    body = {"task_ids": task_ids, "values": values}
+    # Vikunja's POST /tasks/bulk is a full replace *per task*: without `fields`, every
+    # column absent from `values` is reset to its zero value on every task in the list
+    # (ticket #333 / task 347 — same root cause as #173, verified destroying description,
+    # priority and percent_done on a live probe). `models.BulkTask.fields` restricts the
+    # write to the named columns. It is real but undocumented in swagger, so the probe
+    # recorded in the #333 ticket is its specification.
+    body = {"task_ids": task_ids, "fields": list(values.keys()), "values": values}
     return await request("POST", "/tasks/bulk", caller_token(), json=body)
 
 
