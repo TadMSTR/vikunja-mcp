@@ -5,8 +5,15 @@ teams, sharing, buckets/kanban, views, assignees, relations, reminders, attachme
 bulk). Every tool resolves the caller's own Vikunja token per request (see auth.py) and
 forwards it upstream, so Vikunja sees the acting agent, not a shared service account.
 
-Endpoint coverage is sourced from the live Vikunja Swagger spec (/api/v1/docs.json), not
-prose docs. Vikunja's REST idiom is unusual: **PUT creates, POST updates**.
+Endpoint coverage is *derived* from the live Vikunja Swagger spec (/api/v1/docs.json) but
+*verified* against the live router, because swagger is not trustworthy for verbs on this
+API. Vikunja's REST idiom is unusual to begin with: **PUT creates, POST updates**.
+
+Known divergence — do not "correct" it back. Swagger documents ``PUT /labels/{id}`` and no
+``POST /labels/{id}``; the router accepts ``DELETE, GET, POST`` and rejects ``PUT``. Taking
+swagger at its word is what shipped the v0.2.1 ``label_update`` bug. ``scripts/verify-routes.py``
+is the ground truth: it sends an unroutable verb to every implemented path and asserts the
+method appears in Echo's ``Allow:`` header. Run it after changing any verb or path.
 
 Every tool is wrapped by :func:`instrument`, which fires the pre/post extension hooks
 (see ``hooks.py``) and records telemetry (see ``telemetry.py``) around the call.

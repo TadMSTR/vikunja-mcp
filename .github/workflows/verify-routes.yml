@@ -1,0 +1,30 @@
+name: Verify routes
+
+# Opt-in, deliberately NOT on the PR path. This probes a live Vikunja instance, and
+# GitHub-hosted runners cannot reach forge's — a required job that always skips is worse
+# than no job, because it reads as coverage that does not exist. Run it manually, or let
+# the nightly schedule run it from a self-hosted runner that can reach the host.
+on:
+  workflow_dispatch:
+  schedule:
+    # 04:15 UTC daily — after forge's own maintenance windows.
+    - cron: "15 4 * * *"
+
+jobs:
+  verify-routes:
+    name: Live router verb sweep
+    runs-on: ubuntu-latest
+    steps:
+      # Action versions are pinned to commit SHAs per repo-standards (not floating tags).
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.13"
+      - run: pip install httpx
+      - name: Probe every implemented route against the live Echo router
+        env:
+          # Both absent -> the script prints SKIP and exits 0, so this stays green on a
+          # fork or wherever the secrets are not configured.
+          VIKUNJA_URL: ${{ secrets.VIKUNJA_URL }}
+          VIKUNJA_TOKEN: ${{ secrets.VIKUNJA_TOKEN }}
+        run: python scripts/verify-routes.py
