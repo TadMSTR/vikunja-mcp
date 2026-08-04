@@ -44,6 +44,12 @@ async def call(tool, **kwargs):
         "https://box.internal/hook",  # internal suffix
         "http://[::1]/hook",  # ipv6 loopback
         "ftp://example.com/hook",  # wrong scheme
+        "https://100.64.0.1/hook",  # CGNAT — is_private is False for this since py3.12.4
+        "https://100.127.255.254/hook",  # CGNAT upper edge
+        "https://224.0.0.1/hook",  # multicast
+        "https://0.0.0.0/hook",  # unspecified
+        "http://[fd00::1]/hook",  # ipv6 ULA
+        "http://[fe80::1]/hook",  # ipv6 link-local
     ],
 )
 async def test_webhook_create_rejects_internal_targets(_patch_calls, url):
@@ -54,6 +60,17 @@ async def test_webhook_create_rejects_internal_targets(_patch_calls, url):
 
 async def test_webhook_create_allows_public_ip_literal(_patch_calls):
     await call(server.webhook_create, project_id=1, target_url="https://8.8.8.8/hook", events=["x"])
+    assert _patch_calls.call_args.args[:2] == ("PUT", "/projects/1/webhooks")
+
+
+async def test_webhook_create_allows_public_ipv6_literal(_patch_calls):
+    """The is_global tightening must not start refusing legitimate public targets."""
+    await call(
+        server.webhook_create,
+        project_id=1,
+        target_url="https://[2606:4700::1111]/hook",
+        events=["x"],
+    )
     assert _patch_calls.call_args.args[:2] == ("PUT", "/projects/1/webhooks")
 
 

@@ -20,8 +20,23 @@ Vikunja itself validates it. Consequences:
   grants, not by this server.
 - A local process that already holds a valid Vikunja token could call the port directly; it
   would gain nothing it could not already do by calling Vikunja directly with that token.
-- Webhook registration (`webhook_create`) forwards `target_url` to Vikunja, which enforces
-  its own SSRF protection (rejects RFC1918 destinations). Always target public hostnames.
+- Webhook registration (`webhook_create`) validates `target_url` **in this server**, before
+  it reaches Vikunja. `_validate_webhook_target` requires an `http(s)` scheme and refuses a
+  host that is loopback, private, link-local, reserved, multicast, unspecified, or carries
+  an internal suffix (`.local`, `.internal`, `.lan`, `.home`, `.corp`); hostnames are
+  resolved and every returned address is checked.
+
+  This guard is load-bearing rather than defence in depth. Vikunja has its own
+  outgoing-request SSRF filter, but forge **disables** it — the Vikunja container sets
+  `VIKUNJA_OUTGOINGREQUESTS_ALLOWNONROUTABLEIPS=true` (verified 2026-08-04). In this
+  deployment the MCP-side check is the only thing standing between a webhook registration
+  and an internal address, so do not weaken it on the assumption that upstream will catch
+  it. Always target a public SWAG hostname.
+
+  Known limit: a host that does not resolve at registration time is allowed through, since
+  it cannot be classified. Vikunja re-resolves at delivery, and with the upstream filter
+  off that re-resolution is unguarded — so a DNS entry that is public at registration and
+  internal at delivery (DNS rebinding) is not covered here.
 
 ## Reporting
 

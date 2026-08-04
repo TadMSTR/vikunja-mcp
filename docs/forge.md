@@ -1,8 +1,10 @@
 # Forge deployment
 
-How `vikunja-mcp` is deployed on forge and wired into scoped-mcp. This is the reference for
-build-plan **Phase 9 (manifest)** and **Phase 11 (PM2 + wiring)** of
-`vikunja-migration-2026-07`.
+How `vikunja-mcp` is deployed on forge and wired into scoped-mcp.
+
+Originally written against `vikunja-migration-2026-07` (its Phases 9 and 11). The topology
+and grant matrix below were re-verified against the live deployment on 2026-08-04; where
+this doc and the deployment disagreed, the deployment won and this doc was corrected.
 
 ## Topology
 
@@ -37,8 +39,20 @@ exec /opt/venvs/vikunja-mcp/bin/vikunja-mcp
 python -m venv /opt/venvs/vikunja-mcp
 /opt/venvs/vikunja-mcp/bin/pip install /home/ted/repos/personal/vikunja-mcp
 pm2 start ecosystem.config.js && pm2 save
-curl -s http://127.0.0.1:8501/health   # or the FastMCP health path
 ```
+
+**Verifying it came up.** There is no `/health` route — `curl http://127.0.0.1:8501/health`
+returns 404, and an earlier revision of this doc suggested it as the check. Use one of:
+
+```bash
+pm2 describe vikunja-mcp | grep -E 'status|uptime'
+pm2 logs vikunja-mcp --lines 20 --nostream | grep vikunja_mcp_start   # reports version
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8501/mcp    # 406, i.e. listening
+```
+
+`/mcp` answering 406 is a healthy result: the endpoint is up and refusing a request that
+lacks the MCP content-type. A connection refused or a 502 is the failure signal. Note the
+path has no trailing slash — `/mcp/` answers 307 and redirects.
 
 The `env` file holds only non-secret config (`VIKUNJA_URL`, `VIKUNJA_PORT`, `LOG_LEVEL`).
 No Vikunja token is ever written here — that is the point of the passthrough model.
@@ -49,41 +63,127 @@ Add this module to **each agent's** manifest. The per-agent Vikunja token lives 
 `secret/data/vikunja/agent-<role>` (KV v2, key `token`) and is pulled by scoped-mcp's own
 Vault credential source, then substituted into the header as `${token}`.
 
+The block below is transcribed from the **live** manifests in `/etc/forge/manifests/`
+(read 2026-08-04), not from the original build plan. An earlier revision of this doc
+documented a `secret/data/vikunja/agent-{agent_type}` Vault path and a `${token}` header
+variable; neither matches what is deployed.
+
 ```yaml
 # credentials block is manifest-scoped — reconcile with the agent's existing source.
-# The vault path interpolates {agent_type}: developer -> agent-developer, etc.
 credentials:
   source: vault
   vault:
-    addr: https://vault.helmforge.me
+    addr: ${VAULT_ADDR}
     auth: approle
-    path: "secret/data/vikunja/agent-{agent_type}"
+    path: "agents/{agent_type}"
     kv_version: 2
+    role_id_env: VAULT_ROLE_ID
+    secret_id_env: VAULT_SECRET_ID
 
 modules:
   vikunja-mcp:
     type: mcp_proxy
     config:
-      url: http://127.0.0.1:8501/mcp/     # verify path against nextcloud-mcp's live manifest
+      url: http://127.0.0.1:8501/mcp             # no trailing slash — /mcp/ 307-redirects
       headers:
-        Authorization: "Bearer ${token}"  # ${token} = key from the Vault secret above
+        Authorization: "Bearer ${VIKUNJA_TOKEN}"
       tool_allowlist: [ ... see grant matrix below ... ]
 ```
 
 ### Grant matrix
 
-Per-agent `tool_allowlist` (replaces the plan's placeholder tool names with the ones this
-server actually exposes):
+**State as deployed**, read from `/etc/forge/manifests/*-agent.yml` on 2026-08-04. Every
+agent's live grant was wider than what this doc previously claimed — in every case wider,
+never narrower:
 
-| Agent | Tools |
-|-------|-------|
-| sysadmin | *(all — omit `tool_allowlist`)* |
-| developer | `project_list, project_get, project_create, task_list, task_search, task_get, task_create, task_update, label_list, label_create, task_label_add, comment_list, comment_create, whoami` |
-| research | `project_list, task_list, task_search, task_get, task_create, whoami` |
-| writer | `project_list, task_list, task_get, task_create, task_update, comment_create, whoami` |
-| security | `project_list, task_list, task_search, task_get, whoami` |
+| Agent | Previously documented | Deployed 2026-08-04 | Target |
+|-------|----------------------|---------------------|--------|
+| sysadmin | all (no allowlist) | all (no allowlist) | unchanged |
+| developer | 14 tools | **71 — the entire surface** | **23** (below) |
+| research | 6 tools | 22 | out of scope, see id 349 |
+| writer | 7 tools | 8 | out of scope, see id 349 |
+| security | 5 tools | 16 (read-only shape held) | out of scope, see id 349 |
 
-Reload scoped-mcp after editing manifests so grants take effect.
+The old 14-tool developer row was never deployed. It also predates the ratified flat
+taxonomy and granted `project_create` and `label_create`, which now work *against* that
+taxonomy. It is recorded above as history, not as a target.
+
+The cross-agent reconciliation for research/writer/security is tracked separately as
+vikunja id 349 (`#335`) and is deliberately not attempted here.
+
+#### developer — 23 tools
+
+Built from what the role's workflow actually needs (file a ticket, label it, link it,
+comment on it, move it across the board, close it), with every destructive and
+administrative tool removed.
+
+| Group | Tools | Why |
+|-------|-------|-----|
+| Identity | `whoami` | verify token wiring |
+| Projects (read) | `project_list`, `project_get` | flat taxonomy — read only, never create |
+| Tasks | `task_list`, `task_search`, `task_get`, `task_create`, `task_update` | core filing + status |
+| Labels | `label_list`, `label_get`, `task_label_add`, `task_label_remove` | attach/detach from the ratified vocabulary; never mutate the vocabulary itself |
+| Comments | `comment_list`, `comment_create` | build notes on a ticket |
+| Relations | `task_relation_add`, `task_relation_remove` | multi-repo build grouping |
+| Assignees (read) | `task_assignee_list` | read only |
+| Attachments | `attachment_list`, `attachment_upload` | attach a failing test log or diff |
+| Kanban | `view_list`, `view_get`, `bucket_list`, `task_bucket_move` | read the board and move a ticket across it |
+
+```yaml
+tool_allowlist:
+  - whoami
+  - project_list
+  - project_get
+  - task_list
+  - task_search
+  - task_get
+  - task_create
+  - task_update
+  - label_list
+  - label_get
+  - task_label_add
+  - task_label_remove
+  - comment_list
+  - comment_create
+  - task_relation_add
+  - task_relation_remove
+  - task_assignee_list
+  - attachment_list
+  - attachment_upload
+  - view_list
+  - view_get
+  - bucket_list
+  - task_bucket_move
+```
+
+#### developer — the 48 removed, and why
+
+| Removed | Reason |
+|---------|--------|
+| `project_delete` | deletes a project **and all its tasks** — catastrophic, never needed |
+| `task_delete` | agents close tickets, they do not delete them |
+| `tasks_bulk_update` | mutates N tickets in one call; a migration tool, not a developer tool. Do not re-grant even now that the field-wipe bug is fixed |
+| `label_create`, `label_update`, `label_delete` | the label vocabulary is ratified; `label_delete` strips the label from every task carrying it |
+| `project_create`, `project_update` | the taxonomy is deliberately flat — one project, id 7 |
+| `team_*` (8 tools) | team administration is not a developer function |
+| `project_team_*`, `project_user_*`, `project_share_*` (11 tools) | access control; `project_share_create` can mint a public link share |
+| `webhook_create`, `webhook_delete`, `webhook_events`, `webhook_list` | webhook registration belongs to `vikunja-webhook-listener`; `webhook_create` is the SSRF-relevant surface |
+| `filter_*` (4 tools) | saved filters are shared UI objects |
+| `view_create/update/delete`, `bucket_create/update/delete` | board structure, not per-ticket work |
+| `comment_delete`, `attachment_delete`, `task_assignee_add/remove`, `task_assignees_add_bulk`, `task_reminders_set` | destructive or unused |
+
+**Verified against a real filing cycle.** The full CLAUDE.md ticket-filing path was exercised
+end to end while writing this doc — `task_create` → 2× `task_label_add` → `task_relation_add`
+→ `comment_create` → `task_update` → `task_get`, for tickets id 356 and id 357. Every tool it
+touched is in the 23-tool set, so the trim does not break the workflow it is scoped around.
+
+One consequence to note before applying it: `tasks_bulk_update` is on the removed list, and
+it is the tool whose data-loss fix this release ships. Its live verification must be run
+*before* the trim lands, because afterwards developer cannot call it.
+
+Reload scoped-mcp after editing manifests so grants take effect. An allowlist that has not
+been observed rejecting anything has not been observed working — confirm by calling a
+removed tool and getting a refusal.
 
 > **Integration note.** `credentials` is a single manifest-level source. If an agent's
 > manifest already reads other secrets from a different Vault path, the Vikunja `token` key
@@ -94,6 +194,10 @@ Reload scoped-mcp after editing manifests so grants take effect.
 ## Webhooks (Phase 10 — separate `vikunja-webhook-listener`)
 
 Not part of this server. When that listener registers Vikunja webhooks via `webhook_create`,
-the `target_url` **must** be a public SWAG hostname — Vikunja refuses delivery to RFC1918
-addresses (SSRF guard). Set the webhook `secret` so the listener can verify
-`X-Vikunja-Signature`.
+the `target_url` **must** be a public SWAG hostname. Set the webhook `secret` so the
+listener can verify `X-Vikunja-Signature`.
+
+The SSRF check that enforces this runs **in `vikunja-mcp`**, not upstream: forge's Vikunja
+container sets `VIKUNJA_OUTGOINGREQUESTS_ALLOWNONROUTABLEIPS=true`, which disables
+Vikunja's own filter. See `SECURITY.md` for what the MCP-side guard does and does not
+cover.

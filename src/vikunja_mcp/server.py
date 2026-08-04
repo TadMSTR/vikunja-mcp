@@ -170,9 +170,19 @@ _INTERNAL_HOST_SUFFIXES = (".local", ".internal", ".lan", ".home", ".corp")
 
 
 def _ip_is_blocked(ip: ipaddress._BaseAddress) -> bool:
-    """True if an address is non-routable / internal and unsafe as a webhook target."""
+    """True if an address is non-routable / internal and unsafe as a webhook target.
+
+    ``is_global`` is the primary test rather than an enumeration of private-ish flags.
+    Since CPython 3.12.4, ``100.64.0.0/10`` (CGNAT — also Tailscale's range) reports
+    ``is_private=False``, so an is_private-based guard let it through despite it being
+    plainly not a public destination. Anything not globally routable is refused.
+
+    The named checks are kept after it: they document intent, and ``is_global`` is True
+    for parts of multicast/reserved space that are still not valid webhook targets.
+    """
     return (
-        ip.is_private
+        not getattr(ip, "is_global", False)
+        or ip.is_private
         or ip.is_loopback
         or ip.is_link_local
         or ip.is_reserved
