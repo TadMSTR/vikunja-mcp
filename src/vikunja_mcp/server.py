@@ -29,6 +29,7 @@ import binascii
 import functools
 import inspect
 import ipaddress
+import re
 import socket
 from collections.abc import Callable
 from typing import Any
@@ -111,6 +112,34 @@ def _drop_none(**fields: Any) -> dict[str, Any]:
     return {k: v for k, v in fields.items() if v is not None}
 
 
+# A line that begins with a ticket reference — `#333 ...` or `- #333 ...` — is parsed by
+# markdown as an ATX heading, so a "Related" list renders as a run of <h1>s. Seen live on
+# vikunja id 347. Matches an optional list marker and at most three leading spaces: four or
+# more would be an indented code block, where inserting a backslash would corrupt the text.
+_LEADING_TICKET_REF = re.compile(r"^( {0,3}(?:[-*+]\s+|\d+\.\s+)?)(#\d)")
+_FENCE = re.compile(r"^\s*(?:```|~~~)")
+
+
+def _escape_leading_ticket_refs(text: str) -> str:
+    """Escape a `#` that starts a line and is followed by a digit, outside code fences.
+
+    Fixes the reference, rather than requiring every agent to learn to write `` `#333` ``.
+    A `#` followed by a space (`# Real Heading`) is a genuine heading and is left alone, as
+    is any `#` that is not at the start of a line (`C#`, `see #333`).
+    """
+    out: list[str] = []
+    in_fence = False
+    for line in text.split("\n"):
+        if _FENCE.match(line):
+            in_fence = not in_fence
+            out.append(line)
+        elif in_fence:
+            out.append(line)
+        else:
+            out.append(_LEADING_TICKET_REF.sub(r"\1\\\2", line))
+    return "\n".join(out)
+
+
 def _md_to_html(text: str | None) -> str | None:
     """Render markdown to the HTML Vikunja's rich-text fields expect.
 
@@ -118,6 +147,12 @@ def _md_to_html(text: str | None) -> str | None:
     not markdown — a raw markdown string stored verbatim renders as literal `##`/`-`
     characters with collapsed whitespace (no <p>/<h2>/<br> tags). Agents author these
     fields in plain markdown, so convert on the way in.
+
+    `tables` is enabled: GFM tables are written constantly in ticket descriptions and
+    otherwise render as literal pipe characters. nh3's default allowlist already permits
+    every table tag, so the rendered table survives sanitisation byte-identical.
+
+    The conversion is idempotent — re-rendering HTML read back from `task_get` is safe.
 
     # SECURITY[control]: Python-Markdown passes embedded raw HTML through unmodified (no
     # safe_mode since 3.0) — `<script>`, `onerror=`, etc. would otherwise be stored
@@ -129,7 +164,10 @@ def _md_to_html(text: str | None) -> str | None:
     """
     if not text:
         return text
-    html = _markdown_lib.markdown(text, extensions=["fenced_code", "nl2br"])
+    html = _markdown_lib.markdown(
+        _escape_leading_ticket_refs(text),
+        extensions=["fenced_code", "nl2br", "tables"],
+    )
     return nh3.clean(html)
 
 
