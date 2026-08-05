@@ -81,6 +81,36 @@ async def test_task_update_reads_merges_writes_full_body(_patch_calls):
     assert body["priority"] == 4  # preserved, not wiped
 
 
+async def test_task_update_drops_heavy_read_only_collections_from_the_repost(_patch_calls):
+    """`related_tasks` inlines every related task's full body — do not echo it back.
+
+    Vikunja stores these in their own tables, so they are unaffected by the task
+    endpoint's full-replace behaviour. Probed live: relations and labels survive their
+    omission, while the re-posted body stops carrying a nested copy of every neighbour.
+    """
+    current = {
+        "id": 5,
+        "title": "Ship it",
+        "description": "keep me",
+        "related_tasks": {"related": [{"id": 9, "description": "a very large blob"}]},
+        "attachments": [{"id": 1}],
+        "reactions": {"1": ["ted"]},
+        "labels": [{"id": 36}],
+    }
+    _patch_calls.side_effect = [current, {"ok": True}]
+
+    await call(server.task_update, task_id=5, title="Renamed")
+
+    body = _patch_calls.call_args_list[1].kwargs["json"]
+    assert "related_tasks" not in body
+    assert "attachments" not in body
+    assert "reactions" not in body
+    # labels are left in place — only the three heavy collections are dropped
+    assert body["labels"] == [{"id": 36}]
+    assert body["title"] == "Renamed"
+    assert body["description"] == "keep me"
+
+
 async def test_task_search_uses_s_param(_patch_calls):
     await call(server.task_search, query="deploy")
     assert _patch_calls.call_args.args[:2] == ("GET", "/tasks")
@@ -90,6 +120,27 @@ async def test_task_search_uses_s_param(_patch_calls):
 async def test_task_delete(_patch_calls):
     await call(server.task_delete, task_id=9)
     assert _patch_calls.call_args.args[:2] == ("DELETE", "/tasks/9")
+
+
+async def test_tasks_bulk_update_restricts_write_to_named_fields(_patch_calls):
+    """#333: without `fields`, POST /tasks/bulk zeroes every column absent from `values`."""
+    await call(server.tasks_bulk_update, task_ids=[1, 2], values={"done": True})
+    assert _patch_calls.call_args.args[:2] == ("POST", "/tasks/bulk")
+    assert _patch_calls.call_args.kwargs["json"] == {
+        "task_ids": [1, 2],
+        "fields": ["done"],
+        "values": {"done": True},
+    }
+
+
+async def test_tasks_bulk_update_serialises_multi_key_values_in_order(_patch_calls):
+    """`fields` must list every key in `values`, preserving the caller's ordering."""
+    values = {"done": True, "priority": 4}
+    await call(server.tasks_bulk_update, task_ids=[7], values=values)
+    body = _patch_calls.call_args.kwargs["json"]
+    assert body["fields"] == ["done", "priority"]
+    assert body["values"] == values
+    assert set(body["fields"]) == set(body["values"])
 
 
 # --- labels ---------------------------------------------------------------

@@ -17,9 +17,17 @@ Register it for the tools you want audited (typically the mutating ones)::
         "project_share_create", "webhook_create",
     ])
 
-This satisfies the forge tool-audit directive (acting agent + tool + args-hash). To route
-the line into ``~/.claude/comms/artifacts/tool-audit/`` instead of stdout, pass your own
-``logger`` (any object with an ``info(event, **fields)`` method).
+**Nothing here is active until a deployment calls ``register_audit_log``.** This module is
+opt-in contrib, not server wiring: ``server.py`` does not import it, and as of 2026-08-04
+no forge deployment registers it, so this server currently emits no audit trail. An earlier
+version of this docstring claimed the module "satisfies the forge tool-audit directive",
+which read as though importing the file were enough — it is not, and that wording left the
+directive quietly unsatisfied.
+
+It provides the *mechanism* for the directive (acting agent + tool + args-hash). Satisfying
+it requires registering the tools you want audited, in whatever wires up your deployment.
+To route the line into ``~/.claude/comms/artifacts/tool-audit/`` instead of stdout, pass
+your own ``logger`` (any object with an ``info(event, **fields)`` method).
 """
 
 from __future__ import annotations

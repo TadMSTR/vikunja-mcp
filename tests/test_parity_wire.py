@@ -12,6 +12,7 @@ Only ``caller_token`` is patched (there is no real HTTP request context in a uni
 from __future__ import annotations
 
 import base64
+import json
 
 import httpx
 import pytest
@@ -104,6 +105,41 @@ async def test_tasks_bulk_update_posts_on_the_wire():
     route = respx.post(f"{BASE}/tasks/bulk").mock(return_value=httpx.Response(200, json={}))
     await _fn(server.tasks_bulk_update)(task_ids=[1, 2], values={"done": True})
     assert route.calls.last.request.method == "POST"
+
+
+@respx.mock
+async def test_tasks_bulk_update_sends_fields_array():
+    """The `fields` array is what stops the bulk endpoint wiping unnamed columns (#333).
+
+    Pinning only the verb (the test above) is exactly why the field wipe shipped, so this
+    asserts the body itself: `fields` present, and covering precisely the keys of `values`.
+    """
+    route = respx.post(f"{BASE}/tasks/bulk").mock(return_value=httpx.Response(200, json={}))
+    await _fn(server.tasks_bulk_update)(task_ids=[1, 2], values={"done": True})
+    body = json.loads(route.calls.last.request.content)
+    assert body["fields"] == ["done"]
+    assert body["values"] == {"done": True}
+    assert body["task_ids"] == [1, 2]
+
+
+@respx.mock
+async def test_tasks_bulk_update_fields_covers_every_key():
+    """A multi-key write must name every column it writes, in the order given."""
+    route = respx.post(f"{BASE}/tasks/bulk").mock(return_value=httpx.Response(200, json={}))
+    values = {"done": True, "priority": 4, "percent_done": 0.5}
+    await _fn(server.tasks_bulk_update)(task_ids=[7], values=values)
+    body = json.loads(route.calls.last.request.content)
+    assert body["fields"] == ["done", "priority", "percent_done"]
+    assert set(body["fields"]) == set(body["values"])
+
+
+@respx.mock
+async def test_tasks_bulk_update_empty_values_writes_nothing():
+    """An empty `values` must produce an empty `fields` — never an unrestricted replace."""
+    route = respx.post(f"{BASE}/tasks/bulk").mock(return_value=httpx.Response(200, json={}))
+    await _fn(server.tasks_bulk_update)(task_ids=[7], values={})
+    body = json.loads(route.calls.last.request.content)
+    assert body["fields"] == []
 
 
 @respx.mock

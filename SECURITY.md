@@ -20,8 +20,31 @@ Vikunja itself validates it. Consequences:
   grants, not by this server.
 - A local process that already holds a valid Vikunja token could call the port directly; it
   would gain nothing it could not already do by calling Vikunja directly with that token.
-- Webhook registration (`webhook_create`) forwards `target_url` to Vikunja, which enforces
-  its own SSRF protection (rejects RFC1918 destinations). Always target public hostnames.
+- Webhook registration (`webhook_create`) validates `target_url` **in this server**, before
+  it reaches Vikunja. `_validate_webhook_target` requires an `http(s)` scheme and refuses a
+  host that is loopback, private, link-local, reserved, multicast, unspecified, or carries
+  an internal suffix (`.local`, `.internal`, `.lan`, `.home`, `.corp`); hostnames are
+  resolved and every returned address is checked.
+
+  This guard is load-bearing rather than defence in depth. Vikunja has its own
+  outgoing-request SSRF filter, but forge **disables** it — the Vikunja container sets
+  `VIKUNJA_OUTGOINGREQUESTS_ALLOWNONROUTABLEIPS=true` (verified 2026-08-04). In this
+  deployment the MCP-side check is the only thing standing between a webhook registration
+  and an internal address, so do not weaken it on the assumption that upstream will catch
+  it. Always target a public SWAG hostname.
+
+  **The guard fails closed.** A host that cannot be resolved is refused rather than waved
+  through. Until 2026-08-04 it was allowed, on the reasoning that Vikunja re-resolves at
+  delivery — but that reasoning does not hold in this deployment, because the upstream
+  filter is off and so the delivery-time resolution is unguarded. The practical cost is
+  that registering a webhook against a host forge cannot currently resolve will be
+  rejected; that is the cheaper failure for a rare, deliberate operation.
+
+  Residual limit: validation happens at registration, and Vikunja performs the actual
+  delivery in its own process. A name that resolves to a public address when registered and
+  is re-pointed to an internal one before delivery is still a TOCTOU window that a
+  registration-time check cannot close. Narrowing it further would require either a control
+  inside Vikunja (its own filter, currently disabled) or network isolation of the container.
 
 ## Reporting
 

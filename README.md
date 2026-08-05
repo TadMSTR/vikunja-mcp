@@ -136,13 +136,49 @@ fire-and-forget: a telemetry backend being down never breaks a tool call. Forge 
 `influxdb:3-core`, so the InfluxDB sink uses the **v3** write API. See
 [`docs/telemetry.md`](docs/telemetry.md) for the full backend matrix.
 
+### Enabling it — two steps, and the env var is not the one that matters
+
+On forge this runs with OTLP on, exporting to the SigNoz collector. Enabling it takes
+**both** of the following; doing only the second is the common failure:
+
+```bash
+/opt/venvs/vikunja-mcp/bin/pip install 'vikunja-mcp[telemetry]'   # 1. the extra
+# 2. append to /opt/appdata/vikunja-mcp/env:
+#    OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
+pm2 restart vikunja-mcp
+```
+
+Port 4317 is gRPC — `telemetry.py` uses `opentelemetry-exporter-otlp-proto-grpc`, so it is
+4317, not the 4318 HTTP port.
+
+**The acceptance check is the startup log line, never the presence of the env var:**
+
+```bash
+pm2 logs vikunja-mcp --lines 50 --nostream | grep -E 'otlp_enabled|otlp_import_failed'
+```
+
+`otlp_enabled` means it is working. `otlp_import_failed` means the endpoint is configured
+but the extra was never installed — the process starts fine, logs one warning, then
+silently emits nothing. Anyone reading `/opt/appdata/*/env` to see which services have
+telemetry on gets the wrong answer in that state.
+
+This is not hypothetical: `nextcloud-mcp` on forge has had the env var set and the extra
+missing since at least 2026-07-26, emitting nothing the whole time (tracked as vikunja id
+350 / `#336`). Confirm `otlp_enabled`, then confirm the service actually shows up in
+SigNoz.
+
 ## Development
 
 ```bash
 pip install -e ".[dev]"
-ruff check src/ tests/
-ruff format --check src/ tests/
+ruff check src/ tests/ scripts/
+ruff format --check src/ tests/ scripts/
 pytest --cov=vikunja_mcp --cov-report=term-missing
+
+# Optional: probe every implemented route against a live Vikunja router.
+# Skips cleanly when the credentials are absent. Never run against a host you
+# do not control — it sends one unroutable verb per endpoint.
+VIKUNJA_URL=https://vikunja.example VIKUNJA_TOKEN=... python scripts/verify-routes.py
 ```
 
 ## Deployment

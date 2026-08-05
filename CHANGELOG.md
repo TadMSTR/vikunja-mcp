@@ -6,6 +6,90 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-08-04
+
+### Fixed
+- **`tasks_bulk_update` no longer wipes untouched columns on every task it touches.**
+  `POST /tasks/bulk` is a full replace *per task*, so posting a bare `values` object reset
+  every column absent from it — `values={"done": true}` erased description, priority and
+  percent_done across the whole list. Same root cause as #173, which was fixed in v0.2.2
+  for the two single-task tools and never applied to the bulk one. The request now carries
+  `models.BulkTask`'s `fields` array, restricting the write to the columns named in
+  `values`. Verified live against Vikunja 2.3.0. (ticket #333 / id 347)
+- **Version drift between `__init__.py` (0.2.1) and `pyproject.toml` (0.2.2)**, which meant
+  the deployed process reported the wrong version at startup. A test now pins the two
+  together.
+- **Markdown tables render as tables.** `tables` was missing from the extension list, so a
+  GFM table in a ticket description came out as literal pipe characters.
+- **A line starting with a ticket reference is no longer parsed as a heading.** `- #333 …`
+  rendered as `<h1>333 …</h1>`, which mangled the "Related" list of at least one ticket. A
+  leading `#` followed by a digit is now escaped, outside code fences. Real headings
+  (`# Context`) and inline references (`C#`, `see #333`) are untouched.
+
+### Added
+- **List results report truncation instead of hiding it.** Vikunja paginates every list
+  endpoint at 50 per page and signals the extent only in headers, which were discarded — so
+  "find every ticket about X" returned at most one page and looked complete. A multi-page
+  list is now returned as `{"items": [...], "pagination": {page, total_pages, count,
+  truncated}}`; single-page lists and all non-list bodies are unchanged.
+- **`task_create` no longer returns the ambiguous `index` field.** Vikunja returns `id`
+  (global), `index` (per-project) and `identifier` (`"#N"`). `index` is indistinguishable
+  from a task id at a glance and misreading it caused #331 — an agent passed it to
+  `task_label_add` and silently mutated three unrelated tickets. `identifier` is kept; it
+  is a string and five consumers display it. Read `index` back via `task_get` if needed.
+  (ticket #331 / id 342, closed as wrong root cause — the `id` mapping was always correct)
+- **`scripts/verify-routes.py`** — probes every implemented route against Vikunja's live
+  Echo router using an unroutable verb and asserts the code's method appears in the
+  `Allow:` header. Swagger is wrong about `/labels/{id}` (it documents `PUT`; the router
+  takes `DELETE, GET, POST`), which is how the v0.2.1 `label_update` bug shipped. Wired as
+  an opt-in `workflow_dispatch` + nightly job, deliberately not on the PR path.
+- `hooks.after_handlers()`, so a handler can be registered idempotently without touching
+  the registry's private state.
+
+### Changed
+- `_apply_task_update` no longer echoes `related_tasks`/`attachments`/`reactions` back in
+  the re-posted body. Vikunja inlines the full body of every related task — one
+  `task_search` returned 155k characters. These live in their own tables; verified by probe
+  that relations, labels and assignees survive their omission.
+- `docs/vikunja-structure.md` is now a pointer to the ratified knowledge-base copy rather
+  than a stale 83-line fork missing the label-ID table every agent's CLAUDE.md relies on.
+
+### Security
+- **Webhook SSRF guard now refuses any non-globally-routable address.** It enumerated
+  `is_private`/`is_loopback`/etc, and since CPython 3.12.4 `100.64.0.0/10` (CGNAT, also
+  Tailscale's range) reports `is_private=False` — so those targets passed. Latent rather
+  than exploitable on forge (no CGNAT interface, route, or Tailscale install), but this
+  guard is load-bearing here because forge disables Vikunja's own filter.
+- **The webhook SSRF guard now fails closed on an unresolvable host.** It previously
+  allowed one, reasoning that Vikunja re-resolves at delivery — but forge disables
+  Vikunja's outgoing-request filter, so that second resolution is unguarded, leaving a DNS
+  rebinding path into `forge-net`. A host that cannot be classified is now refused. Cost:
+  registering a webhook against a momentarily unresolvable legitimate host is rejected,
+  which is the cheaper failure for a rare, deliberate operation. (audit 2026-08-04, MEDIUM)
+- **`scripts/verify-routes.py` no longer requires a Vikunja token,** and the CI job no
+  longer takes one. Echo answers the route-mismatch 405 before auth middleware runs —
+  verified across all 69 routes with no `Authorization` header — so the sweep never needed
+  a credential. Removing it means no live Vikunja token exists as a GitHub secret at all,
+  rather than merely being scoped down. (audit 2026-08-04, INFO)
+
+### Documentation
+- `SECURITY.md` no longer credits Vikunja's upstream SSRF filter, which forge disables via
+  `VIKUNJA_OUTGOINGREQUESTS_ALLOWNONROUTABLEIPS=true`. It now states that the MCP-side
+  guard is the only control in this deployment, and records the DNS-rebinding limit.
+- `AGENTS.md` invariant 5 claimed partial updates never clobber unspecified fields — true
+  for projects/labels/teams/filters/views/buckets, false for tasks since v0.2.2. Replaced
+  with a table of all three behaviours so nobody "simplifies" `_apply_task_update` back
+  into #173. `hooks.py`, `telemetry.py` and `contrib/` added to module boundaries.
+- `docs/forge.md` grant matrix rewritten against the live manifests: developer's documented
+  14-tool grant was never deployed (the manifest grants all 71) and the target is a
+  23-tool set. Also corrected the Vault path, header variable, module URL, and the
+  verification step — there is no `/health` route.
+- README documents that enabling telemetry needs *both* the `[telemetry]` extra and the
+  endpoint env var, and that `otlp_enabled` — not the presence of the variable — is the
+  acceptance check.
+- `contrib/audit_log.py` no longer claims to satisfy the forge tool-audit directive on its
+  own; nothing registers it, so this server currently emits no audit trail.
+
 ## [0.2.2] — 2026-07-19
 
 ### Fixed

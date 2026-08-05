@@ -234,11 +234,13 @@ async def test_attachment_upload_decodes_and_sends_multipart(_patch_calls):
 # --- bulk -----------------------------------------------------------------
 
 
-async def test_tasks_bulk_update_sends_ids_and_values(_patch_calls):
+async def test_tasks_bulk_update_sends_ids_fields_and_values(_patch_calls):
+    """`fields` restricts the write; without it the endpoint replaces the whole task (#333)."""
     await call(server.tasks_bulk_update, task_ids=[1, 2, 3], values={"done": True})
     assert _patch_calls.call_args.args[:2] == ("POST", "/tasks/bulk")
     assert _patch_calls.call_args.kwargs["json"] == {
         "task_ids": [1, 2, 3],
+        "fields": ["done"],
         "values": {"done": True},
     }
 

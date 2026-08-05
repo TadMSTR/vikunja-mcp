@@ -5,8 +5,15 @@ teams, sharing, buckets/kanban, views, assignees, relations, reminders, attachme
 bulk). Every tool resolves the caller's own Vikunja token per request (see auth.py) and
 forwards it upstream, so Vikunja sees the acting agent, not a shared service account.
 
-Endpoint coverage is sourced from the live Vikunja Swagger spec (/api/v1/docs.json), not
-prose docs. Vikunja's REST idiom is unusual: **PUT creates, POST updates**.
+Endpoint coverage is *derived* from the live Vikunja Swagger spec (/api/v1/docs.json) but
+*verified* against the live router, because swagger is not trustworthy for verbs on this
+API. Vikunja's REST idiom is unusual to begin with: **PUT creates, POST updates**.
+
+Known divergence — do not "correct" it back. Swagger documents ``PUT /labels/{id}`` and no
+``POST /labels/{id}``; the router accepts ``DELETE, GET, POST`` and rejects ``PUT``. Taking
+swagger at its word is what shipped the v0.2.1 ``label_update`` bug. ``scripts/verify-routes.py``
+is the ground truth: it sends an unroutable verb to every implemented path and asserts the
+method appears in Echo's ``Allow:`` header. Run it after changing any verb or path.
 
 Every tool is wrapped by :func:`instrument`, which fires the pre/post extension hooks
 (see ``hooks.py``) and records telemetry (see ``telemetry.py``) around the call.
@@ -22,6 +29,7 @@ import binascii
 import functools
 import inspect
 import ipaddress
+import re
 import socket
 from collections.abc import Callable
 from typing import Any
@@ -37,7 +45,7 @@ from .auth import caller_token
 from .client import request
 from .config import get_settings
 from .exceptions import VikunjaAPIError
-from .hooks import run_after_hooks, run_before_hooks
+from .hooks import after_handlers, register_after, run_after_hooks, run_before_hooks
 
 # ---------------------------------------------------------------------------
 # Logging — JSON structlog, on by default (forge MCP convention)
@@ -104,6 +112,34 @@ def _drop_none(**fields: Any) -> dict[str, Any]:
     return {k: v for k, v in fields.items() if v is not None}
 
 
+# A line that begins with a ticket reference — `#333 ...` or `- #333 ...` — is parsed by
+# markdown as an ATX heading, so a "Related" list renders as a run of <h1>s. Seen live on
+# vikunja id 347. Matches an optional list marker and at most three leading spaces: four or
+# more would be an indented code block, where inserting a backslash would corrupt the text.
+_LEADING_TICKET_REF = re.compile(r"^( {0,3}(?:[-*+]\s+|\d+\.\s+)?)(#\d)")
+_FENCE = re.compile(r"^\s*(?:```|~~~)")
+
+
+def _escape_leading_ticket_refs(text: str) -> str:
+    """Escape a `#` that starts a line and is followed by a digit, outside code fences.
+
+    Fixes the reference, rather than requiring every agent to learn to write `` `#333` ``.
+    A `#` followed by a space (`# Real Heading`) is a genuine heading and is left alone, as
+    is any `#` that is not at the start of a line (`C#`, `see #333`).
+    """
+    out: list[str] = []
+    in_fence = False
+    for line in text.split("\n"):
+        if _FENCE.match(line):
+            in_fence = not in_fence
+            out.append(line)
+        elif in_fence:
+            out.append(line)
+        else:
+            out.append(_LEADING_TICKET_REF.sub(r"\1\\\2", line))
+    return "\n".join(out)
+
+
 def _md_to_html(text: str | None) -> str | None:
     """Render markdown to the HTML Vikunja's rich-text fields expect.
 
@@ -111,6 +147,12 @@ def _md_to_html(text: str | None) -> str | None:
     not markdown — a raw markdown string stored verbatim renders as literal `##`/`-`
     characters with collapsed whitespace (no <p>/<h2>/<br> tags). Agents author these
     fields in plain markdown, so convert on the way in.
+
+    `tables` is enabled: GFM tables are written constantly in ticket descriptions and
+    otherwise render as literal pipe characters. nh3's default allowlist already permits
+    every table tag, so the rendered table survives sanitisation byte-identical.
+
+    The conversion is idempotent — re-rendering HTML read back from `task_get` is safe.
 
     # SECURITY[control]: Python-Markdown passes embedded raw HTML through unmodified (no
     # safe_mode since 3.0) — `<script>`, `onerror=`, etc. would otherwise be stored
@@ -122,8 +164,21 @@ def _md_to_html(text: str | None) -> str | None:
     """
     if not text:
         return text
-    html = _markdown_lib.markdown(text, extensions=["fenced_code", "nl2br"])
+    html = _markdown_lib.markdown(
+        _escape_leading_ticket_refs(text),
+        extensions=["fenced_code", "nl2br", "tables"],
+    )
     return nh3.clean(html)
+
+
+# Collections Vikunja returns on a task but stores in their own tables, not as task
+# columns. They are not affected by the full-replace behaviour of POST /tasks/{id}, so
+# read-merge-write does not need to echo them back — and echoing `related_tasks` is
+# actively expensive, because Vikunja inlines the *entire* body of every related task
+# (one task_search over a well-linked ticket returned 155k characters). Dropped from the
+# merged body before re-posting; verified by probe that relations, labels and assignees
+# all survive their omission.
+_READ_ONLY_TASK_COLLECTIONS = ("related_tasks", "attachments", "reactions")
 
 
 async def _apply_task_update(task_id: int, token: str, changes: dict[str, Any]) -> dict:
@@ -146,6 +201,8 @@ async def _apply_task_update(task_id: int, token: str, changes: dict[str, Any]) 
     current = await request("GET", f"/tasks/{task_id}", token)
     if not isinstance(current, dict):
         return await request("POST", f"/tasks/{task_id}", token, json=changes)
+    for heavy in _READ_ONLY_TASK_COLLECTIONS:
+        current.pop(heavy, None)
     current.update(changes)
     return await request("POST", f"/tasks/{task_id}", token, json=current)
 
@@ -158,9 +215,19 @@ _INTERNAL_HOST_SUFFIXES = (".local", ".internal", ".lan", ".home", ".corp")
 
 
 def _ip_is_blocked(ip: ipaddress._BaseAddress) -> bool:
-    """True if an address is non-routable / internal and unsafe as a webhook target."""
+    """True if an address is non-routable / internal and unsafe as a webhook target.
+
+    ``is_global`` is the primary test rather than an enumeration of private-ish flags.
+    Since CPython 3.12.4, ``100.64.0.0/10`` (CGNAT — also Tailscale's range) reports
+    ``is_private=False``, so an is_private-based guard let it through despite it being
+    plainly not a public destination. Anything not globally routable is refused.
+
+    The named checks are kept after it: they document intent, and ``is_global`` is True
+    for parts of multicast/reserved space that are still not valid webhook targets.
+    """
     return (
-        ip.is_private
+        not getattr(ip, "is_global", False)
+        or ip.is_private
         or ip.is_loopback
         or ip.is_link_local
         or ip.is_reserved
@@ -181,8 +248,15 @@ def _host_is_blocked(host: str) -> bool:
     try:
         infos = socket.getaddrinfo(h, None)
     except OSError:
-        # Unresolvable here — can't classify; Vikunja re-resolves at delivery. Allow.
-        return False
+        # Unresolvable — refuse. This previously allowed the host, reasoning that Vikunja
+        # re-resolves at delivery; that reasoning was void, because forge disables Vikunja's
+        # own outgoing-request filter (ALLOWNONROUTABLEIPS=true), so the delivery-time
+        # resolution is unguarded. A name that does not resolve now but resolves to an
+        # internal address at delivery is the DNS-rebinding case, and this MCP-side check is
+        # the only control standing in front of it. Failing closed costs a rejected
+        # registration when a legitimate host is momentarily unresolvable, which is the
+        # cheaper error for a rare, deliberate operation. (audit 2026-08-04, MEDIUM)
+        return True
     for info in infos:
         addr = info[4][0].split("%")[0]  # strip any zone id
         try:
@@ -243,6 +317,9 @@ async def project_list(
 
     Saved filters appear here as pseudo-projects with negative IDs — Vikunja has no
     separate "list filters" endpoint.
+
+    Capped at `per_page` (default 50). When more pages exist the result becomes
+    `{"items": [...], "pagination": {"truncated": true, ...}}` — raise `page` to read on.
     """
     params = {"page": page, "per_page": per_page, "s": search or None, "is_archived": is_archived}
     return await request("GET", "/projects", caller_token(), params=params)
@@ -311,6 +388,10 @@ async def task_list(
     """List tasks across all projects the caller can access.
 
     `filter` accepts Vikunja's filter syntax, e.g. `done = false && priority >= 3`.
+
+    Capped at `per_page` (default 50). When more pages exist the result becomes
+    `{"items": [...], "pagination": {"truncated": true, ...}}` — raise `page` to read on.
+    Do not treat one page as the whole answer.
     """
     params = {
         "page": page,
@@ -324,7 +405,12 @@ async def task_list(
 
 @tool
 async def task_search(query: str, page: int = 1, per_page: int = 50) -> Any:
-    """Full-text search tasks by title/description (ParadeDB BM25 index)."""
+    """Full-text search tasks by title/description (ParadeDB BM25 index).
+
+    Capped at `per_page` (default 50). When more pages exist the result becomes
+    `{"items": [...], "pagination": {"truncated": true, ...}}` — raise `page` to read on.
+    A "find every ticket about X" question is not answered by page 1 alone.
+    """
     params = {"s": query, "page": page, "per_page": per_page}
     return await request("GET", "/tasks", caller_token(), params=params)
 
@@ -351,6 +437,43 @@ async def task_create(
         due_date=due_date or None,
     )
     return await request("PUT", f"/projects/{project_id}/tasks", caller_token(), json=body)
+
+
+async def _strip_ambiguous_task_index(result: Any) -> Any:
+    """Drop the bare ``index`` from task_create's response.
+
+    Vikunja returns three identifiers on a created task: ``id`` (the global int every
+    other tool takes), ``index`` (a per-project int) and ``identifier`` (the display
+    string ``"#N"``). ``index`` is indistinguishable from a task id at a glance, and
+    misreading it is what caused vikunja#331 (id 342): an agent passed it to
+    task_label_add and silently mutated three unrelated tickets, briefly closing an open
+    security ticket among them.
+
+    ``identifier`` is deliberately kept. It is a string, so it cannot be passed where an
+    int id is expected without an obvious type error, and five forge consumers display it
+    (the ``[TRACKER] task #N (id M)`` line in four agents' CLAUDE.md, plus
+    research-plan-create). Stripping it would break every agent's ticket-filing output.
+
+    Read ``index`` back with task_get if you genuinely need it — this hook is create-only.
+    """
+    if isinstance(result, dict):
+        result.pop("index", None)
+    return result
+
+
+def register_builtin_hooks() -> None:
+    """Register the hooks this server ships with. Idempotent.
+
+    Called at import so the guardrails are on by default in every deployment. Kept as a
+    callable (rather than a bare ``register_after`` at module scope) because
+    ``hooks.clear_hooks()`` wipes built-ins along with test-registered handlers — a test
+    that clears hooks calls this to restore them instead of depending on import order.
+    """
+    if _strip_ambiguous_task_index not in after_handlers("task_create"):
+        register_after("task_create", _strip_ambiguous_task_index)
+
+
+register_builtin_hooks()
 
 
 @tool
@@ -390,9 +513,22 @@ async def tasks_bulk_update(task_ids: list[int], values: dict) -> dict:
     """Apply the same field changes to many tasks in one call (migration throughput).
 
     `values` is a partial task object, e.g. `{"done": true}` or `{"priority": 4}`; it is
-    applied to every task in `task_ids`.
+    applied to every task in `task_ids` as a **targeted field write** — naming a key in
+    `values` is what makes that column eligible to be written, and columns you do not name
+    are left alone.
+
+    This is the bulk counterpart to ``_apply_task_update``: both exist because Vikunja's
+    task writes are full replaces by default. The single-task path solves it with
+    read-merge-write; the bulk path solves it with the ``fields`` array below, which does
+    the same job server-side without N GETs and N TOCTOU windows.
     """
-    body = {"task_ids": task_ids, "values": values}
+    # Vikunja's POST /tasks/bulk is a full replace *per task*: without `fields`, every
+    # column absent from `values` is reset to its zero value on every task in the list
+    # (ticket #333 / task 347 — same root cause as #173, verified destroying description,
+    # priority and percent_done on a live probe). `models.BulkTask.fields` restricts the
+    # write to the named columns. It is real but undocumented in swagger, so the probe
+    # recorded in the #333 ticket is its specification.
+    body = {"task_ids": task_ids, "fields": list(values.keys()), "values": values}
     return await request("POST", "/tasks/bulk", caller_token(), json=body)
 
 
@@ -403,7 +539,11 @@ async def tasks_bulk_update(task_ids: list[int], values: dict) -> dict:
 
 @tool
 async def label_list(page: int = 1, per_page: int = 50, search: str = "") -> Any:
-    """List labels the caller can access. `search` filters by title."""
+    """List labels the caller can access. `search` filters by title.
+
+    Capped at `per_page` (default 50). When more pages exist the result becomes
+    `{"items": [...], "pagination": {"truncated": true, ...}}` — raise `page` to read on.
+    """
     params = {"page": page, "per_page": per_page, "s": search or None}
     return await request("GET", "/labels", caller_token(), params=params)
 
@@ -460,7 +600,13 @@ async def task_label_remove(task_id: int, label_id: int) -> dict:
 
 @tool
 async def comment_list(task_id: int) -> Any:
-    """List comments on a task."""
+    """List comments on a task.
+
+    Vikunja paginates this endpoint but the tool exposes no `page` argument, so a task
+    with more than ~50 comments returns the first page only. That case is now visible —
+    the result becomes `{"items": [...], "pagination": {"truncated": true, ...}}` — rather
+    than silently short. Tracked as vikunja#341 (id 357).
+    """
     return await request("GET", f"/tasks/{task_id}/comments", caller_token())
 
 
@@ -488,7 +634,11 @@ async def comment_delete(task_id: int, comment_id: int) -> dict:
 
 @tool
 async def task_assignee_list(task_id: int) -> Any:
-    """List the users assigned to a task."""
+    """List the users assigned to a task.
+
+    No `page` argument — a truncated result is reported via the `pagination` envelope
+    rather than silently cut. See vikunja#341 (id 357).
+    """
     return await request("GET", f"/tasks/{task_id}/assignees", caller_token())
 
 
@@ -564,7 +714,11 @@ async def task_reminders_set(task_id: int, reminders: list[str]) -> dict:
 
 @tool
 async def attachment_list(task_id: int) -> Any:
-    """List attachments on a task."""
+    """List attachments on a task.
+
+    No `page` argument — a truncated result is reported via the `pagination` envelope
+    rather than silently cut. See vikunja#341 (id 357).
+    """
     return await request("GET", f"/tasks/{task_id}/attachments", caller_token())
 
 
@@ -645,7 +799,11 @@ async def filter_delete(filter_id: int) -> dict:
 
 @tool
 async def team_list(page: int = 1, per_page: int = 50, search: str = "") -> Any:
-    """List teams the caller belongs to. `search` filters by name."""
+    """List teams the caller belongs to. `search` filters by name.
+
+    Capped at `per_page` (default 50). When more pages exist the result becomes
+    `{"items": [...], "pagination": {"truncated": true, ...}}` — raise `page` to read on.
+    """
     params = {"page": page, "per_page": per_page, "s": search or None}
     return await request("GET", "/teams", caller_token(), params=params)
 
@@ -711,7 +869,11 @@ async def team_member_toggle_admin(team_id: int, user_id: int) -> dict:
 
 @tool
 async def project_team_list(project_id: int, page: int = 1, per_page: int = 50) -> Any:
-    """List teams a project is shared with."""
+    """List teams a project is shared with.
+
+    Capped at `per_page` (default 50). When more pages exist the result becomes
+    `{"items": [...], "pagination": {"truncated": true, ...}}` — raise `page` to read on.
+    """
     params = {"page": page, "per_page": per_page}
     return await request("GET", f"/projects/{project_id}/teams", caller_token(), params=params)
 
@@ -742,7 +904,11 @@ async def project_team_remove(project_id: int, team_id: int) -> dict:
 
 @tool
 async def project_user_list(project_id: int, page: int = 1, per_page: int = 50) -> Any:
-    """List users a project is shared with directly."""
+    """List users a project is shared with directly.
+
+    Capped at `per_page` (default 50). When more pages exist the result becomes
+    `{"items": [...], "pagination": {"truncated": true, ...}}` — raise `page` to read on.
+    """
     params = {"page": page, "per_page": per_page}
     return await request("GET", f"/projects/{project_id}/users", caller_token(), params=params)
 
@@ -773,7 +939,11 @@ async def project_user_remove(project_id: int, user_id: int) -> dict:
 
 @tool
 async def project_share_list(project_id: int, page: int = 1, per_page: int = 50) -> Any:
-    """List link shares configured on a project."""
+    """List link shares configured on a project.
+
+    Capped at `per_page` (default 50). When more pages exist the result becomes
+    `{"items": [...], "pagination": {"truncated": true, ...}}` — raise `page` to read on.
+    """
     params = {"page": page, "per_page": per_page}
     return await request("GET", f"/projects/{project_id}/shares", caller_token(), params=params)
 
@@ -827,7 +997,11 @@ async def project_share_delete(project_id: int, share_id: int) -> dict:
 
 @tool
 async def view_list(project_id: int) -> Any:
-    """List the views configured on a project (the 4 auto-created ones by default)."""
+    """List the views configured on a project (the 4 auto-created ones by default).
+
+    No `page` argument — a truncated result is reported via the `pagination` envelope
+    rather than silently cut. See vikunja#341 (id 357).
+    """
     return await request("GET", f"/projects/{project_id}/views", caller_token())
 
 
@@ -882,7 +1056,11 @@ async def view_delete(project_id: int, view_id: int) -> dict:
 
 @tool
 async def bucket_list(project_id: int, view_id: int, page: int = 1, per_page: int = 50) -> Any:
-    """List the kanban buckets (columns) of a project view."""
+    """List the kanban buckets (columns) of a project view.
+
+    Capped at `per_page` (default 50). When more pages exist the result becomes
+    `{"items": [...], "pagination": {"truncated": true, ...}}` — raise `page` to read on.
+    """
     params = {"page": page, "per_page": per_page}
     return await request(
         "GET",
@@ -956,7 +1134,11 @@ async def webhook_events() -> Any:
 
 @tool
 async def webhook_list(project_id: int, page: int = 1, per_page: int = 50) -> Any:
-    """List webhook targets configured on a project."""
+    """List webhook targets configured on a project.
+
+    Capped at `per_page` (default 50). When more pages exist the result becomes
+    `{"items": [...], "pagination": {"truncated": true, ...}}` — raise `page` to read on.
+    """
     params = {"page": page, "per_page": per_page}
     return await request("GET", f"/projects/{project_id}/webhooks", caller_token(), params=params)
 

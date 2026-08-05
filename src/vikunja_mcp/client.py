@@ -41,6 +41,55 @@ async def aclose() -> None:
         _client = None
 
 
+def _pagination_envelope(
+    resp: httpx.Response, data: list[Any], params: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Wrap a truncated list response so the caller can see it is incomplete.
+
+    Vikunja paginates every list endpoint (default 50 per page) and reports the extent
+    only in headers. Returning the bare list therefore hands an agent a silently truncated
+    answer: "find every ticket about X" reads at most one page and looks complete. That is
+    a correctness problem, not an ergonomics one, so a truncated result is re-shaped into
+    ``{"items": [...], "pagination": {...}}`` while a complete one is returned untouched.
+
+    Returns None when the response is not a truncated list, meaning "return ``data`` as-is".
+
+    On the two headers: ``x-pagination-total-pages`` is the page count, and
+    ``x-pagination-result-count`` is the number of items in *this* response, not the size
+    of the whole result set — probed at per_page 1/5/50, where it came back 1/5/50 against
+    340/68/7 total pages. It is surfaced as ``count`` for that reason; calling it
+    ``result_count`` invites exactly the misreading the envelope exists to prevent.
+    Vikunja exposes no total-item count, so none is reported rather than inferred.
+    """
+    raw_total = resp.headers.get("x-pagination-total-pages")
+    if not raw_total:
+        return None
+    try:
+        total_pages = int(raw_total)
+    except ValueError:
+        log.info("vikunja_pagination_header_unparsable", value=raw_total)
+        return None
+    if total_pages <= 1:
+        return None
+
+    # The requested page is taken from the params we actually sent — explicit, never
+    # inferred from the response. Vikunja defaults to page 1 when the caller omits it.
+    try:
+        page = int(params.get("page", 1))
+    except (TypeError, ValueError):
+        page = 1
+
+    return {
+        "items": data,
+        "pagination": {
+            "page": page,
+            "total_pages": total_pages,
+            "count": len(data),
+            "truncated": True,
+        },
+    }
+
+
 def _extract_error(resp: httpx.Response) -> str:
     """Pull Vikunja's error message out of the body, falling back to raw text.
 
@@ -66,6 +115,12 @@ async def request(
     files: Any = None,
 ) -> Any:
     """Make one authenticated request to Vikunja and return the decoded JSON.
+
+    Returns the decoded body unchanged, with one exception: a **list** body that Vikunja
+    reports as spanning more than one page is wrapped as
+    ``{"items": [...], "pagination": {...}}`` so the caller can tell a first page from a
+    complete answer (see :func:`_pagination_envelope`). Single-page lists and all non-list
+    bodies pass through untouched.
 
     Args:
         method: HTTP verb.
@@ -103,4 +158,17 @@ async def request(
 
     if resp.status_code == 204 or not resp.content:
         return {"ok": True}
-    return resp.json()
+
+    data = resp.json()
+    if isinstance(data, list):
+        envelope = _pagination_envelope(resp, data, clean_params)
+        if envelope is not None:
+            log.info(
+                "vikunja_result_truncated",
+                method=method,
+                path=path,
+                page=envelope["pagination"]["page"],
+                total_pages=envelope["pagination"]["total_pages"],
+            )
+            return envelope
+    return data

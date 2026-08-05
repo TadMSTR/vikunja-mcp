@@ -44,6 +44,12 @@ async def call(tool, **kwargs):
         "https://box.internal/hook",  # internal suffix
         "http://[::1]/hook",  # ipv6 loopback
         "ftp://example.com/hook",  # wrong scheme
+        "https://100.64.0.1/hook",  # CGNAT — is_private is False for this since py3.12.4
+        "https://100.127.255.254/hook",  # CGNAT upper edge
+        "https://224.0.0.1/hook",  # multicast
+        "https://0.0.0.0/hook",  # unspecified
+        "http://[fd00::1]/hook",  # ipv6 ULA
+        "http://[fe80::1]/hook",  # ipv6 link-local
     ],
 )
 async def test_webhook_create_rejects_internal_targets(_patch_calls, url):
@@ -54,6 +60,17 @@ async def test_webhook_create_rejects_internal_targets(_patch_calls, url):
 
 async def test_webhook_create_allows_public_ip_literal(_patch_calls):
     await call(server.webhook_create, project_id=1, target_url="https://8.8.8.8/hook", events=["x"])
+    assert _patch_calls.call_args.args[:2] == ("PUT", "/projects/1/webhooks")
+
+
+async def test_webhook_create_allows_public_ipv6_literal(_patch_calls):
+    """The is_global tightening must not start refusing legitimate public targets."""
+    await call(
+        server.webhook_create,
+        project_id=1,
+        target_url="https://[2606:4700::1111]/hook",
+        events=["x"],
+    )
     assert _patch_calls.call_args.args[:2] == ("PUT", "/projects/1/webhooks")
 
 
@@ -76,13 +93,36 @@ def test_host_allowed_when_hostname_resolves_to_public(monkeypatch):
     assert server._host_is_blocked("example.com") is False
 
 
-def test_host_allowed_when_unresolvable(monkeypatch):
+def test_host_blocked_when_unresolvable(monkeypatch):
+    """Fail closed: an unclassifiable host is refused, not waved through.
+
+    This asserted the opposite until the 2026-08-04 audit. The old behaviour reasoned that
+    Vikunja re-resolves at delivery, but forge disables Vikunja's own SSRF filter, so that
+    second resolution is unguarded — leaving DNS rebinding open.
+    """
+
     def _boom(*a, **k):
         raise OSError("nxdomain")
 
     monkeypatch.setattr(server.socket, "getaddrinfo", _boom)
-    # cannot classify → allow (Vikunja re-resolves at delivery)
-    assert server._host_is_blocked("does-not-resolve.example.com") is False
+    assert server._host_is_blocked("does-not-resolve.example.com") is True
+
+
+async def test_webhook_create_rejects_unresolvable_host(_patch_calls, monkeypatch):
+    """End to end: the rejection happens before any upstream call."""
+
+    def _boom(*a, **k):
+        raise OSError("nxdomain")
+
+    monkeypatch.setattr(server.socket, "getaddrinfo", _boom)
+    with pytest.raises(VikunjaAPIError, match="SSRF guard"):
+        await call(
+            server.webhook_create,
+            project_id=1,
+            target_url="https://nxdomain.example/hook",
+            events=["task.created"],
+        )
+    _patch_calls.assert_not_called()
 
 
 # --- F-04: attachment decode guard ----------------------------------------
