@@ -248,8 +248,15 @@ def _host_is_blocked(host: str) -> bool:
     try:
         infos = socket.getaddrinfo(h, None)
     except OSError:
-        # Unresolvable here — can't classify; Vikunja re-resolves at delivery. Allow.
-        return False
+        # Unresolvable — refuse. This previously allowed the host, reasoning that Vikunja
+        # re-resolves at delivery; that reasoning was void, because forge disables Vikunja's
+        # own outgoing-request filter (ALLOWNONROUTABLEIPS=true), so the delivery-time
+        # resolution is unguarded. A name that does not resolve now but resolves to an
+        # internal address at delivery is the DNS-rebinding case, and this MCP-side check is
+        # the only control standing in front of it. Failing closed costs a rejected
+        # registration when a legitimate host is momentarily unresolvable, which is the
+        # cheaper error for a rare, deliberate operation. (audit 2026-08-04, MEDIUM)
+        return True
     for info in infos:
         addr = info[4][0].split("%")[0]  # strip any zone id
         try:

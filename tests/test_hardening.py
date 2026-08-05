@@ -93,13 +93,36 @@ def test_host_allowed_when_hostname_resolves_to_public(monkeypatch):
     assert server._host_is_blocked("example.com") is False
 
 
-def test_host_allowed_when_unresolvable(monkeypatch):
+def test_host_blocked_when_unresolvable(monkeypatch):
+    """Fail closed: an unclassifiable host is refused, not waved through.
+
+    This asserted the opposite until the 2026-08-04 audit. The old behaviour reasoned that
+    Vikunja re-resolves at delivery, but forge disables Vikunja's own SSRF filter, so that
+    second resolution is unguarded — leaving DNS rebinding open.
+    """
+
     def _boom(*a, **k):
         raise OSError("nxdomain")
 
     monkeypatch.setattr(server.socket, "getaddrinfo", _boom)
-    # cannot classify → allow (Vikunja re-resolves at delivery)
-    assert server._host_is_blocked("does-not-resolve.example.com") is False
+    assert server._host_is_blocked("does-not-resolve.example.com") is True
+
+
+async def test_webhook_create_rejects_unresolvable_host(_patch_calls, monkeypatch):
+    """End to end: the rejection happens before any upstream call."""
+
+    def _boom(*a, **k):
+        raise OSError("nxdomain")
+
+    monkeypatch.setattr(server.socket, "getaddrinfo", _boom)
+    with pytest.raises(VikunjaAPIError, match="SSRF guard"):
+        await call(
+            server.webhook_create,
+            project_id=1,
+            target_url="https://nxdomain.example/hook",
+            events=["task.created"],
+        )
+    _patch_calls.assert_not_called()
 
 
 # --- F-04: attachment decode guard ----------------------------------------

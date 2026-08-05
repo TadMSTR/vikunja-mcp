@@ -17,13 +17,16 @@ route `server.py` implements and asserts the implemented method appears in `Allo
 
 Usage
 -----
-    VIKUNJA_URL=https://vikunja.example VIKUNJA_TOKEN=... python scripts/verify-routes.py
+    VIKUNJA_URL=https://vikunja.example python scripts/verify-routes.py
 
-Exits 0 if every route agrees with the router, 1 on any mismatch, and 0 with a skip
-notice when the credentials are absent (so an opt-in CI job stays green rather than
-failing closed on a fork or a PR from outside).
+Exits 0 if every route agrees with the router, 1 on any mismatch, and 0 with a skip notice
+when no target URL is set (so an opt-in CI job stays green rather than failing closed).
 
-The token is read from the environment and never logged, echoed, or included in output.
+**No credential is needed.** Echo answers the route-mismatch 405 before auth middleware
+runs, verified across all 69 routes with no Authorization header. Do not configure a
+VIKUNJA_TOKEN secret for this — an unnecessary CI secret is only blast radius. If one is
+present in the environment it is forwarded (so this still works should a future Vikunja
+authenticate before routing), and it is never logged, echoed, or included in output.
 """
 
 from __future__ import annotations
@@ -111,11 +114,21 @@ def main() -> int:
     parser.add_argument("--timeout", type=float, default=15.0)
     args = parser.parse_args()
 
-    token = os.environ.get("VIKUNJA_TOKEN")
-    if not args.url or not token:
-        # Skip, do not fail: this runs opt-in against a host CI runners cannot reach.
-        print("SKIP: VIKUNJA_URL and VIKUNJA_TOKEN must both be set; nothing probed.")
+    if not args.url:
+        # Skip, do not fail: this is opt-in and not every environment configures a target.
+        print("SKIP: VIKUNJA_URL is not set; nothing probed.")
         return 0
+
+    # No credential is required. Echo matches the route and answers 405 + Allow: before any
+    # auth middleware runs — verified 2026-08-04 across all 69 routes with no Authorization
+    # header at all, and again with a deliberately invalid one. The sweep therefore needs no
+    # live Vikunja token, and none should be configured for it: a CI secret that is never
+    # needed is pure blast radius. A token is still forwarded when one happens to be set, so
+    # this keeps working if a future Vikunja authenticates before routing.
+    headers = {}
+    token = os.environ.get("VIKUNJA_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
 
     routes = discover_routes(SERVER_PY)
     if not routes:
@@ -123,7 +136,7 @@ def main() -> int:
         return 1
 
     failures: list[str] = []
-    with httpx.Client(timeout=args.timeout, headers={"Authorization": f"Bearer {token}"}) as client:
+    with httpx.Client(timeout=args.timeout, headers=headers) as client:
         for method, path in routes:
             ok, detail = check(client, args.url, method, path)
             status = "ok  " if ok else "FAIL"

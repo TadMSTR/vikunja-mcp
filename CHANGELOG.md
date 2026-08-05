@@ -60,6 +60,17 @@ All notable changes to this project are documented here. Format follows
   Tailscale's range) reports `is_private=False` — so those targets passed. Latent rather
   than exploitable on forge (no CGNAT interface, route, or Tailscale install), but this
   guard is load-bearing here because forge disables Vikunja's own filter.
+- **The webhook SSRF guard now fails closed on an unresolvable host.** It previously
+  allowed one, reasoning that Vikunja re-resolves at delivery — but forge disables
+  Vikunja's outgoing-request filter, so that second resolution is unguarded, leaving a DNS
+  rebinding path into `forge-net`. A host that cannot be classified is now refused. Cost:
+  registering a webhook against a momentarily unresolvable legitimate host is rejected,
+  which is the cheaper failure for a rare, deliberate operation. (audit 2026-08-04, MEDIUM)
+- **`scripts/verify-routes.py` no longer requires a Vikunja token,** and the CI job no
+  longer takes one. Echo answers the route-mismatch 405 before auth middleware runs —
+  verified across all 69 routes with no `Authorization` header — so the sweep never needed
+  a credential. Removing it means no live Vikunja token exists as a GitHub secret at all,
+  rather than merely being scoped down. (audit 2026-08-04, INFO)
 
 ### Documentation
 - `SECURITY.md` no longer credits Vikunja's upstream SSRF filter, which forge disables via

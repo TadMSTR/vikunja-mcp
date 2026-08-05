@@ -1,9 +1,12 @@
 name: Verify routes
 
-# Opt-in, deliberately NOT on the PR path. This probes a live Vikunja instance, and
-# GitHub-hosted runners cannot reach forge's — a required job that always skips is worse
-# than no job, because it reads as coverage that does not exist. Run it manually, or let
-# the nightly schedule run it from a self-hosted runner that can reach the host.
+# Opt-in, deliberately NOT on the PR path. This probes a live Vikunja instance; keeping it
+# off pull_request means a fork PR can never trigger it, and a job that is only meaningful
+# against a configured host does not sit in the required-checks path pretending otherwise.
+#
+# runs-on: ubuntu-latest is correct — vikunja.helmforge.me is genuinely public (no Authentik
+# forward-auth on its SWAG vhost, so Bearer-token API calls work), so a GitHub-hosted runner
+# can reach it. No self-hosted runner is needed.
 on:
   workflow_dispatch:
   schedule:
@@ -23,8 +26,9 @@ jobs:
       - run: pip install httpx
       - name: Probe every implemented route against the live Echo router
         env:
-          # Both absent -> the script prints SKIP and exits 0, so this stays green on a
-          # fork or wherever the secrets are not configured.
+          # VIKUNJA_URL only — no token. Echo answers the route-mismatch 405 before auth
+          # middleware runs (verified across all 69 routes with no Authorization header), so
+          # this sweep needs no credential, and configuring one would add blast radius for
+          # nothing. With the variable unset the script prints SKIP and exits 0.
           VIKUNJA_URL: ${{ secrets.VIKUNJA_URL }}
-          VIKUNJA_TOKEN: ${{ secrets.VIKUNJA_TOKEN }}
         run: python scripts/verify-routes.py

@@ -33,10 +33,18 @@ Vikunja itself validates it. Consequences:
   and an internal address, so do not weaken it on the assumption that upstream will catch
   it. Always target a public SWAG hostname.
 
-  Known limit: a host that does not resolve at registration time is allowed through, since
-  it cannot be classified. Vikunja re-resolves at delivery, and with the upstream filter
-  off that re-resolution is unguarded — so a DNS entry that is public at registration and
-  internal at delivery (DNS rebinding) is not covered here.
+  **The guard fails closed.** A host that cannot be resolved is refused rather than waved
+  through. Until 2026-08-04 it was allowed, on the reasoning that Vikunja re-resolves at
+  delivery — but that reasoning does not hold in this deployment, because the upstream
+  filter is off and so the delivery-time resolution is unguarded. The practical cost is
+  that registering a webhook against a host forge cannot currently resolve will be
+  rejected; that is the cheaper failure for a rare, deliberate operation.
+
+  Residual limit: validation happens at registration, and Vikunja performs the actual
+  delivery in its own process. A name that resolves to a public address when registered and
+  is re-pointed to an internal one before delivery is still a TOCTOU window that a
+  registration-time check cannot close. Narrowing it further would require either a control
+  inside Vikunja (its own filter, currently disabled) or network isolation of the container.
 
 ## Reporting
 
