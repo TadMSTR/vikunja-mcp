@@ -97,7 +97,7 @@ All configuration is environment variables. No token is ever configured here.
 
 | Var | Purpose | Default |
 |-----|---------|---------|
-| `VIKUNJA_URL` | Base URL of the Vikunja instance (no `/api/v1`) | `https://vikunja.helmforge.me` |
+| `VIKUNJA_URL` | Base URL of the Vikunja instance (no `/api/v1`) | **required** — no default; the server refuses to start if unset |
 | `VIKUNJA_HOST` | Bind address | `127.0.0.1` |
 | `VIKUNJA_PORT` | Bind port | `8501` |
 | `VIKUNJA_TRANSPORT` | `http` or `stdio` | `http` |
@@ -109,6 +109,8 @@ All configuration is environment variables. No token is ever configured here.
 | `VIKUNJA_INFLUXDB3_DATABASE` | InfluxDB 3 target database | `vikunja_mcp` |
 | `VIKUNJA_NATS_URL` | Enable the NATS metrics sink (e.g. `nats://127.0.0.1:4222`) | off |
 | `VIKUNJA_NATS_SUBJECT` | NATS subject for metric events | `vikunja.mcp.metrics` |
+| `VIKUNJA_AUDIT_LOG` | Wire `contrib/audit_log.py` for the mutating tool set (`1`/`true`/`yes`) | off |
+| `VIKUNJA_AUDIT_LOG_DIR` | Directory audit lines are appended to, one `YYYY-MM-DD.md` file per day. Required if `VIKUNJA_AUDIT_LOG` is set — the server refuses to start rather than falling back to stdout | none |
 
 ## Run
 
