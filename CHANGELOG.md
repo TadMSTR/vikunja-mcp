@@ -6,6 +6,35 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+- **`comment_list`, `attachment_list`, `task_assignee_list`, and `view_list` now take
+  `page`/`per_page`.** These four list tools were the only ones without a way to reach
+  results past the first 50 — a caller could see `pagination.truncated: true` since v0.3.0
+  but had no way to fetch the rest. (ticket #341 / id 357)
+- **Opt-in audit trail for mutating tools.** Set `VIKUNJA_AUDIT_LOG=1` and
+  `VIKUNJA_AUDIT_LOG_DIR=<path>` to have `contrib/audit_log.py` register for `task_create`,
+  `task_update`, `tasks_bulk_update`, `task_delete`, `project_create`, `project_delete`,
+  `team_create`, `project_team_add`, `project_user_add`, `project_share_create`, and
+  `webhook_create`, writing one line per call to `<dir>/YYYY-MM-DD.md`. Off by default;
+  `VIKUNJA_AUDIT_LOG=1` with no directory set fails closed rather than falling back to
+  stdout. The trail is pseudonymous (a hash of the caller's token, not the token or a
+  reversible agent identity) and records that a call happened, not what changed. (ticket
+  #342 / id 361)
+
+### Changed
+- **`config.url` no longer defaults to a real hostname.** It now defaults to `""` and the
+  server refuses to start with a clear `ConfigError` if `VIKUNJA_URL` is unset, instead of
+  silently falling back to Ted's forge instance. (ticket #344 / id 363, SC-01)
+
+### Security
+- **Webhook documentation and the SSRF guard's refusal message no longer recommend a
+  target that doesn't work.** `SECURITY.md`, `docs/forge.md`, and the `webhook_create`
+  docstring told callers to point `target_url` at a public SWAG hostname; on forge,
+  split-horizon DNS resolves every `*.helmforge.me` name to the LAN, so the guard refused
+  exactly the target the docs recommended. Docs now state a valid target must be genuinely
+  external to forge, and that none currently exists on this deployment. The guard itself
+  (`_host_is_blocked`) is unchanged — it was already correct. (ticket #343 / id 362)
+
 ## [0.3.0] — 2026-08-04
 
 ### Fixed

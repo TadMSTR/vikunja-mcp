@@ -54,6 +54,29 @@ async def test_project_list_passes_search_as_s(_patch_calls):
     assert _patch_calls.call_args.kwargs["params"]["s"] == "alpha"
 
 
+# --- pagination on the four tools that were missing it (vikunja#341) ------
+
+
+async def test_comment_list_page_reaches_the_wire(_patch_calls):
+    await call(server.comment_list, task_id=2, page=2, per_page=10)
+    assert _patch_calls.call_args.kwargs["params"] == {"page": 2, "per_page": 10}
+
+
+async def test_attachment_list_page_reaches_the_wire(_patch_calls):
+    await call(server.attachment_list, task_id=2, page=2, per_page=10)
+    assert _patch_calls.call_args.kwargs["params"] == {"page": 2, "per_page": 10}
+
+
+async def test_task_assignee_list_page_reaches_the_wire(_patch_calls):
+    await call(server.task_assignee_list, task_id=2, page=2, per_page=10)
+    assert _patch_calls.call_args.kwargs["params"] == {"page": 2, "per_page": 10}
+
+
+async def test_view_list_page_reaches_the_wire(_patch_calls):
+    await call(server.view_list, project_id=1, page=2, per_page=10)
+    assert _patch_calls.call_args.kwargs["params"] == {"page": 2, "per_page": 10}
+
+
 # --- tasks ----------------------------------------------------------------
 
 

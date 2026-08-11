@@ -31,7 +31,17 @@ Vikunja itself validates it. Consequences:
   `VIKUNJA_OUTGOINGREQUESTS_ALLOWNONROUTABLEIPS=true` (verified 2026-08-04). In this
   deployment the MCP-side check is the only thing standing between a webhook registration
   and an internal address, so do not weaken it on the assumption that upstream will catch
-  it. Always target a public SWAG hostname.
+  it.
+
+  **On forge specifically, a SWAG hostname is not a valid target.** Split-horizon DNS
+  resolves every `*.helmforge.me` hostname to its LAN address, so the guard classifies
+  SWAG-fronted vhosts as internal and refuses them — including
+  `vikunja-webhook-listener`'s own vhost, which is the obvious candidate target. A valid
+  `target_url` must be genuinely external to forge. As of this writing no such target is in
+  use: `vikunja-webhook-listener` binds the Docker bridge gateway
+  (`172.20.1.1:8502`, container-reachable only), has no SWAG proxy-conf, and no agent is
+  granted `webhook_create`. Do not weaken this guard to work around that — fix the target,
+  not the check.
 
   **The guard fails closed.** A host that cannot be resolved is refused rather than waved
   through. Until 2026-08-04 it was allowed, on the reasoning that Vikunja re-resolves at

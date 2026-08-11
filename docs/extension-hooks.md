@@ -43,7 +43,7 @@ from vikunja_mcp.hooks import register_before
 async def enforce_public_webhook(kwargs: dict) -> dict:
     url = kwargs.get("target_url", "")
     if url.startswith("http://10.") or "localhost" in url:
-        raise PermissionError("webhook target must be a public SWAG hostname")
+        raise PermissionError("webhook target must be genuinely external to forge")
     return kwargs
 
 

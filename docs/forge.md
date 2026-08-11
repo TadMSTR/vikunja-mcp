@@ -193,9 +193,17 @@ removed tool and getting a refusal.
 
 ## Webhooks (Phase 10 — separate `vikunja-webhook-listener`)
 
-Not part of this server. When that listener registers Vikunja webhooks via `webhook_create`,
-the `target_url` **must** be a public SWAG hostname. Set the webhook `secret` so the
-listener can verify `X-Vikunja-Signature`.
+Not part of this server. If that listener were to register a Vikunja webhook via
+`webhook_create`, `target_url` would need to be genuinely external to forge — **not** a
+SWAG hostname. Split-horizon DNS resolves every `*.helmforge.me` name to its LAN address, so
+`vikunja-mcp`'s SSRF guard classifies SWAG-fronted vhosts as internal and refuses them, the
+same as any other private address. Set the webhook `secret` so the listener can verify
+`X-Vikunja-Signature`, once a valid external target exists.
+
+As of this writing there is no valid target on this deployment:
+`vikunja-webhook-listener` binds the Docker bridge gateway (`172.20.1.1:8502`,
+container-reachable only), has no SWAG proxy-conf, and no agent is granted `webhook_create`.
+This is a gap to close by adding a real external target, not by weakening the guard.
 
 The SSRF check that enforces this runs **in `vikunja-mcp`**, not upstream: forge's Vikunja
 container sets `VIKUNJA_OUTGOINGREQUESTS_ALLOWNONROUTABLEIPS=true`, which disables

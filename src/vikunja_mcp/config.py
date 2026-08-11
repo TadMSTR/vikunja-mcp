@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from .exceptions import ConfigError
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -19,7 +21,10 @@ class Settings(BaseSettings):
     )
 
     # Base URL of the Vikunja instance (without the /api/v1 suffix — the client appends it).
-    url: str = "https://vikunja.helmforge.me"
+    # No default: an environment-specific hostname baked in here would (a) publish it to
+    # every reader of this public repo and (b) let a misconfigured deployment silently fall
+    # back to someone else's instance instead of failing. See vikunja#344 (id 363, SC-01).
+    url: str = ""
     request_timeout: float = 30.0
 
     # Transport binding. Loopback-only by default: the token-passthrough model means any
@@ -36,7 +41,14 @@ _settings: Settings | None = None
 def get_settings() -> Settings:
     global _settings
     if _settings is None:
-        _settings = Settings()
+        settings = Settings()
+        if not settings.url:
+            raise ConfigError(
+                "VIKUNJA_URL is not set. This server has no default Vikunja instance — "
+                "set VIKUNJA_URL to the base URL of your Vikunja deployment (without the "
+                "/api/v1 suffix) before starting."
+            )
+        _settings = settings
     return _settings
 
 
