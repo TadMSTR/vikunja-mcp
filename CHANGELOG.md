@@ -6,6 +6,8 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-08-11
+
 ### Added
 - **`comment_list`, `attachment_list`, `task_assignee_list`, and `view_list` now take
   `page`/`per_page`.** These four list tools were the only ones without a way to reach
