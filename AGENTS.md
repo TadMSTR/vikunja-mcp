@@ -19,7 +19,7 @@ logic, no caching, no persistence.
 | `exceptions.py` | Typed error hierarchy | — |
 | `hooks.py` | Pre/post extension-hook registry, keyed on tool name | Swallow handler exceptions — hooks are not fire-and-forget |
 | `telemetry.py` | Optional OTLP spans/metrics, InfluxDB3, NATS — inert unless env-configured | Become a hard import dependency; a missing extra must degrade, not crash |
-| `contrib/` | Opt-in add-ons a deployment may register (e.g. `audit_log`) | Be imported by `server.py` implicitly — registration is the deployment's choice |
+| `contrib/` | Opt-in add-ons a deployment may register (e.g. `audit_log`) | Be imported unconditionally — the one exception is `audit_log`, gated behind `VIKUNJA_AUDIT_LOG=1` in `register_builtin_hooks` (vikunja#342, id 361); everything else in `contrib/` still needs its own explicit registration |
 
 ## Invariants (do not break)
 
@@ -55,6 +55,15 @@ logic, no caching, no persistence.
    one). `_apply_task_update` also drops `related_tasks`/`attachments`/`reactions` from the
    re-posted body — they live in their own tables and echoing them back is what made one
    `task_search` return 155k characters.
+
+7. **The audit trail is opt-in via env, not always-on.** Set `VIKUNJA_AUDIT_LOG=1` and
+   `VIKUNJA_AUDIT_LOG_DIR=<path>` to have `register_builtin_hooks` wire
+   `contrib/audit_log.py` for the mutating tool set (`server._AUDITED_TOOLS`), writing one
+   line per call to `<dir>/YYYY-MM-DD.md`. Unset `VIKUNJA_AUDIT_LOG` to turn it back off.
+   `VIKUNJA_AUDIT_LOG=1` with no dir set raises `ConfigError` at startup rather than
+   defaulting to stdout, where it would mix into PM2 logs. The trail records that a call
+   happened and a pseudonymous actor hash — not what changed, and not a reversible agent
+   identity (vikunja#342, id 361).
 
 ## Test expectations
 

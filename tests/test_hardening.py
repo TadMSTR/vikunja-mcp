@@ -198,3 +198,29 @@ async def test_influx_write_is_offloaded_via_schedule(monkeypatch):
     telemetry._emit("whoami", 0.01, None)
     assert len(scheduled) == 1  # influx write went through _schedule, not inline
     telemetry.reset_for_tests()
+
+
+# --- SC-01: fail closed on an unset VIKUNJA_URL -----------------------------
+
+
+def test_get_settings_raises_configerror_when_url_unset(monkeypatch):
+    from vikunja_mcp import config
+    from vikunja_mcp.exceptions import ConfigError
+
+    monkeypatch.delenv("VIKUNJA_URL", raising=False)
+    config.reset_settings()
+    try:
+        with pytest.raises(ConfigError):
+            config.get_settings()
+    finally:
+        monkeypatch.setenv("VIKUNJA_URL", "https://vikunja.test")
+        config.reset_settings()
+
+
+def test_get_settings_succeeds_when_url_set(monkeypatch):
+    from vikunja_mcp import config
+
+    monkeypatch.setenv("VIKUNJA_URL", "https://vikunja.test")
+    config.reset_settings()
+    assert config.get_settings().url == "https://vikunja.test"
+    config.reset_settings()

@@ -29,6 +29,7 @@ import binascii
 import functools
 import inspect
 import ipaddress
+import os
 import re
 import socket
 from collections.abc import Callable
@@ -44,8 +45,14 @@ from . import __version__, telemetry
 from .auth import caller_token
 from .client import request
 from .config import get_settings
-from .exceptions import VikunjaAPIError
-from .hooks import after_handlers, register_after, run_after_hooks, run_before_hooks
+from .exceptions import ConfigError, VikunjaAPIError
+from .hooks import (
+    after_handlers,
+    before_handlers,
+    register_after,
+    run_after_hooks,
+    run_before_hooks,
+)
 
 # ---------------------------------------------------------------------------
 # Logging — JSON structlog, on by default (forge MCP convention)
@@ -282,8 +289,11 @@ def _validate_webhook_target(url: str) -> None:
     if not host or _host_is_blocked(host):
         raise VikunjaAPIError(
             0,
-            f"webhook target_url host {host!r} is loopback/private/link-local/internal and "
-            "is refused (SSRF guard). Use a public SWAG hostname.",
+            f"webhook target_url host {host!r} is loopback/private/link-local/internal "
+            "(or resolves there) and is refused (SSRF guard). Note: on forge, split-horizon "
+            "DNS resolves *.helmforge.me — including SWAG-fronted vhosts — to the LAN, so "
+            "those are blocked too. A valid target must be genuinely external to forge; "
+            "see SECURITY.md.",
         )
 
 
@@ -461,6 +471,50 @@ async def _strip_ambiguous_task_index(result: Any) -> Any:
     return result
 
 
+# Mutating tools audited when VIKUNJA_AUDIT_LOG=1 — the set contrib/audit_log.py's own
+# docstring names, plus tasks_bulk_update, which mutates N tasks per call and was missing
+# from that list (vikunja#342, id 361). Flagged as an omission, not folded in silently.
+_AUDITED_TOOLS = (
+    "task_create",
+    "task_update",
+    "tasks_bulk_update",
+    "task_delete",
+    "project_create",
+    "project_delete",
+    "team_create",
+    "project_team_add",
+    "project_user_add",
+    "project_share_create",
+    "webhook_create",
+)
+
+
+def _register_audit_log_if_enabled() -> None:
+    """Env-gated wiring for contrib/audit_log.py (vikunja#342, id 361).
+
+    ``contrib/`` is deliberately not imported by default — see AGENTS.md's module-boundary
+    table. This is the one exception: an explicit opt-in via ``VIKUNJA_AUDIT_LOG=1``, chosen
+    over a deployment-side entry point so the wiring is visible to this repo's own tests and
+    code review rather than living in ``/opt/appdata``.
+    """
+    if os.environ.get("VIKUNJA_AUDIT_LOG", "").strip().lower() not in ("1", "true", "yes"):
+        return
+    if any(getattr(h, "is_audit_log_hook", False) for h in before_handlers("task_create")):
+        return  # already wired — register_builtin_hooks() can be called more than once
+
+    audit_dir = os.environ.get("VIKUNJA_AUDIT_LOG_DIR", "").strip()
+    if not audit_dir:
+        raise ConfigError(
+            "VIKUNJA_AUDIT_LOG=1 but VIKUNJA_AUDIT_LOG_DIR is unset. Set it to the directory "
+            "the audit trail should be written to (one file per day, never stdout), or unset "
+            "VIKUNJA_AUDIT_LOG to leave the audit trail off."
+        )
+
+    from .contrib.audit_log import FileAuditLogger, register_audit_log
+
+    register_audit_log(_AUDITED_TOOLS, logger=FileAuditLogger(audit_dir))
+
+
 def register_builtin_hooks() -> None:
     """Register the hooks this server ships with. Idempotent.
 
@@ -471,6 +525,7 @@ def register_builtin_hooks() -> None:
     """
     if _strip_ambiguous_task_index not in after_handlers("task_create"):
         register_after("task_create", _strip_ambiguous_task_index)
+    _register_audit_log_if_enabled()
 
 
 register_builtin_hooks()
@@ -599,15 +654,14 @@ async def task_label_remove(task_id: int, label_id: int) -> dict:
 
 
 @tool
-async def comment_list(task_id: int) -> Any:
+async def comment_list(task_id: int, page: int = 1, per_page: int = 50) -> Any:
     """List comments on a task.
 
-    Vikunja paginates this endpoint but the tool exposes no `page` argument, so a task
-    with more than ~50 comments returns the first page only. That case is now visible —
-    the result becomes `{"items": [...], "pagination": {"truncated": true, ...}}` — rather
-    than silently short. Tracked as vikunja#341 (id 357).
+    Capped at `per_page` (default 50). When more pages exist the result becomes
+    `{"items": [...], "pagination": {"truncated": true, ...}}` — raise `page` to read on.
     """
-    return await request("GET", f"/tasks/{task_id}/comments", caller_token())
+    params = {"page": page, "per_page": per_page}
+    return await request("GET", f"/tasks/{task_id}/comments", caller_token(), params=params)
 
 
 @tool
@@ -633,13 +687,14 @@ async def comment_delete(task_id: int, comment_id: int) -> dict:
 
 
 @tool
-async def task_assignee_list(task_id: int) -> Any:
+async def task_assignee_list(task_id: int, page: int = 1, per_page: int = 50) -> Any:
     """List the users assigned to a task.
 
-    No `page` argument — a truncated result is reported via the `pagination` envelope
-    rather than silently cut. See vikunja#341 (id 357).
+    Capped at `per_page` (default 50). When more pages exist the result becomes
+    `{"items": [...], "pagination": {"truncated": true, ...}}` — raise `page` to read on.
     """
-    return await request("GET", f"/tasks/{task_id}/assignees", caller_token())
+    params = {"page": page, "per_page": per_page}
+    return await request("GET", f"/tasks/{task_id}/assignees", caller_token(), params=params)
 
 
 @tool
@@ -713,13 +768,14 @@ async def task_reminders_set(task_id: int, reminders: list[str]) -> dict:
 
 
 @tool
-async def attachment_list(task_id: int) -> Any:
+async def attachment_list(task_id: int, page: int = 1, per_page: int = 50) -> Any:
     """List attachments on a task.
 
-    No `page` argument — a truncated result is reported via the `pagination` envelope
-    rather than silently cut. See vikunja#341 (id 357).
+    Capped at `per_page` (default 50). When more pages exist the result becomes
+    `{"items": [...], "pagination": {"truncated": true, ...}}` — raise `page` to read on.
     """
-    return await request("GET", f"/tasks/{task_id}/attachments", caller_token())
+    params = {"page": page, "per_page": per_page}
+    return await request("GET", f"/tasks/{task_id}/attachments", caller_token(), params=params)
 
 
 @tool
@@ -996,13 +1052,14 @@ async def project_share_delete(project_id: int, share_id: int) -> dict:
 
 
 @tool
-async def view_list(project_id: int) -> Any:
+async def view_list(project_id: int, page: int = 1, per_page: int = 50) -> Any:
     """List the views configured on a project (the 4 auto-created ones by default).
 
-    No `page` argument — a truncated result is reported via the `pagination` envelope
-    rather than silently cut. See vikunja#341 (id 357).
+    Capped at `per_page` (default 50). When more pages exist the result becomes
+    `{"items": [...], "pagination": {"truncated": true, ...}}` — raise `page` to read on.
     """
-    return await request("GET", f"/projects/{project_id}/views", caller_token())
+    params = {"page": page, "per_page": per_page}
+    return await request("GET", f"/projects/{project_id}/views", caller_token(), params=params)
 
 
 @tool
@@ -1152,11 +1209,13 @@ async def webhook_create(
 ) -> dict:
     """Register a webhook target on a project.
 
-    SECURITY / SSRF: Vikunja refuses to deliver webhooks to private/RFC1918 addresses by
-    default and will reject a target_url that resolves to one. Always point `target_url`
-    at a public hostname routed through SWAG (e.g. the vikunja-webhook-listener vhost),
-    never a raw internal IP. `secret` is the HMAC key Vikunja signs deliveries with
-    (X-Vikunja-Signature) — set it so the listener can verify authenticity.
+    SECURITY / SSRF: `target_url` must be genuinely external to forge. This server's SSRF
+    guard resolves the hostname and refuses any address that is loopback, private,
+    link-local, reserved, multicast, or unspecified — and on forge that includes
+    `*.helmforge.me` (split-horizon DNS resolves it to the LAN), so a SWAG-fronted hostname
+    is refused just like a raw internal IP. See SECURITY.md. `secret` is the HMAC key
+    Vikunja signs deliveries with (X-Vikunja-Signature) — set it so the listener can verify
+    authenticity.
     """
     _validate_webhook_target(target_url)
     body = _drop_none(target_url=target_url, events=events, secret=secret or None)

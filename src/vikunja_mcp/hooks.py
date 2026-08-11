@@ -94,6 +94,14 @@ def after_handlers(tool: str) -> list[Callable[..., Any]]:
     return list(_after.get(tool, []))
 
 
+def before_handlers(tool: str) -> list[Callable[..., Any]]:
+    """Return the pre-call handlers currently registered for ``tool``.
+
+    Exposed for the same idempotent-registration reason as :func:`after_handlers`.
+    """
+    return list(_before.get(tool, []))
+
+
 def clear_hooks() -> None:
     """Remove all registered hooks. Intended for tests only.
 

@@ -11,23 +11,27 @@ Register it for the tools you want audited (typically the mutating ones)::
     from vikunja_mcp.contrib.audit_log import register_audit_log
 
     register_audit_log([
-        "task_create", "task_update", "task_delete",
+        "task_create", "task_update", "tasks_bulk_update", "task_delete",
         "project_create", "project_delete",
         "team_create", "project_team_add", "project_user_add",
         "project_share_create", "webhook_create",
     ])
 
-**Nothing here is active until a deployment calls ``register_audit_log``.** This module is
-opt-in contrib, not server wiring: ``server.py`` does not import it, and as of 2026-08-04
-no forge deployment registers it, so this server currently emits no audit trail. An earlier
-version of this docstring claimed the module "satisfies the forge tool-audit directive",
-which read as though importing the file were enough — it is not, and that wording left the
-directive quietly unsatisfied.
+``server.py`` uses exactly this set (``server._AUDITED_TOOLS``) when env-gated via
+``VIKUNJA_AUDIT_LOG=1`` — see ``server.register_builtin_hooks``.
+
+**Nothing here is active until something calls ``register_audit_log``.** This module is
+opt-in contrib, not server wiring by default. ``server.py`` registers it only when
+``VIKUNJA_AUDIT_LOG=1`` is set (see ``register_builtin_hooks``) — unset, this server emits
+no audit trail. An earlier version of this docstring claimed the module "satisfies the
+forge tool-audit directive", which read as though importing the file were enough — it is
+not, and that wording left the directive quietly unsatisfied.
 
 It provides the *mechanism* for the directive (acting agent + tool + args-hash). Satisfying
 it requires registering the tools you want audited, in whatever wires up your deployment.
-To route the line into ``~/.claude/comms/artifacts/tool-audit/`` instead of stdout, pass
-your own ``logger`` (any object with an ``info(event, **fields)`` method).
+Pass your own ``logger`` (any object with an ``info(event, **fields)`` method) to route the
+line somewhere other than stdout — :class:`FileAuditLogger` below is a ready-made one that
+appends to a directory you supply, one file per day, so it never mixes into process logs.
 """
 
 from __future__ import annotations
@@ -35,6 +39,8 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Callable, Iterable
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 import structlog
@@ -44,6 +50,29 @@ from ..exceptions import AuthError
 from ..hooks import register_before
 
 _default_log = structlog.get_logger("vikunja_mcp.audit")
+
+
+class FileAuditLogger:
+    """Appends one line per event to ``<directory>/YYYY-MM-DD.md``.
+
+    Deliberately takes the directory as a constructor argument rather than defaulting to
+    one — a baked-in path would be exactly the SC-01 pattern (an environment-specific
+    location published in a public repo's source); the deployment supplies it via
+    ``logger=FileAuditLogger(os.environ["VIKUNJA_AUDIT_LOG_DIR"])`` instead.
+    """
+
+    def __init__(self, directory: str | Path) -> None:
+        self._dir = Path(directory).expanduser()
+
+    def info(self, event: str, **fields: Any) -> None:
+        self._dir.mkdir(parents=True, exist_ok=True)
+        now = datetime.now(UTC)
+        line = f"- {now.isoformat(timespec='seconds')} | {event} | " + " | ".join(
+            f"{key}={value}" for key, value in fields.items()
+        )
+        path = self._dir / f"{now:%Y-%m-%d}.md"
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
 
 
 def _digest(value: Any) -> str:
@@ -85,6 +114,9 @@ def audit_log_hook(tool: str, logger: Any | None = None) -> Callable[[dict], Any
         )
         return kwargs
 
+    # Tagged so callers (server.register_builtin_hooks) can detect an already-registered
+    # audit hook without depending on closure identity, which differs on every call.
+    handler.is_audit_log_hook = True  # type: ignore[attr-defined]
     return handler
 
 

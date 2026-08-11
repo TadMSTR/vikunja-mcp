@@ -6,6 +6,7 @@ import pytest
 
 from vikunja_mcp import hooks, server
 from vikunja_mcp.contrib import audit_log
+from vikunja_mcp.exceptions import ConfigError
 
 
 class _CaptureLogger:
@@ -73,3 +74,68 @@ def _async_ok():
 
 def _fn(tool):
     return tool if callable(tool) and not hasattr(tool, "fn") else tool.fn
+
+
+# --- FileAuditLogger --------------------------------------------------------
+
+
+def test_file_audit_logger_appends_dated_file(tmp_path):
+    logger = audit_log.FileAuditLogger(tmp_path)
+    logger.info("vikunja_tool_call", tool="task_create", actor="agent:abc", args_hash="dead")
+
+    files = list(tmp_path.glob("*.md"))
+    assert len(files) == 1
+    assert files[0].stem.count("-") == 2  # YYYY-MM-DD
+    content = files[0].read_text()
+    assert "tool=task_create" in content
+    assert "actor=agent:abc" in content
+
+
+# --- env-gated wiring (vikunja#342, id 361) ---------------------------------
+
+
+async def test_register_builtin_hooks_wires_audit_log_when_env_set(monkeypatch, tmp_path):
+    monkeypatch.setenv("VIKUNJA_AUDIT_LOG", "1")
+    monkeypatch.setenv("VIKUNJA_AUDIT_LOG_DIR", str(tmp_path))
+    monkeypatch.setattr(server, "request", _async_ok())
+    monkeypatch.setattr(server, "caller_token", lambda: "TOK")
+
+    server.register_builtin_hooks()
+    await _fn(server.task_create)(project_id=1, title="Ship it")
+    await _fn(server.task_get)(task_id=1)  # read-only — must NOT be audited
+
+    files = list(tmp_path.glob("*.md"))
+    assert len(files) == 1
+    content = files[0].read_text()
+    assert "tool=task_create" in content
+    assert "tool=task_get" not in content
+
+
+def test_register_builtin_hooks_raises_when_dir_unset(monkeypatch):
+    monkeypatch.setenv("VIKUNJA_AUDIT_LOG", "1")
+    monkeypatch.delenv("VIKUNJA_AUDIT_LOG_DIR", raising=False)
+    with pytest.raises(ConfigError):
+        server.register_builtin_hooks()
+
+
+async def test_register_builtin_hooks_is_idempotent(monkeypatch, tmp_path):
+    monkeypatch.setenv("VIKUNJA_AUDIT_LOG", "1")
+    monkeypatch.setenv("VIKUNJA_AUDIT_LOG_DIR", str(tmp_path))
+    monkeypatch.setattr(server, "request", _async_ok())
+    monkeypatch.setattr(server, "caller_token", lambda: "TOK")
+
+    server.register_builtin_hooks()
+    server.register_builtin_hooks()  # must not double-register
+    await _fn(server.task_create)(project_id=1, title="Ship it")
+
+    files = list(tmp_path.glob("*.md"))
+    lines = [line for line in files[0].read_text().splitlines() if line.strip()]
+    assert len(lines) == 1
+
+
+def test_register_builtin_hooks_noop_when_env_unset(monkeypatch, tmp_path):
+    monkeypatch.delenv("VIKUNJA_AUDIT_LOG", raising=False)
+    server.register_builtin_hooks()
+    assert not any(
+        getattr(h, "is_audit_log_hook", False) for h in hooks.before_handlers("task_create")
+    )
