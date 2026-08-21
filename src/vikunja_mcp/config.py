@@ -1,12 +1,18 @@
 """Configuration via environment variables.
 
-Only the *upstream* Vikunja location and transport binding live here. Deliberately
-absent: any Vikunja API token. This server never holds agent credentials — see
-``auth.py`` for the token-passthrough model.
+Mostly the *upstream* Vikunja location and transport binding. On any network transport
+this holds no Vikunja API token at all — see ``auth.py`` for the token-passthrough model
+that makes that possible.
+
+The one exception is ``VIKUNJA_TOKEN`` under ``transport=stdio``, where there is no HTTP
+request to carry a credential and passthrough therefore cannot work. That combination is
+opt-in, and its inverse — a token on a network transport — is refused at startup by
+``get_settings()``.
 """
 
 from __future__ import annotations
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .exceptions import ConfigError
@@ -42,6 +48,29 @@ class Settings(BaseSettings):
     host: str = "127.0.0.1"
     port: int = 8501
 
+    # Single-user fallback credential, for **stdio only**. Under stdio there is no HTTP
+    # request to carry an Authorization header, so passthrough has nothing to pass through
+    # and every tool call fails (vikunja#461). This is the escape hatch for that case, not
+    # a general-purpose service account.
+    #
+    # Never set it for a network transport. A static token on a shared port collapses every
+    # caller into a single Vikunja identity — forge runs six agents through this server and
+    # relies on per-agent attribution, which is the whole reason the passthrough model
+    # exists. get_settings() refuses that combination at startup rather than documenting it
+    # as a footgun.
+    token: str | None = None
+
+    @field_validator("token", mode="after")
+    @classmethod
+    def _blank_token_is_unset(cls, v: str | None) -> str | None:
+        """Treat `VIKUNJA_TOKEN=""` (or whitespace) as unset, not as a token.
+
+        Otherwise an empty assignment in a compose file or `.env` would satisfy the
+        "stdio needs a token" check at startup and then fail on the first tool call —
+        which is exactly the deferred failure this change exists to remove.
+        """
+        return v.strip() or None if v else None
+
 
 _settings: Settings | None = None
 
@@ -56,6 +85,36 @@ def get_settings() -> Settings:
                 "set VIKUNJA_URL to the base URL of your Vikunja deployment (without the "
                 "/api/v1 suffix) before starting."
             )
+
+        # Both of these are hard refusals at startup, not warnings.
+        #
+        # The first is a security boundary: a static token on a *network* transport makes
+        # every caller indistinguishable in Vikunja's audit trail, silently, with no
+        # symptom until someone asks who changed a ticket. That must not be reachable by
+        # misconfiguration. Note the check is `!= "stdio"` rather than `== "http"` — `sse`
+        # and any future network transport are just as unsafe, and enumerating the safe
+        # case is what keeps this correct as transports are added.
+        if settings.token and settings.transport != "stdio":
+            raise ConfigError(
+                f"VIKUNJA_TOKEN is set but VIKUNJA_TRANSPORT is {settings.transport!r}. "
+                "A static token is only supported for stdio, where there is no HTTP "
+                "request to carry the caller's own credential. On a network transport it "
+                "would make every caller act as one Vikunja identity and destroy per-agent "
+                "attribution — so this combination is refused rather than silently "
+                "accepted. Unset VIKUNJA_TOKEN and let each caller send its own "
+                "Authorization header, or switch to VIKUNJA_TRANSPORT=stdio."
+            )
+
+        # The second is a usability fix: without it the server starts, logs cleanly,
+        # registers every tool, and then fails 100% of calls at invocation time.
+        if settings.transport == "stdio" and not settings.token:
+            raise ConfigError(
+                "VIKUNJA_TRANSPORT=stdio requires VIKUNJA_TOKEN. Under stdio there is no "
+                "HTTP request to carry an Authorization header, so the token-passthrough "
+                "model has no token to pass through and every tool call would fail. Set "
+                "VIKUNJA_TOKEN to your Vikunja API token."
+            )
+
         _settings = settings
     return _settings
 

@@ -10,8 +10,8 @@ saved filters, and webhooks — designed for multi-agent use behind
 
 ## Why it's shaped this way — token passthrough
 
-This server holds **no** Vikunja credentials. Vikunja issues a per-user API token, and each
-agent has its own account. Rather than teaching this server to fetch five tokens from Vault
+Run over HTTP, this server holds **no** Vikunja credentials. Vikunja issues a per-user API
+token, and each agent has its own account. Rather than teaching this server to fetch five tokens from Vault
 and pick one per call, it stays stateless: it reads the caller's bearer token off the
 incoming request and forwards it to Vikunja unchanged.
 
@@ -33,6 +33,23 @@ flowchart LR
 
 Because the token *is* the credential, a request with no `Authorization` header is rejected
 fail-closed (`AuthError`) — there is no ambient fallback.
+
+### Single-user stdio
+
+Passthrough needs a request to pass a token through, so it cannot work over stdio — there
+is no HTTP request and therefore no header. If you are running this the ordinary MCP way
+(one subprocess, one user, launched by your client), set both:
+
+```bash
+VIKUNJA_TRANSPORT=stdio
+VIKUNJA_TOKEN=<your Vikunja API token>
+```
+
+Neither half is optional. `stdio` without a token refuses to start, rather than starting
+cleanly and failing every tool call the way it used to. And `VIKUNJA_TOKEN` with a network
+transport **also** refuses to start: a shared static token on a port makes every caller
+reach Vikunja as one identity, which silently destroys the per-agent attribution above. See
+[SECURITY.md](SECURITY.md) for the full rule.
 
 ## Tools
 
@@ -164,7 +181,9 @@ and handler signatures: [`docs/extension-hooks.md`](docs/extension-hooks.md).
 
 ## Configuration
 
-All configuration is environment variables. No token is ever configured here.
+All configuration is environment variables. The only Vikunja credential that can be
+configured here is the stdio-only `VIKUNJA_TOKEN` below; on any network transport the token
+comes from the caller's `Authorization` header.
 
 | Var | Purpose | Default |
 |-----|---------|---------|
@@ -172,6 +191,7 @@ All configuration is environment variables. No token is ever configured here.
 | `VIKUNJA_HOST` | Bind address | `127.0.0.1` |
 | `VIKUNJA_PORT` | Bind port | `8501` |
 | `VIKUNJA_TRANSPORT` | `http` or `stdio` | `http` |
+| `VIKUNJA_TOKEN` | Vikunja API token. **Required with `stdio`, refused with any other transport** — see [Single-user stdio](#single-user-stdio) | unset |
 | `VIKUNJA_REQUEST_TIMEOUT` | Upstream timeout (seconds) | `30` |
 | `VIKUNJA_DEFAULT_PROJECT_ID` | Project a `"#454"` ticket reference resolves within. Unset means resolve across all projects and **raise** if more than one matches — ticket numbers are only unique per project | unset |
 | `LOG_LEVEL` | Log verbosity | `INFO` |

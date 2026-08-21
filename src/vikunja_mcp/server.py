@@ -32,6 +32,7 @@ import ipaddress
 import os
 import re
 import socket
+import sys
 from collections.abc import Callable
 from typing import Any
 from urllib.parse import quote, urlparse
@@ -61,6 +62,30 @@ from .hooks import (
 # Logging — JSON structlog, on by default (forge MCP convention)
 # ---------------------------------------------------------------------------
 
+
+def _log_stream():
+    """Pick the log sink: stderr under stdio, stdout otherwise.
+
+    MCP's stdio transport uses **stdout as the JSON-RPC channel**, so it must carry
+    protocol frames and nothing else. Before this change `vikunja_mcp_start` was written
+    there — verified by capturing the subprocess's streams separately.
+
+    Scope of the impact, stated precisely because it is easy to overclaim: the fastmcp
+    client tolerates the stray line and completes the handshake anyway (measured, by
+    reverting this and re-running the end-to-end test). It is fixed because emitting
+    non-protocol bytes on the protocol channel is a violation a stricter client is
+    entitled to reject, not because a specific client was observed failing.
+
+    Read from the environment rather than ``get_settings()`` because logging is configured
+    at import time, before config validation has run — and a log line emitted during
+    import would corrupt the stream just as effectively as one emitted later.
+
+    Under any network transport the sink stays stdout, so PM2's existing out/error log
+    split on forge is unchanged.
+    """
+    return sys.stderr if os.environ.get("VIKUNJA_TRANSPORT") == "stdio" else sys.stdout
+
+
 structlog.configure(
     processors=[
         structlog.stdlib.add_log_level,
@@ -68,7 +93,7 @@ structlog.configure(
         structlog.processors.JSONRenderer(),
     ],
     wrapper_class=structlog.BoundLogger,
-    logger_factory=structlog.PrintLoggerFactory(),
+    logger_factory=structlog.PrintLoggerFactory(file=_log_stream()),
 )
 log = structlog.get_logger()
 

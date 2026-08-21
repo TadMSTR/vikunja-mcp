@@ -2,9 +2,9 @@
 
 ## Model: token passthrough, no stored credentials
 
-`vikunja-mcp` holds no Vikunja API tokens. Each request must carry the caller's own Vikunja
-bearer token in the `Authorization` header; the server forwards it upstream unchanged and
-Vikunja itself validates it. Consequences:
+On every network transport, `vikunja-mcp` holds no Vikunja API tokens. Each request must
+carry the caller's own Vikunja bearer token in the `Authorization` header; the server
+forwards it upstream unchanged and Vikunja itself validates it. Consequences:
 
 - **No ambient authority.** A request with no `Authorization` header is rejected fail-closed
   (`AuthError`) — there is no default or service token to fall back to.
@@ -12,6 +12,37 @@ Vikunja itself validates it. Consequences:
   request, never a stored set of agent credentials.
 - **Attribution.** Every upstream call is made as the acting agent, so Vikunja's own
   authorization and audit trail apply per agent.
+
+### The stdio exception
+
+`VIKUNJA_TRANSPORT=stdio` is the one mode where the server does hold a token, because it
+is the one mode where passthrough is impossible: there is no HTTP request, so there is no
+header to lift. Before this was addressed the server started cleanly, registered every
+tool, and then failed 100% of tool calls (vikunja#461).
+
+Under stdio, `VIKUNJA_TOKEN` supplies the credential. The exception is kept narrow by two
+independent guards, both of which are **hard startup errors, not warnings**:
+
+| Combination | Result |
+|---|---|
+| `VIKUNJA_TOKEN` set, transport is anything but `stdio` | `ConfigError` — refuses to start |
+| transport `stdio`, no `VIKUNJA_TOKEN` | `ConfigError` — refuses to start |
+
+The first is the one that matters. A static token on a shared port would make every caller
+reach Vikunja as one identity — silently, with no symptom until someone asks who changed a
+ticket. That is precisely what passthrough exists to prevent, so it is refused rather than
+documented as a footgun. The check is written against `stdio` (the safe case) rather than
+against `http` (one unsafe case), so a future network transport is covered by default.
+
+At runtime the header remains strictly preferred: the fallback is consulted only when
+there is no `Authorization` header **and** no HTTP request in scope at all. An HTTP request
+that merely forgot its header still fails closed — the two look identical from the header
+dict alone, which is why the request-in-scope check exists rather than a bare emptiness
+test.
+
+Note the exception does not weaken attribution, because stdio has exactly one caller by
+construction: a single subprocess owned by a single client. There is no per-agent identity
+to collapse.
 
 ## Trust boundaries
 
