@@ -17,7 +17,12 @@ question needed. Ticket #456 (id 475).
   server-side with one filtered lookup (`filter=index = 454`); `"#456 (id 475)"` — the form
   forge tickets are written in — is parsed directly with no API call at all. A bare number,
   int or string, is always a global id: `"454"` without the `#` is never read as a ticket
-  number, because guessing there is what caused #331.
+  number, because guessing there is what caused #331. The spelled-out form is accepted only
+  on a string that opens with a ticket reference and names exactly one `id N`: prose
+  mentioning an id is refused, and a string naming several
+  (`"#456 (id 475) blocks #331 (id 342)"`) raises rather than taking the first. Non-ASCII
+  digits are refused too — `str.isdigit()` is also true for `"²"`, where `int()` would raise
+  a confusing message instead of a clear one.
 - **`VIKUNJA_DEFAULT_PROJECT_ID`** scopes ticket-reference resolution to one project.
   Unset by default, in which case resolution runs unscoped and **raises** if more than one
   task matches, naming every candidate rather than picking one. Ticket numbers are only

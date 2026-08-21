@@ -107,10 +107,70 @@ async def test_combined_forge_form_skips_the_api_call_entirely(monkeypatch):
     assert mock.call_args.args[:2] == ("GET", "/tasks/475")
 
 
-@pytest.mark.parametrize("ref", ["", "abc", "#", "#4a", "-5", "4.5", "#454, #455", None, 4.5])
+@pytest.mark.parametrize(
+    "ref",
+    [
+        "",
+        "abc",
+        "#",
+        "#4a",
+        "-5",
+        "4.5",
+        None,
+        4.5,
+        "../../user",
+        "473/../../projects/1",
+        "473?x=1",
+        "473 OR 1=1",
+        "473\x00",
+        "²",  # str.isdigit() is True here; int() would raise a confusing message
+        "٤٧٣",  # Unicode decimal digits convert cleanly but are almost certainly a mistake
+        "see id 999 somewhere",  # prose mentioning an id is not a ticket reference
+        "id 5 and id 6",
+    ],
+)
 async def test_unrecognised_forms_raise_and_name_what_is_accepted(ref):
     with pytest.raises(ValueError, match="task_id must be"):
         await server._resolve_task_ref(ref)
+
+
+async def test_no_string_form_can_reach_the_url_path_unresolved():
+    """The security property behind widening `task_id` to `int | str` (IV-01/IV-19).
+
+    `task_id` is interpolated into `f"/tasks/{task_id}"`, so accepting strings is only safe
+    if `int()` is the resolver's sole exit. Anything else — a traversal segment, a query
+    fragment, a filter clause — must raise rather than be handed to the URL builder.
+    """
+    for hostile in ("../../user", "473/../../projects/1", "%2e%2e%2fuser", "#454 && project = 2"):
+        with pytest.raises(ValueError):
+            await server._resolve_task_ref(hostile)
+
+    for accepted in (473, "473", " 473 ", "#456 (id 475)"):
+        resolved = await server._resolve_task_ref(accepted)
+        assert type(resolved) is int, f"{accepted!r} resolved to {type(resolved).__name__}"
+
+
+async def test_a_reference_naming_several_ids_raises_instead_of_taking_the_first(monkeypatch):
+    """`"#456 (id 475) blocks #331 (id 342)"` is a coin flip, not an answer.
+
+    Every other ambiguous path in this module raises and names the candidates. A regex
+    searching for the first `id N` anywhere in the string would have made this one the
+    silent exception — which is the exact behaviour vikunja#331 is an incident report about.
+    """
+    mock = AsyncMock()
+    monkeypatch.setattr(server, "request", mock)
+
+    with pytest.raises(ValueError) as excinfo:
+        await server._resolve_task_ref("#456 (id 475) blocks #331 (id 342)")
+
+    assert "475" in str(excinfo.value)
+    assert "342" in str(excinfo.value)
+    mock.assert_not_awaited()
+
+
+async def test_repeating_the_same_id_is_not_ambiguous():
+    """Two mentions of one id name one task. Only *different* ids are a conflict."""
+    assert await server._resolve_task_ref("#456 (id 475) — see id 475") == 475
 
 
 async def test_boolean_is_refused_rather_than_read_as_task_1():

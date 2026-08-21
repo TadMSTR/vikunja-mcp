@@ -680,7 +680,16 @@ _VERIFIED_VIKUNJA_VERSION = "v2.3.0"
 
 # The "#456 (id 475)" form that forge tickets, CLAUDE.md files and Matrix messages are
 # written in. When the global id is spelled out, take it and skip the API call entirely.
+#
+# Only consulted on a string that *starts* with a ticket reference, and only when it holds
+# exactly one `id N`. A bare `findall` over arbitrary prose would accept "see id 999
+# somewhere" and, worse, silently take the first of several — "#456 (id 475) blocks #331
+# (id 342)" would resolve to 475 on nothing but position. Every other ambiguous case in this
+# module raises and names the candidates; this one must not be the exception.
 _EMBEDDED_ID = re.compile(r"\bid\s+(\d+)\b", re.IGNORECASE)
+
+# A string that opens with a ticket reference, whatever follows it.
+_STARTS_WITH_TICKET_REF = re.compile(r"^#(\d+)\b")
 
 # A bare ticket reference: "#454", and nothing else.
 _TICKET_REF = re.compile(r"^#(\d+)$")
@@ -753,9 +762,13 @@ async def _resolve_task_ref(ref: int | str, token: str | None = None) -> int:
 
     ==========================  ===============================================
     ``473`` / ``"473"``         a global id, returned as-is. No API call.
-    ``"#456 (id 475)"``         the id is spelled out — take it. No API call.
     ``"#454"``                  a ticket number — one filtered lookup.
+    ``"#456 (id 475)"``         the id is spelled out — take it. No API call.
     ==========================  ===============================================
+
+    The third form is only honoured on a string that *opens* with a ticket reference and
+    names exactly one ``id N``. Prose that merely mentions an id is refused, and a string
+    naming several raises rather than taking the first — position is not evidence.
 
     A **bare** number is always a global id, never a ticket number. That asymmetry is the
     whole safety property: the ``#`` is what makes a ticket reference recognisable, and
@@ -777,16 +790,30 @@ async def _resolve_task_ref(ref: int | str, token: str | None = None) -> int:
         raise ValueError(f"task_id must be {_REF_FORMS}; got {type(ref).__name__} {ref!r}")
 
     text = ref.strip()
-    if text.isdigit():
-        return int(text)
 
-    embedded = _EMBEDDED_ID.search(text)
-    if embedded:
-        return int(embedded.group(1))
+    # `isascii()` matters: `str.isdigit()` is also true for superscripts like "²", where
+    # `int()` then raises "invalid literal for int()" — a confusing message for what is
+    # simply an unaccepted form. Unicode decimal digits ("٤٧٣") would convert cleanly, but
+    # a task id arriving in Arabic-Indic numerals is far more likely to be a mistake than
+    # an intention, so the rule is plain ASCII digits and a clear error otherwise.
+    if text.isascii() and text.isdigit():
+        return int(text)
 
     ticket = _TICKET_REF.match(text)
     if ticket:
         return await _resolve_index(int(ticket.group(1)), token or caller_token())
+
+    if _STARTS_WITH_TICKET_REF.match(text):
+        ids = set(_EMBEDDED_ID.findall(text))
+        if len(ids) == 1:
+            return int(ids.pop())
+        if len(ids) > 1:
+            raise ValueError(
+                f"task_id {ref!r} names {len(ids)} different task ids "
+                f"({', '.join(sorted(ids, key=int))}). Pass the one you mean — picking the "
+                "first would be a guess, and guessing which task an ambiguous reference "
+                "points at is the whole failure this accepts references to prevent."
+            )
 
     raise ValueError(f"task_id must be {_REF_FORMS}; got {ref!r}")
 

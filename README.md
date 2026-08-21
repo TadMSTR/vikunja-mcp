@@ -98,6 +98,11 @@ number. Guessing there is the whole bug. If a ticket reference is ambiguous (tic
 are only unique *within* a project) the call raises and names every candidate rather than
 picking one; set `VIKUNJA_DEFAULT_PROJECT_ID` to scope resolution and avoid it.
 
+The third form is honoured only on a string that *opens* with a ticket reference and names
+exactly one `id N`. Prose that merely mentions an id (`"see id 999 somewhere"`) is refused,
+and a string naming several (`"#456 (id 475) blocks #331 (id 342)"`) raises rather than
+taking the first — position is not evidence.
+
 > Resolution uses `filter=index = N`, which works but is **not documented** by Vikunja —
 > its published filter-field list does not include `index`. Verified against Vikunja
 > **v2.3.0** with a negative control (`bogusfield = 1` → 400, so unknown fields are
