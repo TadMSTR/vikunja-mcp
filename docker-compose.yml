@@ -4,8 +4,15 @@
 # every deployment must decide for itself. See docs/docker.md.
 services:
   vikunja-mcp:
+    # `:latest` is fine for a first run and wrong for anything you rely on — pin a version
+    # tag (`:v0.6.0`) once you have one working, so a rebuild cannot silently move under
+    # you. Every release publishes both.
     image: ghcr.io/tadmstr/vikunja-mcp:latest
     container_name: vikunja-mcp
+    # Redundant with the image, which already sets USER 1000:1000 — stated anyway so the
+    # guarantee is visible in the file you actually read, and so it survives a swap to a
+    # locally built image that forgot it.
+    user: "1000:1000"
     ports:
       # Loopback-only by default. The bind address inside the container is 0.0.0.0 because
       # it has to be to be reachable at all from outside its own namespace — that is not an
@@ -57,6 +64,12 @@ services:
     # out what rather than dropping this flag.
     read_only: true
     tmpfs: [/tmp]
+    # A stateless HTTP shim over an API — it does not need much, and a bound container
+    # cannot starve its host if a pathological response arrives.
+    mem_limit: 1g
+    cpus: 1.0
+    ulimits:
+      core: 0
     logging:
       driver: json-file
       options: {max-size: "10m", max-file: "3"}

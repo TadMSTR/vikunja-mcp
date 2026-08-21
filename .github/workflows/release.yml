@@ -5,9 +5,10 @@ on:
     tags:
       - "v*"
 
-permissions:
-  contents: write # Required for gh release create
-  packages: write # Required to push the container image to GHCR
+# Scoped per job rather than at the top level: a workflow-level block would hand
+# packages: write to the release job, which has no business pushing images, and
+# contents: write to the publish job. Least privilege is nearly free here.
+permissions: {}
 
 # No PyPI publish, deliberately: the name `vikunja-mcp` is namesquatted on public PyPI, so
 # `pip install vikunja-mcp` would install someone else's package. The container image is
@@ -18,6 +19,8 @@ jobs:
   create-github-release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # gh release create
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
@@ -41,6 +44,9 @@ jobs:
   publish-image:
     name: Publish image to GHCR
     runs-on: ubuntu-latest
+    permissions:
+      contents: read   # checkout
+      packages: write  # push to ghcr.io
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
