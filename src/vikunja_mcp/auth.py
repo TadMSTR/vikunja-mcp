@@ -10,17 +10,42 @@ Why this shape: the blast radius of a compromise of *this* process is a single i
 request's token, never the full set of five agent credentials — which is exactly what a
 Vault-brokering design would have to hold. Per-agent attribution in Vikunja is preserved
 for free, because every call reaches Vikunja as the agent that made it.
+
+**One exception, and it is deliberately narrow.** Under ``transport=stdio`` there is no
+HTTP request, so there is no header to lift and passthrough cannot work at all — the
+server used to start cleanly and then fail every tool call (vikunja#461). In that mode
+only, ``VIKUNJA_TOKEN`` supplies the credential. It is a single-user escape hatch: stdio
+has exactly one caller by construction, so there is no attribution to collapse. The
+combination that *would* collapse it — a static token on a network transport — is refused
+at startup in ``config.py``, and the fallback here additionally requires that no HTTP
+request be in scope, so the two guards are independent.
 """
 
 from __future__ import annotations
 
-from fastmcp.server.dependencies import get_http_headers
+from fastmcp.server.dependencies import get_http_headers, get_http_request
 
+from .config import get_settings
 from .exceptions import AuthError
 
 
+def _in_http_request() -> bool:
+    """True when a real HTTP request is in scope.
+
+    This is the discriminator that keeps the stdio fallback from ever applying to a
+    network call. An empty header dict alone cannot tell the two cases apart: a proxied
+    HTTP request that simply forgot its ``Authorization`` header looks identical to stdio,
+    where no request exists at all. Only the first must fail closed.
+    """
+    try:
+        get_http_request()
+    except RuntimeError:
+        return False
+    return True
+
+
 def caller_token() -> str:
-    """Return the caller's Vikunja bearer token from the current HTTP request.
+    """Return the acting Vikunja token — the caller's header, or the stdio fallback.
 
     Raises:
         AuthError: if no Authorization header / bearer token is present (fail closed).
@@ -33,9 +58,16 @@ def caller_token() -> str:
     headers = get_http_headers(include={"authorization"})
     raw = headers.get("authorization", "").strip()
     if not raw:
+        # The header is strictly preferred and is never overridden while one is present —
+        # the fallback is reached only when there is no header *and* no request at all.
+        if not _in_http_request():
+            token = get_settings().token
+            if token:
+                return token
         raise AuthError(
             "No Authorization header on request. vikunja-mcp requires the caller's "
-            "Vikunja bearer token, injected by the per-agent scoped-mcp manifest."
+            "Vikunja bearer token, injected by the per-agent scoped-mcp manifest. "
+            "(Running over stdio, where no header exists? Set VIKUNJA_TOKEN.)"
         )
 
     # Split scheme from token. A lone "Bearer" (no value) must fail closed rather than be

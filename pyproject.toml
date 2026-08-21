@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "vikunja-mcp"
-version = "0.5.0"
+version = "0.6.0"
 description = "FastMCP server exposing the Vikunja REST API as scoped, per-agent MCP tools"
 readme = "README.md"
 license = { text = "MIT" }
@@ -27,6 +27,10 @@ dependencies = [
     "structlog>=24.0",
     "markdown>=3.8.1",
     "nh3>=0.2",
+    # Direct import (Request/JSONResponse for the /health custom route), not just a
+    # fastmcp transitive — declared so a future fastmcp that vendors or drops it fails
+    # at resolve time rather than at import time.
+    "starlette>=0.37",
 ]
 
 [project.optional-dependencies]

@@ -32,6 +32,7 @@ import ipaddress
 import os
 import re
 import socket
+import sys
 from collections.abc import Callable
 from typing import Any
 from urllib.parse import quote, urlparse
@@ -40,6 +41,8 @@ import markdown as _markdown_lib
 import nh3
 import structlog
 from fastmcp import FastMCP
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 from . import __version__, telemetry
 from .auth import caller_token
@@ -59,6 +62,30 @@ from .hooks import (
 # Logging — JSON structlog, on by default (forge MCP convention)
 # ---------------------------------------------------------------------------
 
+
+def _log_stream():
+    """Pick the log sink: stderr under stdio, stdout otherwise.
+
+    MCP's stdio transport uses **stdout as the JSON-RPC channel**, so it must carry
+    protocol frames and nothing else. Before this change `vikunja_mcp_start` was written
+    there — verified by capturing the subprocess's streams separately.
+
+    Scope of the impact, stated precisely because it is easy to overclaim: the fastmcp
+    client tolerates the stray line and completes the handshake anyway (measured, by
+    reverting this and re-running the end-to-end test). It is fixed because emitting
+    non-protocol bytes on the protocol channel is a violation a stricter client is
+    entitled to reject, not because a specific client was observed failing.
+
+    Read from the environment rather than ``get_settings()`` because logging is configured
+    at import time, before config validation has run — and a log line emitted during
+    import would corrupt the stream just as effectively as one emitted later.
+
+    Under any network transport the sink stays stdout, so PM2's existing out/error log
+    split on forge is unchanged.
+    """
+    return sys.stderr if os.environ.get("VIKUNJA_TRANSPORT") == "stdio" else sys.stdout
+
+
 structlog.configure(
     processors=[
         structlog.stdlib.add_log_level,
@@ -66,7 +93,7 @@ structlog.configure(
         structlog.processors.JSONRenderer(),
     ],
     wrapper_class=structlog.BoundLogger,
-    logger_factory=structlog.PrintLoggerFactory(),
+    logger_factory=structlog.PrintLoggerFactory(file=_log_stream()),
 )
 log = structlog.get_logger()
 
@@ -1653,6 +1680,23 @@ async def webhook_delete(project_id: int, webhook_id: int) -> dict:
 # ===========================================================================
 # Entry point
 # ===========================================================================
+
+
+@mcp.custom_route("/health", methods=["GET"])
+async def health(_request: Request) -> JSONResponse:
+    """Liveness probe. Unauthenticated by design — so it must stay free of config.
+
+    Everything this returns is public. Do not add ``VIKUNJA_URL``, the transport binding,
+    upstream identity, or any other config echo: this is the one route on the server that
+    answers without a bearer token, and `/mcp` answering 406 rather than 401 makes it easy
+    to misread the surface as authenticated when it is not.
+
+    It deliberately does **not** probe upstream Vikunja. This server is stateless and
+    recovers on its own, so a Vikunja restart marking the container unhealthy would cost a
+    needless restart loop and buy nothing. If readiness signal is ever wanted, add a
+    separate ``/ready`` rather than overloading liveness with a dependency check.
+    """
+    return JSONResponse({"status": "ok", "version": __version__})
 
 
 def main() -> None:

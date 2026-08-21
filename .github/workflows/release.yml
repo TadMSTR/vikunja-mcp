@@ -5,15 +5,22 @@ on:
     tags:
       - "v*"
 
-permissions:
-  contents: write # Required for gh release create
+# Scoped per job rather than at the top level: a workflow-level block would hand
+# packages: write to the release job, which has no business pushing images, and
+# contents: write to the publish job. Least privilege is nearly free here.
+permissions: {}
 
-# Source-only release (no PyPI) — same pattern as matrix-dispatcher/agent-bus/dockhand-mcp/githost-mcp.
-# A tag `vX.Y.Z` cuts a GitHub Release with auto-generated notes.
+# No PyPI publish, deliberately: the name `vikunja-mcp` is namesquatted on public PyPI, so
+# `pip install vikunja-mcp` would install someone else's package. The container image is
+# the safe adoption path, not merely a parallel one — see docs/docker.md.
+#
+# A tag `vX.Y.Z` cuts a GitHub Release with auto-generated notes and publishes the image.
 jobs:
   create-github-release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # gh release create
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
@@ -33,3 +40,39 @@ jobs:
               --generate-notes \
               --verify-tag
           fi
+
+  publish-image:
+    name: Publish image to GHCR
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read   # checkout
+      packages: write  # push to ghcr.io
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      # arm64 is emulated on the amd64 runner. Wheel-only install, so this is a copy, not
+      # a compile — if it ever does become slow or flaky, drop linux/arm64 from platforms
+      # below rather than carrying the flakiness into the release job.
+      - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      # Lowercased owner: GHCR rejects an uppercase path, and the owner here is `TadMSTR`.
+      # Hardcoded rather than derived so the failure mode is a wrong-looking string in a
+      # diff, not a broken push at tag time.
+      - name: Build and push
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ghcr.io/tadmstr/vikunja-mcp:${{ github.ref_name }}
+            ghcr.io/tadmstr/vikunja-mcp:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

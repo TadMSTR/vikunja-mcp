@@ -35,3 +35,60 @@ jobs:
         run: pip install -e ".[dev]"
       - name: Run tests with coverage
         run: pytest tests/ -v --cov=vikunja_mcp --cov-report=term-missing
+
+  docker-build:
+    name: Docker build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - name: Build image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          push: false
+          load: true
+          tags: vikunja-mcp:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      # Building proves the image assembles; it does not prove it runs. These two are the
+      # cheapest checks that would have caught a broken entry point or a missing runtime
+      # dependency, neither of which a successful build surfaces.
+      - name: Smoke test — refuses to start with no VIKUNJA_URL
+        run: |
+          set +e
+          out=$(docker run --rm vikunja-mcp:ci 2>&1)
+          status=$?
+          echo "$out"
+          if [ $status -eq 0 ]; then
+            echo "::error::server started without VIKUNJA_URL — the fail-closed default is gone"
+            exit 1
+          fi
+          echo "$out" | grep -q "VIKUNJA_URL is not set" || {
+            echo "::error::exited non-zero but not for the expected reason"; exit 1; }
+      - name: Smoke test — /health serves unauthenticated, container reports healthy
+        run: |
+          docker run -d --name vikunja-mcp-ci -e VIKUNJA_URL=https://vikunja.invalid \
+            -p 127.0.0.1:8501:8501 vikunja-mcp:ci
+          for i in $(seq 1 30); do
+            [ "$(docker inspect --format '{{.State.Health.Status}}' vikunja-mcp-ci)" = "healthy" ] && break
+            sleep 2
+          done
+          docker inspect --format '{{.State.Health.Status}}' vikunja-mcp-ci | grep -qx healthy || {
+            echo "::error::container never became healthy"; docker logs vikunja-mcp-ci; exit 1; }
+          # No Authorization header, and the body must stay free of config.
+          body=$(curl -fsS http://127.0.0.1:8501/health)
+          echo "$body"
+          echo "$body" | grep -q '"status":"ok"'
+          # `if grep` rather than `grep && exit 1`: the latter returns non-zero from the
+          # compound when grep finds nothing, failing the step on the success path.
+          if echo "$body" | grep -qi "vikunja.invalid\|token"; then
+            echo "::error::/health echoed config — it is unauthenticated by design"
+            exit 1
+          fi
+          docker rm -f vikunja-mcp-ci
+      - name: Verify the image runs as non-root
+        run: |
+          uid=$(docker run --rm --entrypoint id vikunja-mcp:ci -u)
+          [ "$uid" != "0" ] || { echo "::error::image runs as root"; exit 1; }
+          echo "runs as uid $uid"

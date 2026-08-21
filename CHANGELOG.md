@@ -6,6 +6,62 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-08-21
+
+Makes the server deployable by someone who is not running PM2 on a Debian host. Three
+things blocked that: there was no container image, no endpoint a container could be health
+checked against, and the stdio transport was completely non-functional. Tickets #462
+(id 481) and #461 (id 480).
+
+### Added
+- **Container image**, published to `ghcr.io/tadmstr/vikunja-mcp` on every `v*` tag, for
+  `linux/amd64` and `linux/arm64`. Multi-stage, `python:3.13-slim` pinned by digest,
+  non-root (uid 1000), no pip or build metadata in the runtime layer. The `[telemetry]`
+  extra is installed, so `OTEL_EXPORTER_OTLP_ENDPOINT` works without the silent
+  `otlp_import_failed` state that has bitten this project's siblings before.
+- **`GET /health`** — unauthenticated, returns `{"status", "version"}` and deliberately
+  nothing else, since the response is public by construction. It is a liveness check and
+  does **not** probe upstream Vikunja: this server is stateless, so failing health on a
+  Vikunja restart would cost restarts and buy nothing. A `HEALTHCHECK` in the image uses it.
+- **Reference `docker-compose.yml`** at the repo root — `cap_drop: ALL`,
+  `no-new-privileges`, `read_only`, loopback publish — plus [`docs/docker.md`](docs/docker.md)
+  covering the env table, the security model, the audit-log mount and the webhook caveat.
+- **CI builds and *runs* the image** on every PR: a build proves the image assembles, not
+  that the entry point works. Smoke tests cover the fail-closed `VIKUNJA_URL`, an
+  unauthenticated `/health` that echoes no config, and non-root.
+
+### Fixed
+- **stdio is usable at all.** It previously started cleanly, logged, registered all 71
+  tools, and then failed **100% of tool calls** with `AuthError`: `caller_token()` read
+  HTTP headers, and under stdio there is no request to read. `VIKUNJA_TOKEN` now supplies
+  the credential in that mode. (#461)
+- **stdio no longer writes logs to stdout**, which is the JSON-RPC channel. Logs go to
+  stderr under `transport=stdio` only, leaving the log split unchanged everywhere else.
+- **`test_main_stdio_transport` now invokes a tool** instead of only asserting `mcp.run`
+  was called with `transport="stdio"`. Asserting the launcher rather than the behaviour is
+  precisely how a wholly broken transport shipped under a green suite; a subprocess
+  end-to-end test over real MCP framing was added alongside it.
+
+### Security
+- **`VIKUNJA_TOKEN` with a network transport is refused at startup**, not warned about. A
+  static token on a shared port collapses every caller into one Vikunja identity, silently,
+  with no symptom until someone asks who changed a ticket — the exact failure the
+  token-passthrough model exists to prevent. The check is written against `stdio` (the one
+  safe case) rather than against `http`, so `sse` and any future network transport are
+  covered by default. `stdio` without a token is likewise refused at startup instead of
+  failing at the first tool call. A blank `VIKUNJA_TOKEN` counts as unset, so an empty
+  compose assignment cannot satisfy the check and reintroduce the deferred failure.
+- `SECURITY.md` and the README no longer state that the server never holds a token — true
+  only on network transports after this release, and both now say so plainly rather than
+  being quietly falsified.
+
+### Notes
+- **No PyPI publish.** The name `vikunja-mcp` is namesquatted on public PyPI, which makes
+  `pip install vikunja-mcp` actively unsafe to document. The image is the safe adoption
+  path, not merely a parallel one.
+- Forge still runs the PM2 process. Cutover to the container is a separate, deliberate
+  sysadmin change with its own rollback; nothing in this release touches the live service.
+
 ## [0.5.0] — 2026-08-21
 
 Two halves of the same problem: agents kept confusing the per-project ticket number

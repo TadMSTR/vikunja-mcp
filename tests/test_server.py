@@ -332,15 +332,32 @@ def test_main_http_transport(monkeypatch):
     assert run.call_args.kwargs["port"] == 8501
 
 
-def test_main_stdio_transport(monkeypatch):
+async def test_main_stdio_transport(monkeypatch, _patch_calls):
+    """stdio must actually *work*, not merely launch.
+
+    This test previously asserted only that ``mcp.run`` was called with
+    ``transport="stdio"``. That is an assertion about the launcher, and it stayed green
+    for an entire release during which every tool call under stdio raised AuthError
+    (vikunja#461) — the process started, logged cleanly, registered all 71 tools, and
+    failed 100% of invocations. The launcher assertion is kept; what follows it is the
+    part that was missing.
+    """
     from unittest.mock import MagicMock
 
-    monkeypatch.setenv("VIKUNJA_TRANSPORT", "stdio")
-    from vikunja_mcp import config
+    from vikunja_mcp import auth, config
 
+    monkeypatch.setenv("VIKUNJA_TRANSPORT", "stdio")
+    monkeypatch.setenv("VIKUNJA_TOKEN", "stdio-tok")
     config.reset_settings()
+
     run = MagicMock()
     monkeypatch.setattr(server.mcp, "run", run)
     server.main()
     assert run.call_args == (("stdio",), {}) or run.call_args.kwargs.get("transport") == "stdio"
+
+    # Restore the real caller_token: the autouse fixture pins it to a constant, which
+    # would mask exactly the failure this test exists to catch.
+    monkeypatch.setattr(server, "caller_token", auth.caller_token)
+    await call(server.whoami)
+    assert _patch_calls.await_args.args[2] == "stdio-tok"
     config.reset_settings()
