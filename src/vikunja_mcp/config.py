@@ -27,6 +27,14 @@ class Settings(BaseSettings):
     url: str = ""
     request_timeout: float = 30.0
 
+    # Project that a bare `"#454"` ticket reference is resolved within. Unset by default:
+    # `index` is only unique *per project*, so an unscoped lookup can match more than one
+    # task (live case: `index = 1` matches id 9 in project 7 and id 344 in project 2).
+    # When unset, resolution runs unscoped and **raises** on more than one match rather
+    # than picking a winner — guessing here is how vikunja#331 mutated three unrelated
+    # tickets. Set this to the project agents actually file against to make `#N` unambiguous.
+    default_project_id: int | None = None
+
     # Transport binding. Loopback-only by default: the token-passthrough model means any
     # local process reaching this port could forward a token it already holds, so exposure
     # beyond localhost is never intended (see SECURITY.md).

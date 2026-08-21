@@ -133,16 +133,23 @@ async def test_task_create_response_strips_index_keeps_id_and_identifier(monkeyp
     assert out["identifier"] == "#1"
 
 
-async def test_task_get_still_returns_index(monkeypatch, _builtins):
-    """The guardrail is create-only — task_get remains the way to read `index` back."""
+async def test_task_get_response_strips_index_keeps_identifier(monkeypatch, _builtins):
+    """v0.5.0 extends the guardrail to the read paths — `index` is gone there too.
+
+    This test used to assert the opposite (`task_get` is how you read `index` back). That
+    was the documented behaviour, and it was the bug: the ambiguity #331 came from was
+    closed on the one path agents rarely read and left open on the three they read
+    constantly.
+    """
     mock = AsyncMock(return_value={"id": 344, "identifier": "#1", "index": 1})
     monkeypatch.setattr(server, "request", mock)
     monkeypatch.setattr(server, "caller_token", lambda: "TOK")
 
     out = await _run(server.task_get, task_id=344)
 
-    assert out["index"] == 1
+    assert "index" not in out
     assert out["id"] == 344
+    assert out["identifier"] == "#1"
 
 
 async def test_register_builtin_hooks_is_idempotent(_builtins):
@@ -155,8 +162,8 @@ async def test_register_builtin_hooks_is_idempotent(_builtins):
 
 async def test_strip_index_tolerates_non_dict_result():
     """A list/None result must pass through rather than raise inside the hook."""
-    assert await server._strip_ambiguous_task_index(None) is None
-    assert await server._strip_ambiguous_task_index([1, 2]) == [1, 2]
+    assert await server._strip_task_index(None) is None
+    assert await server._strip_task_index([1, 2]) == [1, 2]
 
 
 def _fn(tool):
