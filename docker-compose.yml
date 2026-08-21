@@ -4,6 +4,11 @@
 # every deployment must decide for itself. See docs/docker.md.
 services:
   vikunja-mcp:
+    # SECURITY[accepted]: DC-01, audit 2026-08-21 (Low). A reference template pinned to a
+    # version is stale the day after the next release, so this one tracks :latest and tells
+    # you to pin. The forge deployment does pin. Revisit if this file ever stops being a
+    # template someone copies and edits.
+    #
     # `:latest` is fine for a first run and wrong for anything you rely on — pin a version
     # tag (`:v0.6.0`) once you have one working, so a rebuild cannot silently move under
     # you. Every release publishes both.
