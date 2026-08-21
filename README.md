@@ -277,5 +277,34 @@ VIKUNJA_URL=https://vikunja.example VIKUNJA_TOKEN=... python scripts/verify-rout
 
 ## Deployment
 
+### Docker (recommended)
+
+```bash
+docker run -d --name vikunja-mcp \
+  -e VIKUNJA_URL=https://vikunja.example.com \
+  -p 127.0.0.1:8501:8501 \
+  --cap-drop ALL --security-opt no-new-privileges:true \
+  --read-only --tmpfs /tmp \
+  ghcr.io/tadmstr/vikunja-mcp:latest
+
+curl -fsS http://127.0.0.1:8501/health
+```
+
+A reference [`docker-compose.yml`](docker-compose.yml) sits at the repo root. Full env var
+table, the security model, the audit-log mount and the webhook caveat are in
+[`docs/docker.md`](docs/docker.md).
+
+> There is no PyPI package. The name `vikunja-mcp` is squatted on public PyPI by an
+> unrelated project — **do not `pip install vikunja-mcp`.** Use the image, or install from
+> a git checkout.
+
+### stdio
+
+For a single-user setup launched by your MCP client, see
+[Single-user stdio](#single-user-stdio) above. You need `VIKUNJA_TRANSPORT=stdio` and
+`VIKUNJA_TOKEN`.
+
+### forge
+
 Runs as a PM2 service on forge, fronted by scoped-mcp. See [`docs/forge.md`](docs/forge.md)
 for the PM2 config, the scoped-mcp manifest, and the per-agent token wiring.
