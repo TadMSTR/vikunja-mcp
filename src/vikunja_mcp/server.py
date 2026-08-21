@@ -40,6 +40,8 @@ import markdown as _markdown_lib
 import nh3
 import structlog
 from fastmcp import FastMCP
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 from . import __version__, telemetry
 from .auth import caller_token
@@ -1653,6 +1655,23 @@ async def webhook_delete(project_id: int, webhook_id: int) -> dict:
 # ===========================================================================
 # Entry point
 # ===========================================================================
+
+
+@mcp.custom_route("/health", methods=["GET"])
+async def health(_request: Request) -> JSONResponse:
+    """Liveness probe. Unauthenticated by design — so it must stay free of config.
+
+    Everything this returns is public. Do not add ``VIKUNJA_URL``, the transport binding,
+    upstream identity, or any other config echo: this is the one route on the server that
+    answers without a bearer token, and `/mcp` answering 406 rather than 401 makes it easy
+    to misread the surface as authenticated when it is not.
+
+    It deliberately does **not** probe upstream Vikunja. This server is stateless and
+    recovers on its own, so a Vikunja restart marking the container unhealthy would cost a
+    needless restart loop and buy nothing. If readiness signal is ever wanted, add a
+    separate ``/ready`` rather than overloading liveness with a dependency check.
+    """
+    return JSONResponse({"status": "ok", "version": __version__})
 
 
 def main() -> None:

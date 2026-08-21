@@ -27,6 +27,10 @@ dependencies = [
     "structlog>=24.0",
     "markdown>=3.8.1",
     "nh3>=0.2",
+    # Direct import (Request/JSONResponse for the /health custom route), not just a
+    # fastmcp transitive — declared so a future fastmcp that vendors or drops it fails
+    # at resolve time rather than at import time.
+    "starlette>=0.37",
 ]
 
 [project.optional-dependencies]
