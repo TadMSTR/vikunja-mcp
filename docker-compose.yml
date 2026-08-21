@@ -1,0 +1,63 @@
+# vikunja-mcp — reference deployment.
+#
+# Adapt rather than adopt verbatim: the `ports` line and `VIKUNJA_URL` are the two things
+# every deployment must decide for itself. See docs/docker.md.
+services:
+  vikunja-mcp:
+    image: ghcr.io/tadmstr/vikunja-mcp:latest
+    container_name: vikunja-mcp
+    ports:
+      # Loopback-only by default. The bind address inside the container is 0.0.0.0 because
+      # it has to be to be reachable at all from outside its own namespace — that is not an
+      # exposure decision, THIS line is. Widen it to "8501:8501" only if you have decided
+      # the port should be reachable from your network.
+      #
+      # Note what is on this port: every tool call carries the caller's own Vikunja token,
+      # and a request without one is rejected. So the port grants nothing a caller could
+      # not already do by talking to Vikunja directly with the same token. It is still
+      # worth keeping narrow.
+      - "127.0.0.1:8501:8501"
+    environment:
+      # Required. No default is baked into the image on purpose: the server refuses to
+      # start without it, rather than silently pointing at the wrong Vikunja.
+      #
+      # Container-to-container works fine here — this is not subject to the webhook SSRF
+      # guard, so a private address or compose service name is fine:
+      #   VIKUNJA_URL: http://vikunja:3456
+      #
+      # Set it in a `.env` beside this file, or edit the value in directly. Note there is
+      # no `${VIKUNJA_URL:?...}` guard here on purpose: compose evaluates interpolation on
+      # every subcommand, so a required-variable guard makes `docker compose down` and
+      # `logs` fail too, which is worse than useless. The server's own startup check is the
+      # real guard and it is unmissable.
+      VIKUNJA_URL: ${VIKUNJA_URL}
+
+      # Scopes what a bare "#12" ticket reference resolves against. Leave unset and an
+      # ambiguous reference raises instead of guessing — task numbers are unique per
+      # project, not globally.
+      # VIKUNJA_DEFAULT_PROJECT_ID: 1
+
+      # Do NOT set VIKUNJA_TOKEN here. The container runs the HTTP transport, where a
+      # static token is refused at startup: it would make every caller reach Vikunja as
+      # one identity. Tokens travel per-request in the Authorization header.
+
+      # Opt-in audit log. Enabling it requires the volume below, because the container
+      # filesystem is read-only.
+      # VIKUNJA_AUDIT_LOG: "1"
+      # VIKUNJA_AUDIT_LOG_DIR: /var/log/vikunja-mcp
+
+    # volumes:
+    #   # uid/gid 1000 inside the container — chown the host directory to match.
+    #   - ./audit-log:/var/log/vikunja-mcp
+
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    # Safe by default: the audit log is off unless you turn it on, and it is the only
+    # path this server writes to. If something turns out to need a writable root, find
+    # out what rather than dropping this flag.
+    read_only: true
+    tmpfs: [/tmp]
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+    restart: unless-stopped

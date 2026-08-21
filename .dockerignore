@@ -1,0 +1,47 @@
+# .dockerignore does not inherit .gitignore — every entry here is deliberate.
+
+# Rebuilt inside the image; a host copy would shadow it with the wrong architecture
+# or a stale tree.
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+
+# Caches and local test state — all present in the working tree today.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Not needed at build or runtime.
+tests/
+docs/
+scripts/
+.github/
+.git/
+.gitignore
+.vscode/
+.idea/
+ecosystem.config.js
+
+# Never bake secrets or local state into an image layer. `.env` matters more than usual
+# here: config.py reads it via pydantic-settings env_file, so a copied-in .env would be
+# silently *loaded* by the container, not merely present in a layer.
+.env
+*.env
+run.sh
+
+# Core dumps (see vikunja#206). The compose file sets `ulimits: core: 0`, but an old host
+# dump must not be copied in regardless.
+core.*
+*.core
+
+# The deployed stack lives outside the repo; these describe the build, not the runtime.
+docker-compose*.yml
+Dockerfile
+.dockerignore
