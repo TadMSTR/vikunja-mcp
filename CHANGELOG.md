@@ -6,6 +6,77 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-08-21
+
+Two halves of the same problem: agents kept confusing the per-project ticket number
+(`#454`) with the global task id (`473`), and every read shipped far more payload than the
+question needed. Ticket #456 (id 475).
+
+### Added
+- **`task_id` accepts a ticket reference on all 19 tools that take one.** `"#454"` resolves
+  server-side with one filtered lookup (`filter=index = 454`); `"#456 (id 475)"` — the form
+  forge tickets are written in — is parsed directly with no API call at all. A bare number,
+  int or string, is always a global id: `"454"` without the `#` is never read as a ticket
+  number, because guessing there is what caused #331. The spelled-out form is accepted only
+  on a string that opens with a ticket reference and names exactly one `id N`: prose
+  mentioning an id is refused, and a string naming several
+  (`"#456 (id 475) blocks #331 (id 342)"`) raises rather than taking the first. Non-ASCII
+  digits are refused too — `str.isdigit()` is also true for `"²"`, where `int()` would raise
+  a confusing message instead of a clear one.
+- **`VIKUNJA_DEFAULT_PROJECT_ID`** scopes ticket-reference resolution to one project.
+  Unset by default, in which case resolution runs unscoped and **raises** if more than one
+  task matches, naming every candidate rather than picking one. Ticket numbers are only
+  unique within a project (`index = 1` matches id 9 in project 7 *and* id 344 in project 2).
+- **`url` on every projected task**, built from `id`. Constructing `/tasks/454` from a
+  ticket number lands on an unrelated task; this removes the opportunity.
+- **`verbose` on `task_get`, `task_list` and `task_search`** — returns the upstream body
+  untouched, for the cases that genuinely need everything.
+
+### Changed
+- **BREAKING: no read path returns a bare `index` any more.** `_strip_ambiguous_task_index`
+  was create-only by its own docstring, so `task_get`/`task_list`/`task_search` still
+  returned `"index": 454` sitting beside `"id": 473` — the exact ambiguity behind #331 (id
+  342), where an agent passed one for the other, silently mutated three unrelated tickets
+  and briefly closed an open security ticket. It is now `_strip_task_index`, applies at any
+  nesting depth (including the tasks Vikunja inlines under `related_tasks`, which carry
+  their own `index`), and covers all nine tools that return a task body — not just the
+  three read tools, since `task_update` and friends returned one too. `identifier` is
+  unchanged: it is a string, so it cannot be passed where an int id is expected without an
+  obvious type error. **The strip applies in `verbose` mode as well** — `verbose` restores
+  the payload, not the ambiguity.
+- **BREAKING: `task_get`, `task_list` and `task_search` are compact by default.** The
+  expensive field differs per tool, so the projection does too. `task_list`/`task_search`
+  return summary rows and drop `description` — 132 KB of a measured 182 KB page of 50, or
+  roughly 45k tokens for one call. `task_get` **keeps** `description` (that is the point of
+  reading one ticket) and instead reduces the inlined bodies of related tasks to
+  `{id, identifier, title, done}`. Dropped collections become counts
+  (`attachment_count`, `reaction_count`, `assignee_count`) so their existence stays
+  discoverable. Measured: 182,108 B → ~13 KB for a 50-row list, 9,523 B → ~4.6 KB for
+  `task_get`. Pass `verbose=true` for the old shape.
+  - `pagination` is never projected — a truncated list still reports `truncated: true` and
+    `total_pages`, so one page is not mistaken for a whole answer.
+  - Surveyed before merging: no forge consumer reads `description` out of a list result.
+    Every `task_list`/`task_search` reference across `agent-platform-agents`,
+    `.claude/skills` and `host-forge-scripts` is either a manifest allowlist entry or prose
+    telling an agent to search for a ticket by title. No call site needed `verbose=true`.
+
+### Notes
+- Resolution depends on `filter=index = N`, which **Vikunja does not document** — its
+  published filter-field list omits `index`, and the server's accepted set matches the docs
+  in neither direction (`bucket_id` works, `position` 500s). Verified working on Vikunja
+  **v2.3.0** with a negative control (`bogusfield = 1` → 400, proving unknown filter fields
+  are rejected rather than silently ignored). A failed resolve raises with a message naming
+  that caveat and the verified version; it **never** falls back to treating `"#454"` as id
+  454, which would be #331 reintroduced as an error path.
+  `tests/test_task_refs.py::test_live_index_filter_still_resolves` is an opt-in live canary
+  for a future upgrade removing it.
+- Deliberately not resolved: `tasks_bulk_update`'s `task_ids` (mutates N tasks per call —
+  the tool behind #333, deserves its own review) and `other_task_id` on the relation tools
+  (still `int`, so a `"#454"` there is refused at schema validation — loud and safe).
+- No cache. `index` is filterable server-side, so there is no N+1 lookup to cache away, and
+  a stale `index → id` map's failure symptom is commenting on the wrong ticket — precisely
+  what this release exists to prevent.
+
 ## [0.4.0] — 2026-08-11
 
 ### Added

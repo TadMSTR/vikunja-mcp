@@ -66,6 +66,77 @@ Notes:
 - Attachments upload base64 (multipart on the wire); `attachment_upload` handles the
   encoding.
 
+## Ticket numbers vs. task ids
+
+Vikunja gives every task **two** numbers, and mixing them up silently edits the wrong
+ticket. `id` is global and is what `/tasks/{id}` and every tool take. `index` is a counter
+*per project*, and it is what the UI displays as `#454`.
+
+They are not the same number and the difference is not a constant — across one real corpus
+the offset ran 8, then 11, then 19. That is the shape of gap that teaches you a rule which
+then quietly fails on an older ticket.
+
+So, as of v0.5.0:
+
+- **No tool returns a bare `index`.** `identifier` (the string `"#454"`) is returned
+  instead. Being a string, it cannot be passed where an int id is expected without an
+  obvious type error.
+- **Every tool that takes a `task_id` also accepts a ticket reference.** It is resolved
+  server-side with one filtered lookup:
+
+  | You pass | Meaning | Lookup? |
+  |---|---|---|
+  | `473` or `"473"` | global task id | no |
+  | `"#454"` | ticket number | one call |
+  | `"#456 (id 475)"` | ticket number with the id spelled out | no |
+
+- **Every projected read returns a `url`**, built from `id`. Constructing `/tasks/454` from
+  the ticket number lands on an unrelated task; this removes the opportunity.
+
+A **bare** number is always a global id — `"454"` without the `#` is never read as a ticket
+number. Guessing there is the whole bug. If a ticket reference is ambiguous (ticket numbers
+are only unique *within* a project) the call raises and names every candidate rather than
+picking one; set `VIKUNJA_DEFAULT_PROJECT_ID` to scope resolution and avoid it.
+
+The third form is honoured only on a string that *opens* with a ticket reference and names
+exactly one `id N`. Prose that merely mentions an id (`"see id 999 somewhere"`) is refused,
+and a string naming several (`"#456 (id 475) blocks #331 (id 342)"`) raises rather than
+taking the first — position is not evidence.
+
+> Resolution uses `filter=index = N`, which works but is **not documented** by Vikunja —
+> its published filter-field list does not include `index`. Verified against Vikunja
+> **v2.3.0** with a negative control (`bogusfield = 1` → 400, so unknown fields are
+> rejected rather than ignored). If an upgrade removes it, resolution fails loudly with a
+> message naming this caveat; it never falls back to treating `"#454"` as id 454.
+> `tests/test_task_refs.py` carries an opt-in live canary for exactly this.
+
+Not resolved: `tasks_bulk_update`'s `task_ids`, and `other_task_id` on the relation tools.
+Both still take plain ints, so a `"#454"` there is refused at schema validation.
+
+## Response size — compact by default
+
+`task_get`, `task_list` and `task_search` return **projected** bodies. Vikunja inlines the
+full body of every related task, so a single well-linked ticket can return 155,000
+characters and one 50-row `task_list` measured **182 KB** — roughly 45k tokens for one
+call.
+
+The expensive field differs by tool, so the projection does too:
+
+| Tool | Kept | Dropped | Measured |
+|---|---|---|---|
+| `task_list` / `task_search` | id, identifier, title, done, project_id, priority, due_date, updated, url, labels, `*_count` | `description` (132 KB of the 182 KB), related tasks, attachments, reactions, assignee bodies | 182 KB → ~13 KB |
+| `task_get` | everything, **including `description`** | related-task *bodies* (reduced to `{id, identifier, title, done}`), attachments, reactions | 9.5 KB → ~4.6 KB |
+
+Dropped collections become counts (`attachment_count`, `reaction_count`,
+`assignee_count`), so their existence stays discoverable.
+
+Pass `verbose=true` on any of the three to get the upstream body back untouched. Note the
+`index` strip still applies in verbose mode — `verbose` restores the payload, not the
+ambiguity — and the convenience `url` field is only added on the projected path.
+
+`pagination` is never projected: a truncated list still reports
+`{"truncated": true, "total_pages": N}` so one page is not mistaken for a whole answer.
+
 ## Markdown descriptions & comments
 
 `description` on `task_create`/`task_update`/`project_create`/`project_update`, and the
@@ -102,6 +173,7 @@ All configuration is environment variables. No token is ever configured here.
 | `VIKUNJA_PORT` | Bind port | `8501` |
 | `VIKUNJA_TRANSPORT` | `http` or `stdio` | `http` |
 | `VIKUNJA_REQUEST_TIMEOUT` | Upstream timeout (seconds) | `30` |
+| `VIKUNJA_DEFAULT_PROJECT_ID` | Project a `"#454"` ticket reference resolves within. Unset means resolve across all projects and **raise** if more than one matches — ticket numbers are only unique per project | unset |
 | `LOG_LEVEL` | Log verbosity | `INFO` |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | Enable OTLP spans + metrics (needs `[telemetry]` extra) | off |
 | `VIKUNJA_INFLUXDB3_URL` | Enable the InfluxDB 3 metrics sink | off |

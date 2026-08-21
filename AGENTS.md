@@ -56,7 +56,50 @@ logic, no caching, no persistence.
    re-posted body — they live in their own tables and echoing them back is what made one
    `task_search` return 155k characters.
 
-7. **The audit trail is opt-in via env, not always-on.** Set `VIKUNJA_AUDIT_LOG=1` and
+7. **`index` and `id` are different numbers, and only `id` may leave this server.**
+   `index` is per-project; `id` is global. Their difference is not constant (offsets of 8,
+   11 and 19 in one live corpus). `_strip_task_index` removes every bare `index` from every
+   response listed in `server._INDEX_STRIPPED_TOOLS`, at any nesting depth — including the
+   tasks Vikunja inlines under `related_tasks`, which carry their own. Keep `identifier`:
+   it is a string, so it cannot be passed where an int id is expected without an obvious
+   type error, and five forge consumers render it. This is vikunja#331 (id 342), where an
+   agent passed `index` to `task_label_add` and silently mutated three unrelated tickets.
+
+   `_resolve_task_ref` is the inverse: it accepts `"#454"` on every tool in
+   `server._TASK_REF_TOOLS`. Three rules that are load-bearing, not stylistic:
+
+   - **A bare number is always a global id.** `"454"` without a `#` is never a ticket
+     number. The `#` is the only thing that distinguishes the two, so guessing without it
+     is #331 with extra steps.
+   - **A failed resolve raises.** It must never fall back to treating `"#454"` as id 454.
+   - **An ambiguous resolve raises and names every candidate.** Never pick one. Ticket
+     numbers are unique per project, not globally (`index = 1` matches id 9 in project 7
+     and id 344 in project 2, live).
+
+   The annotation `task_id: int | str` is the enabling change, not cosmetic — FastMCP
+   derives the schema from `wrapper.__signature__`, so `task_id: int` rejects `"#454"`
+   before any before-hook can run. `tests/test_task_refs.py` asserts this against the
+   schema FastMCP actually publishes, and asserts the tool list is exactly the set of tools
+   whose signature takes a `task_id`, so it cannot drift.
+
+8. **Endpoint semantics verified by probe, not by documentation.** Swagger and the docs are
+   both unreliable for this API; each row below is a live probe with a negative control.
+
+   | Behaviour | Probe | Control | Verified on |
+   |---|---|---|---|
+   | `index` is filterable | `filter=index = 454` → one row, id 473 | `filter=bogusfield = 1` → **400** `The task field 'bogusfield' is invalid` | Vikunja v2.3.0, 2026-08-21 |
+   | `index` filter is project-scopable | `filter=project = 7 && index = 454` → `[473]` | `filter=project = 2 && index = 454` → `[]` | same |
+   | `index` is **not** sortable | — | `sort_by` accepts `id, title, done, done_at, due_date, start_date, end_date, priority, percent_done, created, updated, position` | same |
+   | `s` cannot be combined with `filter` | — | — | Vikunja filter docs; this is why `task_search` and `task_list` stay separate tools |
+
+   The control matters more than the probe: Vikunja *rejects* unknown filter fields rather
+   than ignoring them, which is what proves the `index` filter is genuinely applied
+   server-side rather than silently dropped. Note that `index` is **not** in Vikunja's
+   documented filter-field list — the accepted set matches the docs in neither direction
+   (`bucket_id` works, `position` 500s). Ticket-reference resolution therefore depends on
+   undocumented behaviour, deliberately and with a live canary test guarding it.
+
+9. **The audit trail is opt-in via env, not always-on.** Set `VIKUNJA_AUDIT_LOG=1` and
    `VIKUNJA_AUDIT_LOG_DIR=<path>` to have `register_builtin_hooks` wire
    `contrib/audit_log.py` for the mutating tool set (`server._AUDITED_TOOLS`), writing one
    line per call to `<dir>/YYYY-MM-DD.md`. Unset `VIKUNJA_AUDIT_LOG` to turn it back off.

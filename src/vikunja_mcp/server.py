@@ -50,6 +50,7 @@ from .hooks import (
     after_handlers,
     before_handlers,
     register_after,
+    register_before,
     run_after_hooks,
     run_before_hooks,
 )
@@ -386,6 +387,142 @@ async def project_delete(project_id: int) -> dict:
 # Tasks
 # ===========================================================================
 
+# Fields a summary row carries through from the upstream task. Chosen to answer the
+# questions a *list* is actually asked — what is this, is it done, how urgent, when is it
+# due — without the fields that make the answer expensive.
+_SUMMARY_FIELDS = (
+    "id",
+    "identifier",
+    "title",
+    "done",
+    "project_id",
+    "priority",
+    "due_date",
+    "updated",
+)
+
+# Collections reduced to a count rather than returned in full, on every projected path,
+# mapped to the key the count is reported under. Spelled out rather than derived from the
+# field name so nothing depends on stripping a trailing "s".
+_COUNTED_COLLECTIONS = {"attachments": "attachment_count", "reactions": "reaction_count"}
+
+
+def _task_url(task_id: Any) -> str:
+    """The browser URL for a task.
+
+    Always built from ``id``, never from ``index``/``identifier``. Constructing
+    ``/tasks/454`` from the ticket number lands on a different, unrelated ticket — that is
+    the same off-by-a-drifting-offset confusion as vikunja#331, and handing the agent the
+    finished URL is what removes the opportunity to get it wrong.
+    """
+    return f"{get_settings().url.rstrip('/')}/tasks/{task_id}"
+
+
+def _count(value: Any) -> int:
+    """Length of a collection Vikunja may return as null, a list, or a keyed dict."""
+    if value is None:
+        return 0
+    if isinstance(value, dict):
+        return sum(_count(v) for v in value.values())
+    if isinstance(value, list):
+        return len(value)
+    return 0
+
+
+def _task_ref(task: dict[str, Any]) -> dict[str, Any]:
+    """The smallest honest reference to a task: enough to identify it and fetch it.
+
+    ``identifier`` is included but can be the empty string on a task Vikunja inlines under
+    ``related_tasks`` (live-observed) — ``id`` is the field that is always meaningful.
+    """
+    return {
+        "id": task.get("id"),
+        "identifier": task.get("identifier"),
+        "title": task.get("title"),
+        "done": task.get("done"),
+    }
+
+
+def _thin_related(related: Any) -> Any:
+    """Reduce ``related_tasks`` from inlined full task bodies to bare references.
+
+    Vikunja inlines the *entire* body of every related task, description included — one
+    ``task_search`` over a well-linked ticket returned 155,000 characters. ``related_tasks``
+    is a dict keyed by relation kind (``{"related": [...], "subtask": [...]}``), so the
+    reduction has to walk the values, not the top level.
+    """
+    if not isinstance(related, dict):
+        return related
+    return {
+        kind: [_task_ref(t) if isinstance(t, dict) else t for t in (entries or [])]
+        for kind, entries in related.items()
+    }
+
+
+def _summarise_task(task: dict[str, Any]) -> dict[str, Any]:
+    """A list row: identity, status, urgency, and a link. No body.
+
+    ``description`` is the field that dominates a list response — 132 KB of a measured
+    182 KB page of 50 — and it is almost never what a list was asked for. Call ``task_get``
+    on the row you care about, or pass ``verbose=True`` to get the old shape back.
+    """
+    row: dict[str, Any] = {k: task.get(k) for k in _SUMMARY_FIELDS}
+    row["url"] = _task_url(task.get("id"))
+    row["labels"] = [
+        {"id": label.get("id"), "title": label.get("title")}
+        for label in (task.get("labels") or [])
+        if isinstance(label, dict)
+    ]
+    row["assignee_count"] = _count(task.get("assignees"))
+    for name, count_key in _COUNTED_COLLECTIONS.items():
+        row[count_key] = _count(task.get(name))
+    return row
+
+
+def _compact_task(task: dict[str, Any]) -> dict[str, Any]:
+    """A single task, minus the collections that make it expensive.
+
+    The opposite trade to :func:`_summarise_task`: ``description`` is kept, because reading
+    one ticket's body is the point of ``task_get``. What goes is the inlined bodies of
+    related tasks, and the attachment/reaction payloads — replaced by counts, so their
+    existence stays discoverable and a caller knows to go look.
+
+    Unknown fields pass through untouched, so a Vikunja upgrade that adds a column does not
+    silently lose it here.
+    """
+    out = {k: v for k, v in task.items() if k not in _COUNTED_COLLECTIONS}
+    out["url"] = _task_url(task.get("id"))
+    if "related_tasks" in out:
+        out["related_tasks"] = _thin_related(out["related_tasks"])
+    for name, count_key in _COUNTED_COLLECTIONS.items():
+        out[count_key] = _count(task.get(name))
+    return out
+
+
+def _project(result: Any, projection: Callable[[dict[str, Any]], dict[str, Any]]) -> Any:
+    """Apply ``projection`` to every task in a response, whatever shape it arrived in.
+
+    Handles the three bodies ``client.request`` can hand back: a single task dict, a bare
+    list (single-page result), and the ``{"items": [...], "pagination": {...}}`` envelope it
+    wraps a multi-page list in. ``pagination`` is left strictly alone — projecting a list
+    while dropping the metadata that says it is only page 1 would trade one silent-truncation
+    bug for another.
+
+    Anything without an ``id`` is passed through unprojected. That covers the ``{"ok": True}``
+    body a 204 produces, which would otherwise pick up a ``url`` of ``/tasks/None`` — a
+    plausible-looking link to nothing is worse than no link.
+    """
+
+    def apply(item: Any) -> Any:
+        return projection(item) if isinstance(item, dict) and "id" in item else item
+
+    if isinstance(result, dict) and "items" in result and "pagination" in result:
+        result["items"] = [apply(item) for item in result["items"]]
+        return result
+    if isinstance(result, list):
+        return [apply(item) for item in result]
+    return apply(result)
+
 
 @tool
 async def task_list(
@@ -394,10 +531,19 @@ async def task_list(
     filter: str = "",
     sort_by: str = "",
     order_by: str = "",
+    verbose: bool = False,
 ) -> Any:
     """List tasks across all projects the caller can access.
 
     `filter` accepts Vikunja's filter syntax, e.g. `done = false && priority >= 3`.
+    `index` is filterable too (`project = 7 && index = 454`) though Vikunja does not
+    document it; `sort_by` does **not** accept `index`.
+
+    Returns **summary rows** — id, identifier, title, done, project_id, priority,
+    due_date, updated, url, labels, and counts for assignees/attachments/reactions. There
+    is no `description`: it is 132 KB of a measured 182 KB page and is rarely what a list
+    was asked for. Call `task_get` on the row you want, or pass `verbose=true` for the
+    full bodies.
 
     Capped at `per_page` (default 50). When more pages exist the result becomes
     `{"items": [...], "pagination": {"truncated": true, ...}}` — raise `page` to read on.
@@ -410,25 +556,46 @@ async def task_list(
         "sort_by": sort_by or None,
         "order_by": order_by or None,
     }
-    return await request("GET", "/tasks", caller_token(), params=params)
+    result = await request("GET", "/tasks", caller_token(), params=params)
+    return result if verbose else _project(result, _summarise_task)
 
 
 @tool
-async def task_search(query: str, page: int = 1, per_page: int = 50) -> Any:
+async def task_search(query: str, page: int = 1, per_page: int = 50, verbose: bool = False) -> Any:
     """Full-text search tasks by title/description (ParadeDB BM25 index).
+
+    Returns **summary rows** — see `task_list` for the field list and the reasoning. Pass
+    `verbose=true` for the full task bodies.
+
+    Note this searches with Vikunja's `s` parameter, which cannot be combined with
+    `filter`. Use `task_list` when you need a filter.
 
     Capped at `per_page` (default 50). When more pages exist the result becomes
     `{"items": [...], "pagination": {"truncated": true, ...}}` — raise `page` to read on.
     A "find every ticket about X" question is not answered by page 1 alone.
     """
     params = {"s": query, "page": page, "per_page": per_page}
-    return await request("GET", "/tasks", caller_token(), params=params)
+    result = await request("GET", "/tasks", caller_token(), params=params)
+    return result if verbose else _project(result, _summarise_task)
 
 
 @tool
-async def task_get(task_id: int) -> dict:
-    """Get a single task by ID, including labels, assignees, and comments."""
-    return await request("GET", f"/tasks/{task_id}", caller_token())
+async def task_get(task_id: int | str, verbose: bool = False) -> dict:
+    """Get a single task, including its description, labels and assignees.
+
+    `task_id` accepts the global id (`473`), the ticket number (`"#454"`), or the
+    `"#456 (id 475)"` form forge tickets are written in. A **bare** integer or digit
+    string is always a global id — `"454"` without the `#` is never read as a ticket
+    number, because that guess is what vikunja#331 was.
+
+    `description` is kept — reading one ticket's body is the point. What is dropped is the
+    inlined body of every related task (reduced to `{id, identifier, title, done}`) and
+    the attachment/reaction payloads (reduced to `attachment_count`/`reaction_count`).
+    Pass `verbose=true` for the untouched upstream body; note that the convenience `url`
+    field is only added on the projected path.
+    """
+    result = await request("GET", f"/tasks/{task_id}", caller_token())
+    return result if verbose else _project(result, _compact_task)
 
 
 @tool
@@ -449,27 +616,276 @@ async def task_create(
     return await request("PUT", f"/projects/{project_id}/tasks", caller_token(), json=body)
 
 
-async def _strip_ambiguous_task_index(result: Any) -> Any:
-    """Drop the bare ``index`` from task_create's response.
+def _strip_index_in_place(node: Any) -> None:
+    """Recursively drop every ``index`` key from a decoded response body.
 
-    Vikunja returns three identifiers on a created task: ``id`` (the global int every
-    other tool takes), ``index`` (a per-project int) and ``identifier`` (the display
-    string ``"#N"``). ``index`` is indistinguishable from a task id at a glance, and
-    misreading it is what caused vikunja#331 (id 342): an agent passed it to
-    task_label_add and silently mutated three unrelated tickets, briefly closing an open
-    security ticket among them.
+    Walks dicts and lists so a task nested inside ``related_tasks.*`` is stripped along
+    with the top-level one. The pagination envelope's ``pagination`` key is skipped: it is
+    this server's own metadata, never a task, and must survive untouched (a caller has to
+    be able to tell page 1 from a complete answer).
+
+    The walk is deliberately untyped — it does not try to recognise "a task" — because
+    every nested object Vikunja returns on a task (``labels``, ``assignees``,
+    ``created_by``, ``attachments``, ``reactions``, ``reminders``) is index-free, and the
+    one that is not (``related_tasks``) holds real tasks that need stripping. Erring
+    towards stripping costs a field nobody should be reading; erring the other way is
+    vikunja#331.
+    """
+    if isinstance(node, dict):
+        node.pop("index", None)
+        for key, value in node.items():
+            if key != "pagination":
+                _strip_index_in_place(value)
+    elif isinstance(node, list):
+        for item in node:
+            _strip_index_in_place(item)
+
+
+async def _strip_task_index(result: Any) -> Any:
+    """Drop the bare ``index`` from every task in a create or read response.
+
+    Vikunja returns three identifiers on a task: ``id`` (the global int every other tool
+    takes), ``index`` (a per-project int) and ``identifier`` (the display string
+    ``"#N"``). ``index`` is indistinguishable from a task id at a glance, and misreading
+    it is what caused vikunja#331 (id 342): an agent passed it to task_label_add and
+    silently mutated three unrelated tickets, briefly closing an open security ticket
+    among them.
+
+    Until v0.5.0 this was create-only, so ``task_get``/``task_list``/``task_search`` kept
+    returning ``"index": 454`` directly beside ``"id": 473`` — the ambiguity was closed on
+    the one path agents rarely read and left open on the three they read constantly. It
+    now covers the read paths too, at any nesting depth and inside the pagination
+    envelope.
 
     ``identifier`` is deliberately kept. It is a string, so it cannot be passed where an
     int id is expected without an obvious type error, and five forge consumers display it
     (the ``[TRACKER] task #N (id M)`` line in four agents' CLAUDE.md, plus
     research-plan-create). Stripping it would break every agent's ticket-filing output.
 
-    Read ``index`` back with task_get if you genuinely need it — this hook is create-only.
+    Nothing returns a bare ``index`` any more. Use ``identifier`` for the ticket number,
+    and pass it straight back as ``task_id`` — ``_resolve_task_ref`` accepts it.
     """
-    if isinstance(result, dict):
-        result.pop("index", None)
+    _strip_index_in_place(result)
     return result
 
+
+# ---------------------------------------------------------------------------
+# Ticket-reference resolution — accepting "#454" where a task id is taken
+# ---------------------------------------------------------------------------
+
+# The Vikunja release the `index` filter below was verified against. Named in the error
+# message when a resolve fails upstream, because that filter is *undocumented* (see
+# `_resolve_index`) and an upgrade dropping it is the most likely cause.
+_VERIFIED_VIKUNJA_VERSION = "v2.3.0"
+
+# The "#456 (id 475)" form that forge tickets, CLAUDE.md files and Matrix messages are
+# written in. When the global id is spelled out, take it and skip the API call entirely.
+#
+# Only consulted on a string that *starts* with a ticket reference, and only when it holds
+# exactly one `id N`. A bare `findall` over arbitrary prose would accept "see id 999
+# somewhere" and, worse, silently take the first of several — "#456 (id 475) blocks #331
+# (id 342)" would resolve to 475 on nothing but position. Every other ambiguous case in this
+# module raises and names the candidates; this one must not be the exception.
+_EMBEDDED_ID = re.compile(r"\bid\s+(\d+)\b", re.IGNORECASE)
+
+# A string that opens with a ticket reference, whatever follows it.
+_STARTS_WITH_TICKET_REF = re.compile(r"^#(\d+)\b")
+
+# A bare ticket reference: "#454", and nothing else.
+_TICKET_REF = re.compile(r"^#(\d+)$")
+
+_REF_FORMS = (
+    'a global task id (473, or the string "473"), '
+    'a ticket reference ("#454"), '
+    'or the combined form forge writes ("#456 (id 475)")'
+)
+
+
+async def _resolve_index(index: int, token: str) -> int:
+    """Resolve a per-project ticket number to the global task id, server-side.
+
+    One filtered call, no cache. ``index`` is a first-class filterable field — probed live
+    with a negative control (``bogusfield = 1`` returns 400, so Vikunja rejects unknown
+    filter fields rather than ignoring them, which proves the filter is genuinely applied).
+
+    **This filter is undocumented.** Vikunja's published filter-field list names twelve
+    fields and ``index`` is not among them; it works anyway on the version recorded in
+    ``_VERIFIED_VIKUNJA_VERSION``, and the server's accepted set matches the docs in neither
+    direction (``bucket_id`` works, ``position`` 500s). That is an accepted dependency, but
+    it must fail loudly — hence the re-raise below naming the verified version, and the live
+    guard test in ``tests/test_task_refs.py``.
+
+    Raises:
+        ValueError: no task carries that index, or more than one does.
+        VikunjaAPIError: the resolve call itself failed. Never swallowed, and **never**
+            fallen back to treating the ticket number as a global id — that fallback is
+            vikunja#331 reintroduced as an error path.
+    """
+    scope = get_settings().default_project_id
+    expr = f"index = {index}" if scope is None else f"project = {scope} && index = {index}"
+    try:
+        result = await request("GET", "/tasks", token, params={"filter": expr})
+    except VikunjaAPIError as exc:
+        raise VikunjaAPIError(
+            exc.status_code,
+            f"could not resolve ticket reference #{index}: the upstream filter "
+            f"{expr!r} failed ({exc}). Vikunja does not document `index` as a filterable "
+            f"field; it was verified working on Vikunja {_VERIFIED_VIKUNJA_VERSION}, so an "
+            "upgrade may have removed it. Pass the global task id instead until this is "
+            "fixed — do NOT assume the ticket number is the id.",
+        ) from exc
+
+    matches = result.get("items", []) if isinstance(result, dict) else result
+    matches = [t for t in (matches or []) if isinstance(t, dict)]
+
+    if not matches:
+        where = "" if scope is None else f" in project {scope}"
+        raise ValueError(
+            f"no task with ticket number #{index}{where}. Check the project — ticket "
+            "numbers restart per project and are not global task ids."
+        )
+    if len(matches) > 1:
+        candidates = ", ".join(f"id {t.get('id')} (project {t.get('project_id')})" for t in matches)
+        raise ValueError(
+            f"ticket number #{index} is ambiguous — it matches {len(matches)} tasks: "
+            f"{candidates}. Ticket numbers are only unique within a project. Pass the "
+            "global task id you meant, or set VIKUNJA_DEFAULT_PROJECT_ID to scope "
+            "resolution to one project."
+        )
+    return int(matches[0]["id"])
+
+
+async def _resolve_task_ref(ref: int | str, token: str | None = None) -> int:
+    """Turn whatever a caller passed as ``task_id`` into a global task id.
+
+    Accepted, in the order they are tried:
+
+    ==========================  ===============================================
+    ``473`` / ``"473"``         a global id, returned as-is. No API call.
+    ``"#454"``                  a ticket number — one filtered lookup.
+    ``"#456 (id 475)"``         the id is spelled out — take it. No API call.
+    ==========================  ===============================================
+
+    The third form is only honoured on a string that *opens* with a ticket reference and
+    names exactly one ``id N``. Prose that merely mentions an id is refused, and a string
+    naming several raises rather than taking the first — position is not evidence.
+
+    A **bare** number is always a global id, never a ticket number. That asymmetry is the
+    whole safety property: the ``#`` is what makes a ticket reference recognisable, and
+    without it there is no way to tell ``454`` meaning "task 454" from ``454`` meaning
+    "ticket #454, which is task 473". Guessing is precisely what vikunja#331 did.
+
+    ``token`` is resolved from the caller's request only when a lookup is actually needed,
+    so the no-API-call paths stay usable outside an HTTP request context.
+
+    Raises:
+        ValueError: on any other form, naming what is accepted.
+    """
+    # bool is an int subclass, and `task_id=True` reaching /tasks/1 is never intended.
+    if isinstance(ref, bool):
+        raise ValueError(f"task_id must be {_REF_FORMS}; got the boolean {ref!r}")
+    if isinstance(ref, int):
+        return ref
+    if not isinstance(ref, str):
+        raise ValueError(f"task_id must be {_REF_FORMS}; got {type(ref).__name__} {ref!r}")
+
+    text = ref.strip()
+
+    # `isascii()` matters: `str.isdigit()` is also true for superscripts like "²", where
+    # `int()` then raises "invalid literal for int()" — a confusing message for what is
+    # simply an unaccepted form. Unicode decimal digits ("٤٧٣") would convert cleanly, but
+    # a task id arriving in Arabic-Indic numerals is far more likely to be a mistake than
+    # an intention, so the rule is plain ASCII digits and a clear error otherwise.
+    if text.isascii() and text.isdigit():
+        return int(text)
+
+    ticket = _TICKET_REF.match(text)
+    if ticket:
+        return await _resolve_index(int(ticket.group(1)), token or caller_token())
+
+    if _STARTS_WITH_TICKET_REF.match(text):
+        ids = set(_EMBEDDED_ID.findall(text))
+        if len(ids) == 1:
+            return int(ids.pop())
+        if len(ids) > 1:
+            raise ValueError(
+                f"task_id {ref!r} names {len(ids)} different task ids "
+                f"({', '.join(sorted(ids, key=int))}). Pass the one you mean — picking the "
+                "first would be a guess, and guessing which task an ambiguous reference "
+                "points at is the whole failure this accepts references to prevent."
+            )
+
+    raise ValueError(f"task_id must be {_REF_FORMS}; got {ref!r}")
+
+
+async def _resolve_task_ref_kwarg(kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Before-hook: rewrite ``task_id`` in place to a global id.
+
+    Registered on every tool that takes a ``task_id``, so ``"#454"`` works uniformly rather
+    than on whichever tools someone remembered. A tool call with no ``task_id`` passes
+    through untouched.
+    """
+    if "task_id" in kwargs:
+        kwargs["task_id"] = await _resolve_task_ref(kwargs["task_id"])
+    return kwargs
+
+
+# Every tool that takes a `task_id`. All of them accept a ticket reference, resolved by
+# `_resolve_task_ref_kwarg` before the tool body runs.
+#
+# Registered from one list rather than decorated tool-by-tool so the set cannot drift: a
+# new task_id-taking tool that is not added here silently rejects "#454" while its
+# neighbours accept it, and "works on some tools" is worse than "works on none".
+#
+# Deliberately NOT resolved:
+#   - `tasks_bulk_update.task_ids` — a list, mutating N tasks per call, and the tool behind
+#     vikunja#333. Widening it deserves its own review (plan Phase 3 step 15).
+#   - `task_relation_add`/`task_relation_remove`'s `other_task_id` — still `int`, so a
+#     "#452" there is refused at schema validation. Loud and safe, but inconsistent;
+#     tracked separately rather than half-widened here.
+_TASK_REF_TOOLS = (
+    "task_get",
+    "task_update",
+    "task_delete",
+    "task_label_add",
+    "task_label_remove",
+    "comment_list",
+    "comment_create",
+    "comment_delete",
+    "task_assignee_list",
+    "task_assignee_add",
+    "task_assignees_add_bulk",
+    "task_assignee_remove",
+    "task_relation_add",
+    "task_relation_remove",
+    "task_reminders_set",
+    "attachment_list",
+    "attachment_upload",
+    "attachment_delete",
+    "task_bucket_move",
+)
+
+# Every tool whose response body is a task, or a list of tasks. All of them get the
+# `index` strip.
+#
+# The plan for v0.5.0 named only the three read tools, on the reasoning that they are what
+# agents actually read. But `task_update`, `task_delete`, `task_reminders_set`,
+# `tasks_bulk_update` and `task_bucket_move` all return a full task body too, `index` and
+# all — so naming only the read paths would have left the same `"index": 454` next to
+# `"id": 473` on five other tools, which is the trap this hook exists to remove. The strip
+# is a no-op on a body that has no `index`, so over-including a tool costs nothing and
+# under-including one is vikunja#331 again.
+_INDEX_STRIPPED_TOOLS = (
+    "task_create",
+    "task_get",
+    "task_list",
+    "task_search",
+    "task_update",
+    "task_delete",
+    "task_reminders_set",
+    "tasks_bulk_update",
+    "task_bucket_move",
+)
 
 # Mutating tools audited when VIKUNJA_AUDIT_LOG=1 — the set contrib/audit_log.py's own
 # docstring names, plus tasks_bulk_update, which mutates N tasks per call and was missing
@@ -523,8 +939,12 @@ def register_builtin_hooks() -> None:
     ``hooks.clear_hooks()`` wipes built-ins along with test-registered handlers — a test
     that clears hooks calls this to restore them instead of depending on import order.
     """
-    if _strip_ambiguous_task_index not in after_handlers("task_create"):
-        register_after("task_create", _strip_ambiguous_task_index)
+    for name in _INDEX_STRIPPED_TOOLS:
+        if _strip_task_index not in after_handlers(name):
+            register_after(name, _strip_task_index)
+    for name in _TASK_REF_TOOLS:
+        if _resolve_task_ref_kwarg not in before_handlers(name):
+            register_before(name, _resolve_task_ref_kwarg)
     _register_audit_log_if_enabled()
 
 
@@ -533,7 +953,7 @@ register_builtin_hooks()
 
 @tool
 async def task_update(
-    task_id: int,
+    task_id: int | str,
     title: str | None = None,
     description: str | None = None,
     done: bool | None = None,
@@ -558,7 +978,7 @@ async def task_update(
 
 
 @tool
-async def task_delete(task_id: int) -> dict:
+async def task_delete(task_id: int | str) -> dict:
     """Delete a task. Irreversible."""
     return await request("DELETE", f"/tasks/{task_id}", caller_token())
 
@@ -635,7 +1055,7 @@ async def label_delete(label_id: int) -> dict:
 
 
 @tool
-async def task_label_add(task_id: int, label_id: int) -> dict:
+async def task_label_add(task_id: int | str, label_id: int) -> dict:
     """Attach an existing label to a task."""
     return await request(
         "PUT", f"/tasks/{task_id}/labels", caller_token(), json={"label_id": label_id}
@@ -643,7 +1063,7 @@ async def task_label_add(task_id: int, label_id: int) -> dict:
 
 
 @tool
-async def task_label_remove(task_id: int, label_id: int) -> dict:
+async def task_label_remove(task_id: int | str, label_id: int) -> dict:
     """Detach a label from a task."""
     return await request("DELETE", f"/tasks/{task_id}/labels/{label_id}", caller_token())
 
@@ -654,7 +1074,7 @@ async def task_label_remove(task_id: int, label_id: int) -> dict:
 
 
 @tool
-async def comment_list(task_id: int, page: int = 1, per_page: int = 50) -> Any:
+async def comment_list(task_id: int | str, page: int = 1, per_page: int = 50) -> Any:
     """List comments on a task.
 
     Capped at `per_page` (default 50). When more pages exist the result becomes
@@ -665,7 +1085,7 @@ async def comment_list(task_id: int, page: int = 1, per_page: int = 50) -> Any:
 
 
 @tool
-async def comment_create(task_id: int, comment: str) -> dict:
+async def comment_create(task_id: int | str, comment: str) -> dict:
     """Add a comment to a task. `comment` may contain markdown or HTML."""
     return await request(
         "PUT",
@@ -676,7 +1096,7 @@ async def comment_create(task_id: int, comment: str) -> dict:
 
 
 @tool
-async def comment_delete(task_id: int, comment_id: int) -> dict:
+async def comment_delete(task_id: int | str, comment_id: int) -> dict:
     """Delete a comment from a task."""
     return await request("DELETE", f"/tasks/{task_id}/comments/{comment_id}", caller_token())
 
@@ -687,7 +1107,7 @@ async def comment_delete(task_id: int, comment_id: int) -> dict:
 
 
 @tool
-async def task_assignee_list(task_id: int, page: int = 1, per_page: int = 50) -> Any:
+async def task_assignee_list(task_id: int | str, page: int = 1, per_page: int = 50) -> Any:
     """List the users assigned to a task.
 
     Capped at `per_page` (default 50). When more pages exist the result becomes
@@ -698,7 +1118,7 @@ async def task_assignee_list(task_id: int, page: int = 1, per_page: int = 50) ->
 
 
 @tool
-async def task_assignee_add(task_id: int, user_id: int) -> dict:
+async def task_assignee_add(task_id: int | str, user_id: int) -> dict:
     """Assign a user to a task."""
     return await request(
         "PUT", f"/tasks/{task_id}/assignees", caller_token(), json={"user_id": user_id}
@@ -706,14 +1126,14 @@ async def task_assignee_add(task_id: int, user_id: int) -> dict:
 
 
 @tool
-async def task_assignees_add_bulk(task_id: int, user_ids: list[int]) -> dict:
+async def task_assignees_add_bulk(task_id: int | str, user_ids: list[int]) -> dict:
     """Assign several users to a task in one call (carries Plane assignees on migration)."""
     body = {"assignees": [{"id": uid} for uid in user_ids]}
     return await request("POST", f"/tasks/{task_id}/assignees/bulk", caller_token(), json=body)
 
 
 @tool
-async def task_assignee_remove(task_id: int, user_id: int) -> dict:
+async def task_assignee_remove(task_id: int | str, user_id: int) -> dict:
     """Remove a user's assignment from a task."""
     return await request("DELETE", f"/tasks/{task_id}/assignees/{user_id}", caller_token())
 
@@ -727,14 +1147,14 @@ async def task_assignee_remove(task_id: int, user_id: int) -> dict:
 
 
 @tool
-async def task_relation_add(task_id: int, other_task_id: int, relation_kind: str) -> dict:
+async def task_relation_add(task_id: int | str, other_task_id: int, relation_kind: str) -> dict:
     """Relate two tasks. `relation_kind` is e.g. `subtask`, `related`, `blocking`, `precedes`."""
     body = {"other_task_id": other_task_id, "relation_kind": relation_kind}
     return await request("PUT", f"/tasks/{task_id}/relations", caller_token(), json=body)
 
 
 @tool
-async def task_relation_remove(task_id: int, relation_kind: str, other_task_id: int) -> dict:
+async def task_relation_remove(task_id: int | str, relation_kind: str, other_task_id: int) -> dict:
     """Remove a relation between two tasks. `relation_kind` must match the existing relation."""
     # relation_kind is a free-text path segment — percent-encode it so a value like
     # "../.." cannot traverse to a different API path (IV-01).
@@ -751,7 +1171,7 @@ async def task_relation_remove(task_id: int, relation_kind: str, other_task_id: 
 
 
 @tool
-async def task_reminders_set(task_id: int, reminders: list[str]) -> dict:
+async def task_reminders_set(task_id: int | str, reminders: list[str]) -> dict:
     """Set a task's reminders. `reminders` is a list of RFC3339 timestamps.
 
     Replaces the task's reminder set (Vikunja stores reminders on the task object). Pass
@@ -768,7 +1188,7 @@ async def task_reminders_set(task_id: int, reminders: list[str]) -> dict:
 
 
 @tool
-async def attachment_list(task_id: int, page: int = 1, per_page: int = 50) -> Any:
+async def attachment_list(task_id: int | str, page: int = 1, per_page: int = 50) -> Any:
     """List attachments on a task.
 
     Capped at `per_page` (default 50). When more pages exist the result becomes
@@ -779,7 +1199,7 @@ async def attachment_list(task_id: int, page: int = 1, per_page: int = 50) -> An
 
 
 @tool
-async def attachment_upload(task_id: int, filename: str, content_base64: str) -> dict:
+async def attachment_upload(task_id: int | str, filename: str, content_base64: str) -> dict:
     """Upload a file attachment to a task.
 
     `content_base64` is the file's bytes, base64-encoded (keeps the transport JSON-safe).
@@ -796,7 +1216,7 @@ async def attachment_upload(task_id: int, filename: str, content_base64: str) ->
 
 
 @tool
-async def attachment_delete(task_id: int, attachment_id: int) -> dict:
+async def attachment_delete(task_id: int | str, attachment_id: int) -> dict:
     """Delete an attachment from a task."""
     return await request("DELETE", f"/tasks/{task_id}/attachments/{attachment_id}", caller_token())
 
@@ -1167,7 +1587,9 @@ async def bucket_delete(project_id: int, view_id: int, bucket_id: int) -> dict:
 
 
 @tool
-async def task_bucket_move(project_id: int, view_id: int, bucket_id: int, task_id: int) -> dict:
+async def task_bucket_move(
+    project_id: int, view_id: int, bucket_id: int, task_id: int | str
+) -> dict:
     """Move a task into a kanban bucket (column) — drives status changes on migration."""
     body = {"task_id": task_id, "bucket_id": bucket_id}
     return await request(
