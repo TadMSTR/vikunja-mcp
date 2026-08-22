@@ -46,7 +46,7 @@ from fastmcp import FastMCP
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from . import __version__, telemetry
+from . import __version__, markers, telemetry
 from .auth import caller_token
 from .client import request
 from .config import get_settings
@@ -1011,6 +1011,50 @@ async def _strip_task_index(result: Any) -> Any:
     return result
 
 
+def _strip_markers_in_place(node: Any) -> None:
+    """Recursively rewrite every ``description`` to drop its metadata footer.
+
+    Walks the body the same way :func:`_strip_index_in_place` does, and for the same
+    reason: a task inlined under ``related_tasks`` carries its own description, so a
+    top-level-only strip leaks a marker on every ticket that links to another.
+
+    ``pagination`` is skipped — it is this server's own envelope metadata, never a task.
+
+    Only ``description`` is touched. A label's ``description`` is also visited and is
+    correctly a no-op: :func:`markers.strip` only ever removes a paragraph that opens with
+    the ``vikunja-mcp:`` namespace, and nothing writes one there.
+    """
+    if isinstance(node, dict):
+        if isinstance(node.get("description"), str):
+            node["description"] = markers.strip(node["description"])
+        for key, value in node.items():
+            if key != "pagination":
+                _strip_markers_in_place(value)
+    elif isinstance(node, list):
+        for item in node:
+            _strip_markers_in_place(item)
+
+
+async def _strip_task_markers(result: Any) -> Any:
+    """Drop metadata markers from every description in a create, read or update response.
+
+    Markers are machinery — an idempotency key and commit backlinks — not content. An
+    agent reading a ticket should get the body a human wrote, and a build report quoting a
+    description should not acquire a footer it has to explain.
+
+    Registered on the same tool set as the ``index`` strip, and for the same reasoning
+    recorded there: ``task_update``, ``tasks_bulk_update`` and ``task_bucket_move`` all
+    return a full task body too, so naming only the three read tools would leave the
+    marker visible on the paths that *write* it — which is where it is most surprising.
+
+    This runs after the projections, so :func:`_compact_task` has already read whatever
+    structured fields it derives from the marker (``linked_refs``) while the description
+    still carried it. Ordering matters: strip first and the parse finds nothing.
+    """
+    _strip_markers_in_place(result)
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Ticket-reference resolution — accepting "#454" where a task id is taken
 # ---------------------------------------------------------------------------
@@ -1317,6 +1361,9 @@ def register_builtin_hooks() -> None:
     for name in _INDEX_STRIPPED_TOOLS:
         if _strip_task_index not in after_handlers(name):
             register_after(name, _strip_task_index)
+    for name in _INDEX_STRIPPED_TOOLS:
+        if _strip_task_markers not in after_handlers(name):
+            register_after(name, _strip_task_markers)
     for name in _TASK_REF_TOOLS:
         if _resolve_task_ref_kwarg not in before_handlers(name):
             register_before(name, _resolve_task_ref_kwarg)
