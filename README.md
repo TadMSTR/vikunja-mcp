@@ -179,6 +179,67 @@ fire-and-forget. `contrib/audit_log.py` is a worked example that records
 actor/tool/args-hash without ever logging raw arguments or the bearer token. Full contract
 and handler signatures: [`docs/extension-hooks.md`](docs/extension-hooks.md).
 
+## Signals for agents
+
+Three features exist because an agent decides what to do from whatever the tracker hands
+back at that moment. A rule in a prompt file erodes under context pressure; a field in the
+response does not.
+
+### Staleness
+
+Every task read carries `days_since_update` and `stale` alongside the raw `updated`, on
+`task_get`, `task_list` and `task_search`, in `verbose` mode too.
+
+Read them honestly. `updated` moves on *any* change, a label edit included, so
+**`stale: false` means "recently touched", not "the text is still true"**. The useful
+direction is the other one: `stale: true` means nobody has looked at this in months, so
+treat its description as a claim about the past. Both fields are `null` — never `false` —
+when the age is unknown, because "not known to be stale" and "known to be fresh" are
+different claims.
+
+The limitation at its sharpest: a bulk import rewrites `updated` on every task at once.
+Forge's tracker was migrated on 2026-07-19, so a month later its oldest open ticket read as
+33 days old, including tickets whose text predated the import by months. Nothing was fresh;
+every timestamp was. Set `VIKUNJA_STALE_AFTER_DAYS` accordingly after an import.
+
+### `backlog_summary`
+
+Counts, not rows — totals, done/open, and breakdowns by priority, label and staleness.
+Each bucket is one request that asks for a single row and reads the match count off the
+pagination header, so orienting in a backlog stops costing a pagination sweep. Measured on
+a 470-task tracker: 37 requests, ~150 ms, ~1.2 KB of response. The `calls` field reports
+what it cost, so the price is visible to whoever pays it.
+
+If your tracker has an "anchor" task carrying every label deliberately, name it in
+`VIKUNJA_SUMMARY_EXCLUDE_IDS` — otherwise it lands in every label bucket and inflates each
+count by exactly one, which is worse than an obviously broken number.
+
+### Duplicate detection
+
+**On by default**; set `VIKUNJA_DUPLICATE_CHECK=0` to disable. On `task_create`, titles that
+look like they already exist are attached to the response as `possible_duplicates`:
+
+```json
+{ "id": 491, "title": "...", "possible_duplicates": [
+    { "id": 490, "identifier": "#1", "title": "Containerize searxng-mcp deployment probe",
+      "done": false, "url": "https://vikunja.example/tasks/490", "matched_terms": 3 } ] }
+```
+
+It **reports, never refuses** — a false positive that blocked a filing would lose the
+finding entirely — and it can never cost a filing: any failure of the search degrades to no
+warning, and the task is created regardless.
+
+Default-on was decided by measurement, not preference. Run over all 470 titles in forge's
+tracker, 19 produced a warning (4.0%) and none errored; by inspection about twelve of those
+nineteen were genuine, including three exact-title pairs and one triplicate. So 96% of
+creates see nothing. Precision depends on how your tracker writes titles — if yours looks
+nothing like that, measure before trusting the number.
+
+Matching is lexical and title-scoped: the most distinctive terms of the title must *all*
+appear in a candidate's title. Descriptions are not searched, deliberately — on a corpus
+where tickets quote each other, a description match usually means "discusses", not
+"duplicates".
+
 ## Configuration
 
 All configuration is environment variables. The only Vikunja credential that can be
@@ -203,6 +264,9 @@ comes from the caller's `Authorization` header.
 | `VIKUNJA_NATS_SUBJECT` | NATS subject for metric events | `vikunja.mcp.metrics` |
 | `VIKUNJA_AUDIT_LOG` | Wire `contrib/audit_log.py` for the mutating tool set (`1`/`true`/`yes`) | off |
 | `VIKUNJA_AUDIT_LOG_DIR` | Directory audit lines are appended to, one `YYYY-MM-DD.md` file per day. Required if `VIKUNJA_AUDIT_LOG` is set — the server refuses to start rather than falling back to stdout | none |
+| `VIKUNJA_STALE_AFTER_DAYS` | Age at which a task is reported `stale: true`. Must be ≥ 1 — `0` would mark the whole backlog stale, so it is refused at startup | `90` |
+| `VIKUNJA_SUMMARY_EXCLUDE_IDS` | Comma-separated task ids excluded from every `backlog_summary` bucket. For a "vocabulary anchor" task that carries every label deliberately and would otherwise inflate each label count by one | none |
+| `VIKUNJA_DUPLICATE_CHECK` | Warn about probable duplicates on `task_create` (see [Duplicate detection](#duplicate-detection)). Set `0` to disable | **on** |
 
 ## Run
 

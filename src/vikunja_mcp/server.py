@@ -24,6 +24,7 @@ Permission integers used by the sharing tools follow Vikunja's ``Right``:
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import functools
@@ -34,6 +35,7 @@ import re
 import socket
 import sys
 from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import quote, urlparse
 
@@ -456,6 +458,78 @@ def _count(value: Any) -> int:
     return 0
 
 
+# Vikunja spells a null timestamp `0001-01-01T00:00:00Z`, which parses perfectly well and
+# is ~740,000 days ago. Anything at or before year 1 is the sentinel, not a date.
+_ZERO_TIMESTAMP_YEAR = 1
+
+
+def _parse_timestamp(value: Any) -> datetime | None:
+    """Parse an upstream RFC3339 timestamp, or return None if it is not one.
+
+    Returns None for absent, empty, non-string, unparsable, and Vikunja's zero-value
+    sentinel. Never raises: a read must not fail because a timestamp was strange, and a
+    derived convenience field is the last thing that should be able to break a ticket
+    fetch.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.year <= _ZERO_TIMESTAMP_YEAR:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def _staleness(updated: Any) -> dict[str, Any]:
+    """Derive ``days_since_update`` and ``stale`` from a task's ``updated`` timestamp.
+
+    **What this signal actually means, stated plainly because it is easy to overread:**
+    ``updated`` moves whenever *anything* on the task changes — adding a label, closing a
+    subtask, an assignee change. So ``stale: false`` means "recently touched", **not**
+    "verified current": a ticket whose body describes a system that no longer exists reads
+    as fresh the moment someone relabels it. The converse is the stronger direction —
+    ``stale: true`` does mean nobody has touched it in a while.
+
+    It ships anyway, because the alternative on offer is not a better signal, it is no
+    signal: the raw ISO string is already in the payload and nothing reads it. A weak
+    signal in the place the decision is made beats a strong one nobody consults.
+
+    The sharpest illustration of the weakness, measured on the corpus this was built for:
+    a bulk migration rewrites ``updated`` on every task at once. Forge's tracker was
+    imported from Plane on 2026-07-19, so on 2026-08-22 its oldest open ticket read as 33
+    days old — including tickets whose text predated the import by months. Nothing was
+    fresh; every timestamp was. Set ``VIKUNJA_STALE_AFTER_DAYS`` with that in mind after
+    any import, and do not read a corpus-wide ``stale: false`` as a clean bill of health.
+
+    Both fields are ``None`` when the age is unknown — see :func:`_parse_timestamp`.
+    ``None`` rather than ``false`` because "not known to be stale" and "known to be fresh"
+    are different claims, and only one of them is true here.
+    """
+    parsed = _parse_timestamp(updated)
+    if parsed is None:
+        return {"days_since_update": None, "stale": None}
+    # Clamped at zero: a task `updated` in the future is clock skew between forge and
+    # Vikunja, and a negative age reads as a bug in this server rather than in the clocks.
+    days = max((datetime.now(UTC) - parsed).days, 0)
+    return {"days_since_update": days, "stale": days >= get_settings().stale_after_days}
+
+
+def _with_staleness(task: dict[str, Any]) -> dict[str, Any]:
+    """The verbose path's projection: the untouched body plus the two derived fields.
+
+    ``verbose`` restores *payload*, not ambiguity — the principle v0.5.0 established when
+    the ``index`` strip was applied to the verbose path too. A caller asking for the full
+    body is not asking to be handed a raw timestamp to diff by hand.
+
+    Only the top-level task is annotated. A task inlined under ``related_tasks`` is a
+    reference to something the caller did not ask about, and dating it invites reading a
+    staleness verdict on a ticket that was never fetched.
+    """
+    return {**task, **_staleness(task.get("updated"))}
+
+
 def _task_ref(task: dict[str, Any]) -> dict[str, Any]:
     """The smallest honest reference to a task: enough to identify it and fetch it.
 
@@ -503,6 +577,7 @@ def _summarise_task(task: dict[str, Any]) -> dict[str, Any]:
     row["assignee_count"] = _count(task.get("assignees"))
     for name, count_key in _COUNTED_COLLECTIONS.items():
         row[count_key] = _count(task.get(name))
+    row.update(_staleness(task.get("updated")))
     return row
 
 
@@ -523,6 +598,7 @@ def _compact_task(task: dict[str, Any]) -> dict[str, Any]:
         out["related_tasks"] = _thin_related(out["related_tasks"])
     for name, count_key in _COUNTED_COLLECTIONS.items():
         out[count_key] = _count(task.get(name))
+    out.update(_staleness(task.get("updated")))
     return out
 
 
@@ -572,6 +648,9 @@ async def task_list(
     was asked for. Call `task_get` on the row you want, or pass `verbose=true` for the
     full bodies.
 
+    Each row also carries `days_since_update` and `stale` (see `task_get` for exactly what
+    those two do and do not tell you — `stale: false` is **not** "verified current").
+
     Capped at `per_page` (default 50). When more pages exist the result becomes
     `{"items": [...], "pagination": {"truncated": true, ...}}` — raise `page` to read on.
     Do not treat one page as the whole answer.
@@ -584,15 +663,20 @@ async def task_list(
         "order_by": order_by or None,
     }
     result = await request("GET", "/tasks", caller_token(), params=params)
-    return result if verbose else _project(result, _summarise_task)
+    return _project(result, _with_staleness if verbose else _summarise_task)
 
 
 @tool
 async def task_search(query: str, page: int = 1, per_page: int = 50, verbose: bool = False) -> Any:
     """Full-text search tasks by title/description (ParadeDB BM25 index).
 
-    Returns **summary rows** — see `task_list` for the field list and the reasoning. Pass
-    `verbose=true` for the full task bodies.
+    Returns **summary rows** — see `task_list` for the field list (including the staleness
+    fields) and the reasoning. Pass `verbose=true` for the full task bodies.
+
+    This searches **descriptions as well as titles**. That is the right default for "find
+    anything about X", but it means a hit is not evidence of a duplicate — on a corpus
+    where tickets quote each other, most hits are tickets that merely *discuss* the term.
+    Use `task_list(filter='title like "%term%"')` when you need title-scoped matching.
 
     Note this searches with Vikunja's `s` parameter, which cannot be combined with
     `filter`. Use `task_list` when you need a filter.
@@ -603,7 +687,7 @@ async def task_search(query: str, page: int = 1, per_page: int = 50, verbose: bo
     """
     params = {"s": query, "page": page, "per_page": per_page}
     result = await request("GET", "/tasks", caller_token(), params=params)
-    return result if verbose else _project(result, _summarise_task)
+    return _project(result, _with_staleness if verbose else _summarise_task)
 
 
 @tool
@@ -618,11 +702,20 @@ async def task_get(task_id: int | str, verbose: bool = False) -> dict:
     `description` is kept — reading one ticket's body is the point. What is dropped is the
     inlined body of every related task (reduced to `{id, identifier, title, done}`) and
     the attachment/reaction payloads (reduced to `attachment_count`/`reaction_count`).
-    Pass `verbose=true` for the untouched upstream body; note that the convenience `url`
-    field is only added on the projected path.
+    Pass `verbose=true` for the untouched upstream body plus the staleness fields below;
+    note that the convenience `url` field is only added on the projected path.
+
+    **Staleness.** `days_since_update` is the whole-day age of `updated`, and `stale` is
+    true once that reaches `VIKUNJA_STALE_AFTER_DAYS` (default 90). Read them honestly:
+    `updated` moves on *any* change, including a label edit, so `stale: false` means
+    "recently touched", **not** "the text below is still true". The useful direction is
+    the other one — `stale: true` means nobody has touched this in months, so treat its
+    description as a claim about the past and verify before acting on it. Both fields are
+    `null` when `updated` is missing or is Vikunja's `0001-01-01` zero value; `null` means
+    unknown, not fresh.
     """
     result = await request("GET", f"/tasks/{task_id}", caller_token())
-    return result if verbose else _project(result, _compact_task)
+    return _project(result, _with_staleness if verbose else _compact_task)
 
 
 @tool
@@ -641,6 +734,228 @@ async def task_create(
         due_date=due_date or None,
     )
     return await request("PUT", f"/projects/{project_id}/tasks", caller_token(), json=body)
+
+
+# ---------------------------------------------------------------------------
+# Backlog summary — counting without fetching
+# ---------------------------------------------------------------------------
+
+# Vikunja's full priority range: 0 unset, 1 low, 2 medium, 3 high, 4 urgent, 5 DO NOW.
+# Every value is queried, including 0, because "how much of this backlog has nobody
+# triaged" is one of the questions a summary is actually asked.
+_PRIORITIES = (0, 1, 2, 3, 4, 5)
+
+# Default ceiling on label buckets. Each label costs one upstream call, so an unbounded
+# vocabulary would quietly turn a cheap tool into an expensive one.
+_MAX_LABEL_BUCKETS = 25
+
+
+def _compose(*predicates: str) -> str:
+    """Join non-empty filter predicates with Vikunja's ``&&``, each in its own group.
+
+    **The parentheses are a security control, not formatting.** One of these predicates is
+    the caller's own ``filter`` argument, and Vikunja evaluates a filter expression strictly
+    left to right (measured — see below). So without grouping, a caller filter containing a
+    top-level ``||`` breaks out of every predicate composed before it::
+
+        _compose("project = 7", "id = 999 || done = true")
+        -> project = 7 && id = 999 || done = true
+        -> parsed as ((project = 7 && id = 999) || done = true)
+
+    — and the second disjunct is scoped by nothing at all. Reproduced live on v2.3.0:
+    ``done = false && id = 999999 || done = true`` returns 264 *done* tasks, having escaped
+    the ``done = false`` it opens with. Wrapping each predicate contains it:
+    ``(done = false) && (id = 999999 || done = true)`` returns 0.
+
+    That matters here specifically because ``backlog_summary`` *claims* a scope and echoes
+    it back in ``scope.filter``. A caller could already query anything its own token can
+    reach, so this is not privilege escalation — it is the tool reporting counts for one
+    scope while saying it counted another, which is the more dangerous kind of wrong.
+
+    Note the evaluation order is left-to-right, **not** the AND-binds-tighter precedence one
+    would assume from most languages: ``done = true || done = false && id = 999999`` returns
+    0, where precedence would give 264. The practical difference is that a trailing
+    predicate (the ``id != N`` exclusions) does still constrain the whole accumulated
+    expression, so those were never escapable — only the predicates *before* the caller's
+    were. Grouping fixes both regardless of which rule a future Vikunja adopts.
+
+    Predicates are wrapped unconditionally, including ones that are already grouped. Nested
+    groups are valid and count identically (verified: the flat and six-deep nested forms of
+    the same filter both return 206), and a "is it already wrapped?" check is the kind that
+    reads ``(a) && (b)`` as one group and reintroduces the bug.
+    """
+    return " && ".join(f"({p})" for p in predicates if p)
+
+
+async def _count_matching(filter_expr: str) -> int:
+    """The exact number of tasks matching ``filter_expr``, in one one-row request.
+
+    Rests on an undocumented Vikunja behaviour, measured rather than read: with
+    ``per_page=1`` the ``x-pagination-total-pages`` header *is* the match count, because
+    one row per page makes pages and rows the same thing. Confirmed non-ceiling on an
+    exact multiple (49 items at ``per_page=7`` reports 7 pages, not 8) and confirmed
+    against live v2.3.0 on 2026-08-22 in all three regimes this has to survive:
+
+    - **0 matches** — header is ``0``, and ``client.request`` returns the bare ``[]``
+      because it only builds an envelope above one page. Counted as ``len([]) == 0``.
+    - **exactly 1** — header is ``1``, still no envelope, bare one-item list.
+    - **N > 1** — the envelope, where ``pagination.total_pages`` is the count.
+
+    The 0 and 1 cases are the ones worth stating: they never reach the envelope branch, so
+    an implementation that only read ``pagination`` would report 0 for both and be wrong on
+    every bucket holding exactly one task.
+
+    Being undocumented is why `test_filter_canary.py` exists — a Vikunja upgrade that
+    changed this would make every count silently wrong rather than fail.
+    """
+    result = await request(
+        "GET",
+        "/tasks",
+        caller_token(),
+        params={"filter": filter_expr or None, "per_page": 1, "page": 1},
+    )
+    if isinstance(result, dict) and "pagination" in result:
+        try:
+            return int(result["pagination"].get("total_pages", 0))
+        except (TypeError, ValueError):
+            return 0
+    if isinstance(result, list):
+        return len(result)
+    return 0
+
+
+def _unwrap_items(result: Any) -> list[Any]:
+    """The rows from a list response, whether or not it arrived in the envelope."""
+    if isinstance(result, dict) and "items" in result:
+        return result["items"] or []
+    return result if isinstance(result, list) else []
+
+
+@tool
+async def backlog_summary(
+    project_id: int | None = None,
+    filter: str = "",
+    include_done: bool = False,
+    max_label_buckets: int = _MAX_LABEL_BUCKETS,
+) -> dict:
+    """Counts describing the shape of a backlog, without paginating through it.
+
+    Answers "what is in here and what needs attention" in one small response: totals,
+    done vs open, a breakdown by priority, by label, and by staleness. Returns **counts
+    only — no task rows**. When you know which bucket you care about, follow up with
+    `task_list` using the same filter.
+
+    This is cheap by construction. Each bucket is one request that asks for a single row
+    and reads the match count off the pagination header, so a summary of a 470-task
+    tracker moves a few hundred bytes rather than several megabytes. The `calls` field in
+    the response reports exactly how many upstream requests it cost, so the price is
+    visible to whoever is paying it.
+
+    `project_id` scopes the summary to one project; omit it to summarise everything you
+    can see. `filter` is any additional Vikunja filter expression and is composed into
+    *every* bucket, so `filter="priority >= 3"` gives the shape of the urgent work alone.
+    `scope.filter` in the response is the exact expression the buckets were counted over —
+    read it rather than inferring what was included.
+
+    By default the buckets cover **open** tasks only, since "backlog" usually means work
+    outstanding; `total`, `done` and `not_done` always describe the full scope regardless.
+    Pass `include_done=true` to bucket everything.
+
+    Label buckets are capped at `max_label_buckets` (default 25) because each one costs a
+    call. When the cap bites, `labels_truncated` is true and `notes` says how many were
+    dropped — a truncated summary that looked complete would be worse than no summary.
+
+    Staleness reuses `VIKUNJA_STALE_AFTER_DAYS` and carries the same caveat as the
+    per-task `stale` field: it measures when a task was last *touched*, not whether its
+    text is still true. See `task_get`.
+    """
+    settings = get_settings()
+    excluded = settings.excluded_task_ids
+
+    # Applied to every bucket including the totals, so the counts are consistent with each
+    # other. Excluding an anchor task from the label buckets but not the total would just
+    # relocate the off-by-one rather than remove it.
+    # Kept as a *list* of predicates rather than a composed string, so each bucket composes
+    # once from the parts. Composing a composed string would nest the groups
+    # (`((project = 7)) && (done = true)`) — harmless to Vikunja, verified, but it makes the
+    # `scope.filter` a reader has to trust progressively harder to read.
+    base_predicates = [
+        p
+        for p in (
+            f"project = {project_id}" if project_id is not None else "",
+            filter,
+            *(f"id != {task_id}" for task_id in excluded),
+        )
+        if p
+    ]
+    base = _compose(*base_predicates)
+    bucket_predicates = base_predicates if include_done else [*base_predicates, "done = false"]
+    bucket_scope = _compose(*bucket_predicates)
+
+    cutoff = datetime.now(UTC) - timedelta(days=settings.stale_after_days)
+    stale_cutoff = f'"{cutoff:%Y-%m-%d}"'
+
+    labels = [
+        label
+        for label in _unwrap_items(
+            await request("GET", "/labels", caller_token(), params={"per_page": 50})
+        )
+        if isinstance(label, dict) and label.get("id") is not None
+    ]
+    kept_labels = labels[:max_label_buckets]
+    dropped = len(labels) - len(kept_labels)
+
+    # Fired concurrently: they are independent one-row reads, and the bucket cap is what
+    # bounds the fan-out.
+    priority_counts, label_counts, (total, done, not_done, stale, fresh) = await asyncio.gather(
+        asyncio.gather(
+            *(_count_matching(_compose(*bucket_predicates, f"priority = {p}")) for p in _PRIORITIES)
+        ),
+        asyncio.gather(
+            *(
+                _count_matching(_compose(*bucket_predicates, f"labels in {label['id']}"))
+                for label in kept_labels
+            )
+        ),
+        asyncio.gather(
+            _count_matching(base),
+            _count_matching(_compose(*base_predicates, "done = true")),
+            _count_matching(_compose(*base_predicates, "done = false")),
+            _count_matching(_compose(*bucket_predicates, f"updated < {stale_cutoff}")),
+            _count_matching(_compose(*bucket_predicates, f"updated >= {stale_cutoff}")),
+        ),
+    )
+
+    notes: list[str] = []
+    if dropped:
+        notes.append(
+            f"{dropped} of {len(labels)} labels were not counted — max_label_buckets is "
+            f"{max_label_buckets}. Raise it, or narrow the summary with `filter`."
+        )
+
+    return {
+        "scope": {
+            "project_id": project_id,
+            "filter": bucket_scope,
+            "include_done": include_done,
+            "stale_after_days": settings.stale_after_days,
+            "stale_cutoff": f"{cutoff:%Y-%m-%d}",
+            "excluded_task_ids": excluded,
+        },
+        "total": total,
+        "done": done,
+        "not_done": not_done,
+        "by_priority": {str(p): c for p, c in zip(_PRIORITIES, priority_counts, strict=True)},
+        "by_label": {
+            label["title"]: count
+            for label, count in zip(kept_labels, label_counts, strict=True)
+            if label.get("title")
+        },
+        "by_staleness": {"stale": stale, "fresh": fresh},
+        "labels_truncated": bool(dropped),
+        "calls": len(_PRIORITIES) + len(kept_labels) + 5 + 1,
+        "notes": notes,
+    }
 
 
 def _strip_index_in_place(node: Any) -> None:
@@ -958,6 +1273,39 @@ def _register_audit_log_if_enabled() -> None:
     register_audit_log(_AUDITED_TOOLS, logger=FileAuditLogger(audit_dir))
 
 
+def _register_duplicate_check_if_enabled() -> None:
+    """Env-gated wiring for contrib/duplicate_check.py (vikunja#463, id 482).
+
+    Same wiring shape as the audit log — ``contrib/`` is not imported by default, and the
+    registration lives here where this repo's tests and code review can see it — but the
+    **default is on**, which is the opposite of the audit log's.
+
+    The reasoning is the ticket's: a feature that must be opted into will not be, and the
+    correction it enforces ("consolidate, don't re-file") is precisely the kind that erodes
+    under context pressure. That argument was only accepted because the cost was measured
+    rather than assumed. Run over all 470 tickets in forge's tracker on 2026-08-22, each
+    title fed back through the detector: **19 produced a warning (4.0%), 0 errored**, and by
+    inspection about twelve of the nineteen are genuine — including three exact-title pairs,
+    one triplicate, and one ticket a human had already annotated "[duplicate]". So 96% of
+    creates see nothing, and the ones that do are mostly right.
+
+    Set ``VIKUNJA_DUPLICATE_CHECK=0`` to turn it off. The cost when on is one extra upstream
+    search per ``task_create``; any failure of that search degrades to no warning and never
+    to a failed create (see ``contrib/duplicate_check.py``).
+
+    Precision depends on how a tracker writes its titles, so an adopter whose corpus looks
+    nothing like forge's should re-measure before trusting the number above.
+    """
+    if os.environ.get("VIKUNJA_DUPLICATE_CHECK", "1").strip().lower() not in ("1", "true", "yes"):
+        return
+    if any(getattr(h, "is_duplicate_check_hook", False) for h in before_handlers("task_create")):
+        return  # already wired — register_builtin_hooks() can be called more than once
+
+    from .contrib.duplicate_check import register_duplicate_check
+
+    register_duplicate_check()
+
+
 def register_builtin_hooks() -> None:
     """Register the hooks this server ships with. Idempotent.
 
@@ -973,6 +1321,7 @@ def register_builtin_hooks() -> None:
         if _resolve_task_ref_kwarg not in before_handlers(name):
             register_before(name, _resolve_task_ref_kwarg)
     _register_audit_log_if_enabled()
+    _register_duplicate_check_if_enabled()
 
 
 register_builtin_hooks()

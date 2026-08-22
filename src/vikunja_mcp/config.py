@@ -18,6 +18,24 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from .exceptions import ConfigError
 
 
+def parse_task_ids(raw: str) -> list[int]:
+    """Parse ``"180, 42"`` into ``[180, 42]``. Empty or blank yields ``[]``.
+
+    Raises ValueError naming the offending entry, so a typo in a compose file is
+    attributable rather than just "invalid".
+    """
+    ids: list[int] = []
+    for chunk in (raw or "").split(","):
+        entry = chunk.strip()
+        if not entry:
+            continue
+        try:
+            ids.append(int(entry))
+        except ValueError:
+            raise ValueError(f"{entry!r} is not an integer task id") from None
+    return ids
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="VIKUNJA_",
@@ -59,6 +77,70 @@ class Settings(BaseSettings):
     # exists. get_settings() refuses that combination at startup rather than documenting it
     # as a footgun.
     token: str | None = None
+
+    # Age in days past which a task is reported `stale: true` on every read path.
+    #
+    # 90 is a judgement call, not a measurement: long enough that ordinary in-flight work
+    # is never flagged, short enough to catch a ticket whose text has drifted from reality.
+    # It is a *weak* signal by construction — see `server._staleness` for what it does and
+    # does not claim.
+    stale_after_days: int = 90
+
+    # Task ids excluded from every `backlog_summary` bucket, comma-separated. Empty by
+    # default, and that default is the important part.
+    #
+    # The motivating case: a tracker can hold a "vocabulary anchor" task that carries every
+    # label deliberately, so the vocabulary is visible in the UI and cannot be pruned. Such
+    # a task lands in *every* label bucket and inflates each count by exactly one — a
+    # summary that is wrong by one everywhere, which is worse than one that is obviously
+    # broken. A tracker with exactly that convention is how the problem was found.
+    #
+    # The id is NOT baked in here. This is a public repo and another deployment's anchor is
+    # a different id or does not exist; a hardcoded 180 would be the SC-01 pattern
+    # (environment-specific values published in source) that `url` and
+    # `FileAuditLogger`'s directory argument already exist to avoid. The deployment names
+    # its own anchor.
+    summary_exclude_ids: str = ""
+
+    @field_validator("summary_exclude_ids", mode="after")
+    @classmethod
+    def _exclude_ids_must_parse(cls, v: str) -> str:
+        """Reject a malformed list at startup rather than at summary time.
+
+        A typo here would otherwise surface as a filter Vikunja rejects with a 400, on a
+        tool call, long after the deploy that caused it.
+        """
+        try:
+            parse_task_ids(v)
+        except ValueError as exc:
+            raise ValueError(
+                f"VIKUNJA_SUMMARY_EXCLUDE_IDS is not a comma-separated list of task ids: "
+                f"{exc}. Example: VIKUNJA_SUMMARY_EXCLUDE_IDS=180,42"
+            ) from exc
+        return v
+
+    @property
+    def excluded_task_ids(self) -> list[int]:
+        """``summary_exclude_ids`` parsed. Validated at startup, so this cannot raise."""
+        return parse_task_ids(self.summary_exclude_ids)
+
+    @field_validator("stale_after_days", mode="after")
+    @classmethod
+    def _threshold_must_be_positive(cls, v: int) -> int:
+        """Refuse a threshold of 0 or less rather than marking the whole backlog stale.
+
+        A zero threshold makes `stale` true for every task including ones updated seconds
+        ago — a wrong answer with no symptom, since the field looks like it is working.
+        Same reasoning as the token/transport refusal below: fail at startup, where it is
+        attributable, rather than at read time, where it is not.
+        """
+        if v <= 0:
+            raise ValueError(
+                f"VIKUNJA_STALE_AFTER_DAYS must be at least 1, got {v}. A threshold of "
+                "zero or less marks every task stale — including one updated a moment "
+                "ago — which makes the flag useless without looking broken."
+            )
+        return v
 
     @field_validator("token", mode="after")
     @classmethod

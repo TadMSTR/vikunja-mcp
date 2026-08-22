@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "vikunja-mcp"
-version = "0.6.0"
+version = "0.7.0"
 description = "FastMCP server exposing the Vikunja REST API as scoped, per-agent MCP tools"
 readme = "README.md"
 license = { text = "MIT" }
@@ -70,6 +70,11 @@ select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    # Live-instance canary over undocumented Vikunja filter behaviour. Skipped unless
+    # VIKUNJA_CANARY_URL and VIKUNJA_CANARY_TOKEN are set, so the default run stays offline.
+    "canary: requires a live Vikunja instance (see tests/test_filter_canary.py)",
+]
 
 [tool.coverage.run]
 source = ["vikunja_mcp"]

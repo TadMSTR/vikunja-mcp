@@ -415,7 +415,17 @@ async def test_task_list_returns_summary_rows_without_description(monkeypatch):
 
 
 async def test_task_list_summary_is_dramatically_smaller(monkeypatch):
-    """The measured win, asserted rather than assumed — 182 KB was ~45k tokens per call."""
+    """The measured win, asserted rather than assumed — 182 KB was ~45k tokens per call.
+
+    The multiplier moved from 5 to 4 in v0.7.0, and the honest reason is that the two
+    staleness fields cost real bytes: 41 of 446 per row (~9%), taking this fixture's ratio
+    from 5.2x to 4.75x. It is a retarget, not a rounding — the guard still fails on any
+    change that meaningfully re-inflates a list row.
+
+    Note this fixture *understates* the real win. Its synthetic `description` is a single
+    line; on the live corpus `description` was 132 KB of the measured 182 KB page, which is
+    the field the projection actually exists to drop.
+    """
     import json
 
     full = fixtures.task_list(50)
@@ -425,7 +435,7 @@ async def test_task_list_summary_is_dramatically_smaller(monkeypatch):
 
     compact = await call(server.task_list)
 
-    assert len(json.dumps(compact)) * 5 < len(json.dumps(full))
+    assert len(json.dumps(compact)) * 4 < len(json.dumps(full))
 
 
 async def test_task_search_projects_the_same_way(monkeypatch):
@@ -465,7 +475,14 @@ async def test_counted_collections_stay_discoverable(monkeypatch):
 
 
 async def test_verbose_round_trips_the_upstream_body(monkeypatch):
-    """`verbose=True` is an escape hatch, so it has to actually return everything."""
+    """`verbose=True` is an escape hatch, so it has to actually return everything.
+
+    Retargeted in v0.7.0. This was an exact-equality assertion, which made it a tripwire on
+    *any* added field rather than a guard on dropped ones — and the thing it exists to
+    catch is a field going missing. It now asserts the upstream body survives intact and
+    pins the added keys explicitly, so a future addition still has to be declared here but
+    a silent removal still fails.
+    """
     body = fixtures.task()
     mock = AsyncMock(return_value=body)
     monkeypatch.setattr(server, "request", mock)
@@ -476,7 +493,11 @@ async def test_verbose_round_trips_the_upstream_body(monkeypatch):
     expected = fixtures.task()
     expected.pop("index")  # the Phase 1 strip still applies; only the payload comes back
     expected["related_tasks"]["related"][0].pop("index")
-    assert out == expected
+
+    # Nothing from upstream is dropped or altered.
+    assert {k: out[k] for k in expected} == expected
+    # And the only things added are the two derived staleness fields (vikunja#464).
+    assert set(out) - set(expected) == {"days_since_update", "stale"}
 
 
 async def test_a_body_with_no_id_is_not_given_a_url_to_nothing(monkeypatch):

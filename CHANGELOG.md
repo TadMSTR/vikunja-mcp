@@ -6,6 +6,59 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-08-22
+
+Three signals an agent reads at the moment it decides to act, plus a canary over the
+undocumented Vikunja behaviour they rest on. Tickets #463 (id 482), #464 (id 483),
+#467 (id 486) and #470 (id 489). All read-path or report-only — nothing here stores new
+state, and the only write path touched is `task_create`, which gains a read beside it and a
+field on its response.
+
+### Added
+- **Staleness on every task read** — `days_since_update` and `stale` on `task_get`,
+  `task_list` and `task_search`, in `verbose` too. Threshold is `VIKUNJA_STALE_AFTER_DAYS`
+  (default 90); `0` or less is refused at startup rather than marking the whole backlog
+  stale. Both fields are `null`, never `false`, when the age is unknown — including for
+  Vikunja's `0001-01-01` zero value, which parses fine and would otherwise report ~740,000
+  days and `stale: true`. The field docs state plainly that `stale: false` means "recently
+  touched", not "still true".
+- **`backlog_summary`** — counts rather than rows: totals, done/open, and breakdowns by
+  priority, label and staleness. Each bucket is one request asking for a single row, using
+  `per_page=1` so `total_pages` *is* the match count. Measured live: 37 calls, ~150 ms,
+  ~1.2 KB for a 470-task tracker, with the cost reported in the response as `calls`.
+  `VIKUNJA_SUMMARY_EXCLUDE_IDS` drops an all-labels "anchor" task that would otherwise
+  inflate every label count by exactly one.
+- **Duplicate detection on `task_create`** (`contrib/duplicate_check.py`), **on by
+  default** — `VIKUNJA_DUPLICATE_CHECK=0` disables it. Attaches `possible_duplicates` to
+  the created task. Reports, never refuses, and never costs a filing: both hook handlers
+  wrap their entire body, so any failure degrades to no warning rather than aborting the
+  create. Default-on was decided on measurement — over all 470 titles in forge's tracker,
+  19 warned (4.0%), 0 errored, and ~12 of the 19 were genuine.
+- **Filter upgrade canary** (`tests/test_filter_canary.py`) — 22 assertions over the
+  undocumented filter behaviour this server depends on, with negative controls throughout,
+  since a filter silently becoming a no-op looks identical to success. Self-contained
+  (builds and deletes its own fixtures), skipped unless `VIKUNJA_CANARY_URL` and
+  `VIKUNJA_CANARY_TOKEN` are set, and run weekly in CI against `vikunja/vikunja:latest`.
+
+### Security
+- **`backlog_summary`'s caller-supplied `filter` can no longer escape the tool's own scope.**
+  Every predicate is now composed into its own parenthesised group. Previously they were
+  joined with a bare `&&`, and because Vikunja evaluates filter expressions strictly
+  left to right, a caller `filter` containing a top-level `||` broke out of the predicates
+  composed before it — `done = false && id = 999999 || done = true` returns 264 *done*
+  tasks, having escaped the `done = false` it opens with. Not privilege escalation (the
+  caller already reaches whatever its own token permits), but the tool would report counts
+  for one scope while `scope.filter` claimed another. Found by the build audit; the
+  reproduction, the fix, and the left-to-right evaluation order are all pinned by tests.
+
+### Notes
+- **`like` case-sensitivity depends on the database backend, not on Vikunja.** Measured on
+  two instances both running v2.3.0: case-sensitive on Postgres, case-insensitive on
+  SQLite. Duplicate detection therefore queries every term in lower/Capital/UPPER at once,
+  which is correct under either. Found by the canary before release, not after.
+- `task_search`'s docstring now says it searches descriptions as well as titles, so a hit
+  is not evidence of a duplicate.
+
 ## [0.6.0] — 2026-08-21
 
 Makes the server deployable by someone who is not running PM2 on a Debian host. Three
