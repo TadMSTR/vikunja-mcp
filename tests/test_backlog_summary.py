@@ -124,9 +124,11 @@ async def test_call_count_is_bounded_and_reported(upstream):
 
 
 async def test_scope_reports_the_exact_filter_counted(upstream):
+    """Each predicate is its own group — see `server._compose`, where that is a security
+    control rather than formatting. The reported scope is the expression actually sent."""
     upstream({}, labels=[])
     result = await call(server.backlog_summary, project_id=7)
-    assert result["scope"]["filter"] == "project = 7 && done = false"
+    assert result["scope"]["filter"] == "(project = 7) && (done = false)"
     assert result["scope"]["project_id"] == 7
 
 
@@ -134,6 +136,61 @@ async def test_caller_filter_is_composed_into_every_bucket(upstream):
     fake = upstream({}, labels=_labels("type:bug"))
     await call(server.backlog_summary, project_id=7, filter="priority >= 3")
     assert all("priority >= 3" in c["params"]["filter"] for c in fake.task_calls)
+
+
+# --- scope containment (security audit 2026-08-22, MEDIUM) ----------------
+
+
+async def test_a_caller_filter_containing_or_cannot_widen_the_scope(upstream):
+    """A caller `filter` with a top-level `||` must not escape the scoping predicates.
+
+    Vikunja evaluates filters strictly left to right, so an ungrouped composition of
+    `project = 7 && <caller filter>` where the caller supplies `a || b` parses as
+    `((project = 7 && a) || b)` — and `b` is scoped by nothing. Reproduced live before
+    fixing: `done = false && id = 999999 || done = true` returns 264 *done* tasks.
+
+    The fix is grouping, so this asserts the shape that makes the escape impossible rather
+    than trying to re-derive the parser's behaviour from a mock.
+    """
+    fake = upstream({}, labels=_labels("type:bug"))
+    await call(server.backlog_summary, project_id=7, filter="id = 999999 || done = true")
+
+    for c in fake.task_calls:
+        composed = c["params"]["filter"]
+        # The caller's expression is confined to its own group...
+        assert "(id = 999999 || done = true)" in composed
+        # ...and the scope predicate is never left bare beside a top-level ||.
+        assert "project = 7 && id = 999999" not in composed
+        assert "(project = 7)" in composed
+
+
+async def test_every_predicate_is_grouped(upstream):
+    """Grouping is unconditional — a predicate that looks safe today is still wrapped."""
+    fake = upstream({}, labels=[])
+    await call(server.backlog_summary, project_id=7)
+    for c in fake.task_calls:
+        composed = c["params"]["filter"]
+        if composed:
+            # Every `&&` joins two parenthesised groups; no bare predicate at top level.
+            for part in composed.split(" && "):
+                assert part.startswith("(") and part.endswith(")"), part
+
+
+async def test_exclusions_stay_applied_alongside_a_crafted_filter(upstream):
+    """The `id != N` exclusion must survive a caller filter that tries to reintroduce it."""
+    import os
+
+    os.environ["VIKUNJA_SUMMARY_EXCLUDE_IDS"] = "180"
+    config.reset_settings()
+    try:
+        fake = upstream({}, labels=[])
+        await call(server.backlog_summary, project_id=7, filter="id = 180 || done = true")
+        for c in fake.task_calls:
+            assert "(id != 180)" in c["params"]["filter"]
+            assert "(id = 180 || done = true)" in c["params"]["filter"]
+    finally:
+        os.environ.pop("VIKUNJA_SUMMARY_EXCLUDE_IDS", None)
+        config.reset_settings()
 
 
 async def test_unscoped_summary_omits_the_project_predicate(upstream):
@@ -159,9 +216,9 @@ async def test_include_done_widens_the_bucket_scope(upstream):
 async def test_done_and_not_done_are_counted_separately(upstream):
     upstream(
         {
-            "project = 7": 470,
-            "project = 7 && done = true": 264,
-            "project = 7 && done = false": 206,
+            "(project = 7)": 470,
+            "(project = 7) && (done = true)": 264,
+            "(project = 7) && (done = false)": 206,
         }
     )
     result = await call(server.backlog_summary, project_id=7)
@@ -177,7 +234,8 @@ async def test_priority_buckets_cover_the_whole_vikunja_range(upstream):
 
 async def test_label_buckets_are_keyed_by_title_and_counted_by_id(upstream):
     fake = upstream(
-        {"project = 7 && done = false && labels in 30": 49}, labels=_labels("type:bug", "agent")
+        {"(project = 7) && (done = false) && (labels in 30)": 49},
+        labels=_labels("type:bug", "agent"),
     )
     result = await call(server.backlog_summary, project_id=7)
     assert result["by_label"]["type:bug"] == 49

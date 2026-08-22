@@ -289,6 +289,46 @@ def test_or_control_matches_nothing(canary):
     assert api.count(control) == 0
 
 
+def test_parentheses_contain_an_or(canary):
+    """**The grouping `server._compose` depends on as a security control.**
+
+    Without it a caller-supplied `||` inside `backlog_summary(filter=...)` escapes the
+    tool's own scoping predicates. Pinned here because the fix is only a fix for as long as
+    Vikunja keeps honouring the parentheses — if grouping ever stopped being respected, the
+    scope escape would come back silently and every other test would still pass.
+    """
+    api, fx = canary
+    scope = fx["scope"]
+    # Ungrouped: the `|| widget` escapes the impossible first conjunct and matches anyway.
+    escaped = api.count(f'{scope} && title like "%{_NONSENSE}%" || title like "%widget%"')
+    # Grouped: the impossible conjunct holds, so nothing matches.
+    contained = api.count(
+        f'{scope} && (title like "%{_NONSENSE}%" || title like "%widget%") '
+        f'&& title like "%{_NONSENSE}%"'
+    )
+    assert escaped >= 1, "expected the ungrouped form to escape its scope"
+    assert contained == 0, "parenthesised grouping is no longer being honoured"
+
+
+def test_evaluation_is_left_to_right_not_and_precedence(canary):
+    """Records *which* rule Vikunja uses, because the two differ in what they leak.
+
+    `a || b && c` is 0 under strict left-to-right (`(a || b) && c`) and non-zero under the
+    AND-binds-tighter precedence most languages use (`a || (b && c)`). Measured 2026-08-22:
+    left-to-right. The practical consequence is that a *trailing* predicate — the `id != N`
+    exclusions — constrains the whole accumulated expression and was never escapable, while
+    predicates composed *before* the caller's were. `_compose` groups everything regardless,
+    so a change here is informative rather than a breakage; it is worth knowing about.
+    """
+    api, fx = canary
+    scope = fx["scope"]
+    result = api.count(f'{scope} && title like "%widget%" || title like "%gizmo%" && id = 0')
+    assert result == 0, (
+        f"expected 0 under left-to-right evaluation, got {result}. Vikunja may have moved "
+        "to AND-binds-tighter precedence — re-check server._compose's reasoning."
+    )
+
+
 # --- project scoping, date comparison, index -----------------------------
 
 

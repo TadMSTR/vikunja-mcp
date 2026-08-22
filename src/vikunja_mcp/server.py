@@ -751,8 +751,40 @@ _MAX_LABEL_BUCKETS = 25
 
 
 def _compose(*predicates: str) -> str:
-    """Join non-empty filter predicates with Vikunja's `&&`."""
-    return " && ".join(p for p in predicates if p)
+    """Join non-empty filter predicates with Vikunja's ``&&``, each in its own group.
+
+    **The parentheses are a security control, not formatting.** One of these predicates is
+    the caller's own ``filter`` argument, and Vikunja evaluates a filter expression strictly
+    left to right (measured — see below). So without grouping, a caller filter containing a
+    top-level ``||`` breaks out of every predicate composed before it::
+
+        _compose("project = 7", "id = 999 || done = true")
+        -> project = 7 && id = 999 || done = true
+        -> parsed as ((project = 7 && id = 999) || done = true)
+
+    — and the second disjunct is scoped by nothing at all. Reproduced live on v2.3.0:
+    ``done = false && id = 999999 || done = true`` returns 264 *done* tasks, having escaped
+    the ``done = false`` it opens with. Wrapping each predicate contains it:
+    ``(done = false) && (id = 999999 || done = true)`` returns 0.
+
+    That matters here specifically because ``backlog_summary`` *claims* a scope and echoes
+    it back in ``scope.filter``. A caller could already query anything its own token can
+    reach, so this is not privilege escalation — it is the tool reporting counts for one
+    scope while saying it counted another, which is the more dangerous kind of wrong.
+
+    Note the evaluation order is left-to-right, **not** the AND-binds-tighter precedence one
+    would assume from most languages: ``done = true || done = false && id = 999999`` returns
+    0, where precedence would give 264. The practical difference is that a trailing
+    predicate (the ``id != N`` exclusions) does still constrain the whole accumulated
+    expression, so those were never escapable — only the predicates *before* the caller's
+    were. Grouping fixes both regardless of which rule a future Vikunja adopts.
+
+    Predicates are wrapped unconditionally, including ones that are already grouped. Nested
+    groups are valid and count identically (verified: the flat and six-deep nested forms of
+    the same filter both return 206), and a "is it already wrapped?" check is the kind that
+    reads ``(a) && (b)`` as one group and reintroduces the bug.
+    """
+    return " && ".join(f"({p})" for p in predicates if p)
 
 
 async def _count_matching(filter_expr: str) -> int:
@@ -843,12 +875,22 @@ async def backlog_summary(
     # Applied to every bucket including the totals, so the counts are consistent with each
     # other. Excluding an anchor task from the label buckets but not the total would just
     # relocate the off-by-one rather than remove it.
-    base = _compose(
-        f"project = {project_id}" if project_id is not None else "",
-        filter,
-        *(f"id != {task_id}" for task_id in excluded),
-    )
-    bucket_scope = base if include_done else _compose(base, "done = false")
+    # Kept as a *list* of predicates rather than a composed string, so each bucket composes
+    # once from the parts. Composing a composed string would nest the groups
+    # (`((project = 7)) && (done = true)`) — harmless to Vikunja, verified, but it makes the
+    # `scope.filter` a reader has to trust progressively harder to read.
+    base_predicates = [
+        p
+        for p in (
+            f"project = {project_id}" if project_id is not None else "",
+            filter,
+            *(f"id != {task_id}" for task_id in excluded),
+        )
+        if p
+    ]
+    base = _compose(*base_predicates)
+    bucket_predicates = base_predicates if include_done else [*base_predicates, "done = false"]
+    bucket_scope = _compose(*bucket_predicates)
 
     cutoff = datetime.now(UTC) - timedelta(days=settings.stale_after_days)
     stale_cutoff = f'"{cutoff:%Y-%m-%d}"'
@@ -867,20 +909,20 @@ async def backlog_summary(
     # bounds the fan-out.
     priority_counts, label_counts, (total, done, not_done, stale, fresh) = await asyncio.gather(
         asyncio.gather(
-            *(_count_matching(_compose(bucket_scope, f"priority = {p}")) for p in _PRIORITIES)
+            *(_count_matching(_compose(*bucket_predicates, f"priority = {p}")) for p in _PRIORITIES)
         ),
         asyncio.gather(
             *(
-                _count_matching(_compose(bucket_scope, f"labels in {label['id']}"))
+                _count_matching(_compose(*bucket_predicates, f"labels in {label['id']}"))
                 for label in kept_labels
             )
         ),
         asyncio.gather(
             _count_matching(base),
-            _count_matching(_compose(base, "done = true")),
-            _count_matching(_compose(base, "done = false")),
-            _count_matching(_compose(bucket_scope, f"updated < {stale_cutoff}")),
-            _count_matching(_compose(bucket_scope, f"updated >= {stale_cutoff}")),
+            _count_matching(_compose(*base_predicates, "done = true")),
+            _count_matching(_compose(*base_predicates, "done = false")),
+            _count_matching(_compose(*bucket_predicates, f"updated < {stale_cutoff}")),
+            _count_matching(_compose(*bucket_predicates, f"updated >= {stale_cutoff}")),
         ),
     )
 
