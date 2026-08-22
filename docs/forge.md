@@ -128,6 +128,13 @@ administrative tool removed.
 | Assignees (read) | `task_assignee_list` | read only |
 | Attachments | `attachment_list`, `attachment_upload` | attach a failing test log or diff |
 | Kanban | `view_list`, `view_get`, `bucket_list`, `task_bucket_move` | read the board and move a ticket across it |
+| Backlinks | `task_link_commit` | record the commit/PR that closed a ticket (v0.8.0) |
+
+**New in v0.8.0 and not yet granted anywhere.** `task_link_commit` is the one tool added
+since this table was ratified on 2026-08-04. It writes only to the description footer of a
+ticket the agent could already `task_update`, so it grants no reach the role does not have
+— it is a narrower way to do something already permitted. It is listed below, but the
+manifests are root-owned and unchanged by this repo; granting it is a steward proposal.
 
 ```yaml
 tool_allowlist:
@@ -154,6 +161,7 @@ tool_allowlist:
   - view_get
   - bucket_list
   - task_bucket_move
+  - task_link_commit   # v0.8.0 — not yet in the live manifest
 ```
 
 #### developer — the 48 removed, and why

@@ -6,6 +6,66 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-08-22
+
+Structured metadata that Vikunja has no field for, under one convention used twice.
+Tickets #465 (id 484) and #466 (id 485). Unlike 0.7.0, this **writes persistent,
+human-visible data into ticket bodies** — which is why the marker format was gated on a
+round-trip probe before any of it was built.
+
+### Added
+- **Marker convention** (`vikunja_mcp.markers`) — a visible provenance footer in the
+  description: one `<hr>`, one paragraph, space-separated `kind=value` tokens under a
+  `vikunja-mcp:` namespace. Stripped from every task-returning tool's response at any
+  nesting depth and inside the pagination envelope, in `verbose` too. Full rationale in
+  `docs/markers.md`.
+- **`idempotency_key` on `task_create`** (#465) — a caller-supplied key makes a retried
+  create safe. On a match the existing task is returned with `idempotent_hit: true`
+  instead of a second being filed. Scoped to the project; never derived from the title,
+  which would collapse two legitimately-similar tickets into one (the vikunja#331 failure
+  mode). If the lookup itself fails the task is still created, with
+  `idempotency_degraded: true` on the response — losing a filing to a convenience feature
+  is worse than failing to deduplicate, but silently claiming a guarantee that did not
+  hold is worse than both.
+- **`task_link_commit(task_id, ref_type, ref_url)`** (#466) — records a commit/PR/branch
+  backlink, read back as a structured `linked_refs` field on `task_get`. Accepts `#463`
+  and `#463 (id 482)` task refs. Links accumulate: a second never displaces the first, and
+  re-linking the same pair is a no-op. Explicitly **not** in scope: transitioning ticket
+  state from VCS events.
+
+### Security
+- **Idempotency keys are filter operands, so they carry a charset, not an escape.** A key
+  is interpolated into a Vikunja filter expression — the surface the 0.7.0 audit found
+  `_compose` escaping. Vikunja evaluates filters left to right, so a key of
+  `x" || done = true || "` turns a project-scoped lookup into an unscoped one, and `%`
+  (`like`'s wildcard) would silently over-match. Both are refused structurally, matching
+  `contrib/duplicate_check._TOKEN`'s reasoning.
+- **A filter hit is confirmed, not trusted.** `like` is a substring match, so it also
+  returns tickets that merely quote a key and tickets whose key is a prefix of it. Every
+  candidate is re-parsed before being accepted, because returning the wrong one suppresses
+  a real filing while looking like success.
+- **`ref_url` is guarded as stored-link injection.** https with a dotted hostname only;
+  `javascript:`, `data:`, plain `http` and `https://localhost` are refused before any
+  upstream call. Not the `webhook_create` SSRF case — nothing fetches the URL — so the
+  internal-host guard is deliberately *not* reused, since a backlink to an internal Gitea
+  is the normal case on forge.
+- Marker values cannot forge a sibling token: whitespace and `<>` are refused on write
+  rather than sanitised, because a key that silently changed shape would miss on exactly
+  the retry it exists to catch.
+- `nh3`'s `strip_comments` is **unchanged**. The HTML-comment marker format was rejected
+  partly to avoid touching that audited `SECURITY[control]`.
+
+### Notes
+- **TipTap strips inter-block whitespace.** Measured against the live instance: when a
+  human edits a ticket in the web UI, `\n<hr>\n<p>` is re-serialised as `<hr><p>`. Three
+  separator forms therefore exist in the corpus and the parser tolerates all three. A
+  parser anchored on the written form would silently leak markers on read and return empty
+  backlinks for every ticket a human had ever opened, while key lookup kept working — see
+  `docs/markers.md`.
+- **Duplicate detection is unaffected.** vikunja#463 searches titles only, asserted on the
+  generated filter and at the hook seam, so markers cannot produce phantom matches.
+- `task_link_commit` is a new tool and is **not** in any agent's scoped-mcp allowlist yet.
+
 ## [0.7.0] — 2026-08-22
 
 Three signals an agent reads at the moment it decides to act, plus a canary over the
