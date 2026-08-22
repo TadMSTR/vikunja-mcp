@@ -190,7 +190,9 @@ async def test_a_malformed_ref_type_is_refused(wire, ref_type):
 async def test_an_ordinary_https_url_is_accepted(wire):
     """Control: the guard must not reject the links this exists to store."""
     mock = wire()
-    await server.task_link_commit(361, "pr", "https://gitea.tadmstr.me/host-forge/x/pulls/3")
+    # A self-hosted Gitea, which is the case most likely to be over-rejected by a guard
+    # written against github.com. Host is deliberately generic — this repo is public.
+    await server.task_link_commit(361, "pr", "https://gitea.example.com/org/repo/pulls/3")
     assert markers.parse(_written(mock))["ref"]
 
 
