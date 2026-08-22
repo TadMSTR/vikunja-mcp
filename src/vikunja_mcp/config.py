@@ -60,6 +60,32 @@ class Settings(BaseSettings):
     # as a footgun.
     token: str | None = None
 
+    # Age in days past which a task is reported `stale: true` on every read path.
+    #
+    # 90 is a judgement call, not a measurement: long enough that ordinary in-flight work
+    # is never flagged, short enough to catch a ticket whose text has drifted from reality.
+    # It is a *weak* signal by construction — see `server._staleness` for what it does and
+    # does not claim.
+    stale_after_days: int = 90
+
+    @field_validator("stale_after_days", mode="after")
+    @classmethod
+    def _threshold_must_be_positive(cls, v: int) -> int:
+        """Refuse a threshold of 0 or less rather than marking the whole backlog stale.
+
+        A zero threshold makes `stale` true for every task including ones updated seconds
+        ago — a wrong answer with no symptom, since the field looks like it is working.
+        Same reasoning as the token/transport refusal below: fail at startup, where it is
+        attributable, rather than at read time, where it is not.
+        """
+        if v <= 0:
+            raise ValueError(
+                f"VIKUNJA_STALE_AFTER_DAYS must be at least 1, got {v}. A threshold of "
+                "zero or less marks every task stale — including one updated a moment "
+                "ago — which makes the flag useless without looking broken."
+            )
+        return v
+
     @field_validator("token", mode="after")
     @classmethod
     def _blank_token_is_unset(cls, v: str | None) -> str | None:

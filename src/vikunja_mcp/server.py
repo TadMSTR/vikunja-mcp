@@ -34,6 +34,7 @@ import re
 import socket
 import sys
 from collections.abc import Callable
+from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import quote, urlparse
 
@@ -456,6 +457,78 @@ def _count(value: Any) -> int:
     return 0
 
 
+# Vikunja spells a null timestamp `0001-01-01T00:00:00Z`, which parses perfectly well and
+# is ~740,000 days ago. Anything at or before year 1 is the sentinel, not a date.
+_ZERO_TIMESTAMP_YEAR = 1
+
+
+def _parse_timestamp(value: Any) -> datetime | None:
+    """Parse an upstream RFC3339 timestamp, or return None if it is not one.
+
+    Returns None for absent, empty, non-string, unparsable, and Vikunja's zero-value
+    sentinel. Never raises: a read must not fail because a timestamp was strange, and a
+    derived convenience field is the last thing that should be able to break a ticket
+    fetch.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.year <= _ZERO_TIMESTAMP_YEAR:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def _staleness(updated: Any) -> dict[str, Any]:
+    """Derive ``days_since_update`` and ``stale`` from a task's ``updated`` timestamp.
+
+    **What this signal actually means, stated plainly because it is easy to overread:**
+    ``updated`` moves whenever *anything* on the task changes — adding a label, closing a
+    subtask, an assignee change. So ``stale: false`` means "recently touched", **not**
+    "verified current": a ticket whose body describes a system that no longer exists reads
+    as fresh the moment someone relabels it. The converse is the stronger direction —
+    ``stale: true`` does mean nobody has touched it in a while.
+
+    It ships anyway, because the alternative on offer is not a better signal, it is no
+    signal: the raw ISO string is already in the payload and nothing reads it. A weak
+    signal in the place the decision is made beats a strong one nobody consults.
+
+    The sharpest illustration of the weakness, measured on the corpus this was built for:
+    a bulk migration rewrites ``updated`` on every task at once. Forge's tracker was
+    imported from Plane on 2026-07-19, so on 2026-08-22 its oldest open ticket read as 33
+    days old — including tickets whose text predated the import by months. Nothing was
+    fresh; every timestamp was. Set ``VIKUNJA_STALE_AFTER_DAYS`` with that in mind after
+    any import, and do not read a corpus-wide ``stale: false`` as a clean bill of health.
+
+    Both fields are ``None`` when the age is unknown — see :func:`_parse_timestamp`.
+    ``None`` rather than ``false`` because "not known to be stale" and "known to be fresh"
+    are different claims, and only one of them is true here.
+    """
+    parsed = _parse_timestamp(updated)
+    if parsed is None:
+        return {"days_since_update": None, "stale": None}
+    # Clamped at zero: a task `updated` in the future is clock skew between forge and
+    # Vikunja, and a negative age reads as a bug in this server rather than in the clocks.
+    days = max((datetime.now(UTC) - parsed).days, 0)
+    return {"days_since_update": days, "stale": days >= get_settings().stale_after_days}
+
+
+def _with_staleness(task: dict[str, Any]) -> dict[str, Any]:
+    """The verbose path's projection: the untouched body plus the two derived fields.
+
+    ``verbose`` restores *payload*, not ambiguity — the principle v0.5.0 established when
+    the ``index`` strip was applied to the verbose path too. A caller asking for the full
+    body is not asking to be handed a raw timestamp to diff by hand.
+
+    Only the top-level task is annotated. A task inlined under ``related_tasks`` is a
+    reference to something the caller did not ask about, and dating it invites reading a
+    staleness verdict on a ticket that was never fetched.
+    """
+    return {**task, **_staleness(task.get("updated"))}
+
+
 def _task_ref(task: dict[str, Any]) -> dict[str, Any]:
     """The smallest honest reference to a task: enough to identify it and fetch it.
 
@@ -503,6 +576,7 @@ def _summarise_task(task: dict[str, Any]) -> dict[str, Any]:
     row["assignee_count"] = _count(task.get("assignees"))
     for name, count_key in _COUNTED_COLLECTIONS.items():
         row[count_key] = _count(task.get(name))
+    row.update(_staleness(task.get("updated")))
     return row
 
 
@@ -523,6 +597,7 @@ def _compact_task(task: dict[str, Any]) -> dict[str, Any]:
         out["related_tasks"] = _thin_related(out["related_tasks"])
     for name, count_key in _COUNTED_COLLECTIONS.items():
         out[count_key] = _count(task.get(name))
+    out.update(_staleness(task.get("updated")))
     return out
 
 
@@ -572,6 +647,9 @@ async def task_list(
     was asked for. Call `task_get` on the row you want, or pass `verbose=true` for the
     full bodies.
 
+    Each row also carries `days_since_update` and `stale` (see `task_get` for exactly what
+    those two do and do not tell you — `stale: false` is **not** "verified current").
+
     Capped at `per_page` (default 50). When more pages exist the result becomes
     `{"items": [...], "pagination": {"truncated": true, ...}}` — raise `page` to read on.
     Do not treat one page as the whole answer.
@@ -584,15 +662,20 @@ async def task_list(
         "order_by": order_by or None,
     }
     result = await request("GET", "/tasks", caller_token(), params=params)
-    return result if verbose else _project(result, _summarise_task)
+    return _project(result, _with_staleness if verbose else _summarise_task)
 
 
 @tool
 async def task_search(query: str, page: int = 1, per_page: int = 50, verbose: bool = False) -> Any:
     """Full-text search tasks by title/description (ParadeDB BM25 index).
 
-    Returns **summary rows** — see `task_list` for the field list and the reasoning. Pass
-    `verbose=true` for the full task bodies.
+    Returns **summary rows** — see `task_list` for the field list (including the staleness
+    fields) and the reasoning. Pass `verbose=true` for the full task bodies.
+
+    This searches **descriptions as well as titles**. That is the right default for "find
+    anything about X", but it means a hit is not evidence of a duplicate — on a corpus
+    where tickets quote each other, most hits are tickets that merely *discuss* the term.
+    Use `task_list(filter='title like "%term%"')` when you need title-scoped matching.
 
     Note this searches with Vikunja's `s` parameter, which cannot be combined with
     `filter`. Use `task_list` when you need a filter.
@@ -603,7 +686,7 @@ async def task_search(query: str, page: int = 1, per_page: int = 50, verbose: bo
     """
     params = {"s": query, "page": page, "per_page": per_page}
     result = await request("GET", "/tasks", caller_token(), params=params)
-    return result if verbose else _project(result, _summarise_task)
+    return _project(result, _with_staleness if verbose else _summarise_task)
 
 
 @tool
@@ -618,11 +701,20 @@ async def task_get(task_id: int | str, verbose: bool = False) -> dict:
     `description` is kept — reading one ticket's body is the point. What is dropped is the
     inlined body of every related task (reduced to `{id, identifier, title, done}`) and
     the attachment/reaction payloads (reduced to `attachment_count`/`reaction_count`).
-    Pass `verbose=true` for the untouched upstream body; note that the convenience `url`
-    field is only added on the projected path.
+    Pass `verbose=true` for the untouched upstream body plus the staleness fields below;
+    note that the convenience `url` field is only added on the projected path.
+
+    **Staleness.** `days_since_update` is the whole-day age of `updated`, and `stale` is
+    true once that reaches `VIKUNJA_STALE_AFTER_DAYS` (default 90). Read them honestly:
+    `updated` moves on *any* change, including a label edit, so `stale: false` means
+    "recently touched", **not** "the text below is still true". The useful direction is
+    the other one — `stale: true` means nobody has touched this in months, so treat its
+    description as a claim about the past and verify before acting on it. Both fields are
+    `null` when `updated` is missing or is Vikunja's `0001-01-01` zero value; `null` means
+    unknown, not fresh.
     """
     result = await request("GET", f"/tasks/{task_id}", caller_token())
-    return result if verbose else _project(result, _compact_task)
+    return _project(result, _with_staleness if verbose else _compact_task)
 
 
 @tool
