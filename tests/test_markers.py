@@ -325,3 +325,62 @@ async def test_an_unmarked_description_is_returned_untouched(upstream):
     upstream(fixtures.task(description=body))
     result = await server.task_get(361)
     assert result["description"] == body
+
+
+# ==========================================================================
+# Lookup values are filter operands, so they carry a stricter charset
+# ==========================================================================
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param('abc"', id="double-quote"),
+        pytest.param('x"||done = true||"', id="filter-breakout"),
+        pytest.param("a%b", id="like-wildcard"),
+        pytest.param("100%", id="trailing-wildcard"),
+        pytest.param("a\\b", id="backslash"),
+        pytest.param("-leading", id="leading-punctuation"),
+    ],
+)
+def test_lookup_value_rejects_filter_metacharacters(value):
+    """A lookup value is interpolated into a Vikunja filter, so it is an injection site.
+
+    The v0.7.0 audit found a caller filter escaping its enclosing predicates because
+    Vikunja evaluates left-to-right; a key carrying `"` or `||` is the same bug reached
+    through a different argument. `%` matters for a second reason — it is `like`'s
+    wildcard, so `100%` would silently match keys it was never meant to.
+
+    Enforced as a charset rather than an escaping routine, matching the reasoning in
+    contrib/duplicate_check: a value that *cannot* contain the syntax needs no escaping.
+    """
+    with pytest.raises(ValueError):
+        markers.validate_lookup_value(value)
+    with pytest.raises(ValueError):
+        markers.lookup_fragment("idem", value)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param("abc123", id="alnum"),
+        pytest.param("build-2026-08-22", id="hyphens"),
+        pytest.param("task_create.retry", id="underscore-and-dot"),
+        pytest.param("9c07fab3-b9f4-4c0d", id="uuid-fragment"),
+    ],
+)
+def test_lookup_value_accepts_ordinary_keys(value):
+    """Control: the charset must still admit the keys callers actually generate."""
+    markers.validate_lookup_value(value)
+    assert markers.lookup_fragment("idem", value) == f"idem={value}"
+
+
+def test_ref_values_may_still_hold_url_syntax():
+    """`ref` is never a filter operand, so it keeps the permissive value charset.
+
+    Tightening every value to the lookup charset would make it impossible to store the
+    URLs vikunja#466 exists to store.
+    """
+    url = "pr|https://github.com/TadMSTR/vikunja-mcp/pull/14?x=1&y=2"
+    out = markers.append("<p>body</p>", "ref", url)
+    assert markers.parse(out)["ref"] == [url]

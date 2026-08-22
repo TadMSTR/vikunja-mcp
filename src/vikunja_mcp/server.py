@@ -718,6 +718,45 @@ async def task_get(task_id: int | str, verbose: bool = False) -> dict:
     return _project(result, _with_staleness if verbose else _compact_task)
 
 
+# How many candidate rows an idempotency lookup will confirm before giving up. The filter
+# is a substring match, so it can return tickets that merely *quote* a key alongside the
+# one that carries it. One page is a generous ceiling for that — a key is normally unique —
+# and the failure past it degrades to creating a duplicate, which is today's behaviour.
+_IDEMPOTENCY_SCAN_LIMIT = 50
+
+
+async def _find_by_idempotency_key(project_id: int, key: str) -> dict[str, Any] | None:
+    """The task in ``project_id`` already carrying ``key``, or ``None``.
+
+    Two steps, and the second is the one that matters. The filter narrows server-side in a
+    single call, but ``like`` is a **substring** match: it also returns a ticket whose body
+    quotes ``idem=<key>`` in prose or a code block, and a ticket whose key merely *starts*
+    with this one (``k1`` matches a stored ``k12``). Returning either would suppress a
+    legitimate filing and hand back an unrelated ticket as though the caller had created
+    it — silently, because both outcomes look like success.
+
+    So every candidate is confirmed by re-parsing its markers, which is an exact match on a
+    real marker paragraph rather than a substring of arbitrary text.
+    """
+    filter_expr = _compose(
+        f"project = {project_id}",
+        f'description like "%{markers.lookup_fragment("idem", key)}%"',
+    )
+    result = await request(
+        "GET",
+        "/tasks",
+        caller_token(),
+        params={"filter": filter_expr, "per_page": _IDEMPOTENCY_SCAN_LIMIT, "page": 1},
+    )
+    rows = result["items"] if isinstance(result, dict) and "items" in result else result
+    if not isinstance(rows, list):
+        return None
+    for row in rows:
+        if isinstance(row, dict) and key in markers.parse(row.get("description")).get("idem", []):
+            return row
+    return None
+
+
 @tool
 async def task_create(
     project_id: int,
@@ -725,15 +764,70 @@ async def task_create(
     description: str = "",
     priority: int | None = None,
     due_date: str = "",
+    idempotency_key: str | None = None,
 ) -> dict:
-    """Create a task in a project. `title` is required. `due_date` is RFC3339 (or omit)."""
+    """Create a task in a project. `title` is required. `due_date` is RFC3339 (or omit).
+
+    **`idempotency_key`** makes a retried create safe. Pass a stable string identifying
+    *this* filing — a task id, a build name plus a finding id, anything the retry will
+    derive identically — and if a task in `project_id` already carries that key, it is
+    returned with `idempotent_hit: true` instead of a second one being filed.
+
+    The key must be **caller-supplied**, and is deliberately not derived from the title.
+    Deriving it would silently collapse two legitimately-similar tickets into one, which
+    is vikunja#331 (an agent passing one identifier where another was expected, silently
+    mutating three unrelated tickets) in a new costume.
+
+    Keys are **scoped to the project** and match letters, digits, `.`, `_` and `-`, from
+    an alphanumeric first character. That charset is a security boundary, not a style
+    rule: the key is interpolated into a Vikunja filter expression, and quotes or `%`
+    there would escape the scope or silently over-match.
+
+    Distinct from `VIKUNJA_DUPLICATE_CHECK`, which reports *semantically* similar tickets
+    and never suppresses anything. This suppresses, so it only ever acts on an exact key.
+
+    **Known race, accepted.** Lookup-then-create is not atomic and Vikunja offers no
+    conditional create, so two genuinely simultaneous creates with the same key can both
+    miss and both file. The window is small and the failure degrades to today's behaviour
+    — a duplicate — so this is documented rather than locked.
+
+    If the lookup itself fails, the task is still created and the response carries
+    `idempotency_degraded: true`. Losing a filing to a convenience feature would be worse
+    than failing to deduplicate it, but claiming a guarantee that did not hold would be
+    worse than both.
+    """
+    rendered = _md_to_html(description) or None
+    degraded = False
+
+    if idempotency_key is not None:
+        # Before any call: an unusable key should cost nothing and surface immediately.
+        markers.validate_lookup_value(idempotency_key)
+        try:
+            existing = await _find_by_idempotency_key(project_id, idempotency_key)
+        except Exception as exc:
+            # Broad by design, for the reason contrib/duplicate_check gives: enumerating
+            # what an upstream search can raise is the list that goes stale unnoticed.
+            log.warning(
+                "vikunja_idempotency_lookup_failed",
+                project_id=project_id,
+                error=str(exc),
+            )
+            existing, degraded = None, True
+        if existing is not None:
+            existing["idempotent_hit"] = True
+            return existing
+        rendered = markers.append(rendered or "", "idem", idempotency_key)
+
     body = _drop_none(
         title=title,
-        description=_md_to_html(description) or None,
+        description=rendered,
         priority=priority,
         due_date=due_date or None,
     )
-    return await request("PUT", f"/projects/{project_id}/tasks", caller_token(), json=body)
+    result = await request("PUT", f"/projects/{project_id}/tasks", caller_token(), json=body)
+    if degraded and isinstance(result, dict):
+        result["idempotency_degraded"] = True
+    return result
 
 
 # ---------------------------------------------------------------------------

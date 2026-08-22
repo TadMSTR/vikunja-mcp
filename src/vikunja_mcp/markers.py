@@ -70,8 +70,29 @@ _KIND = re.compile(r"\A[a-z][a-z0-9_]*\Z")
 
 #: A marker value: anything that cannot forge a sibling token or escape the paragraph.
 #: Whitespace is excluded because tokens are space-separated, and `<>` because the payload
-#: is bounded by them.
+#: is bounded by them. Deliberately permissive otherwise — a `ref` value is a URL, and
+#: tightening this would make the backlinks vikunja#466 exists to store unstorable.
 _VALUE = re.compile(r"\A[^\s<>]+\Z")
+
+#: A value that will be interpolated into a Vikunja **filter expression**, which is a
+#: narrower thing than a value that is merely stored.
+#:
+#: Two distinct hazards, neither of which escaping would address as well as a charset:
+#:
+#: 1. **Filter break-out.** Vikunja evaluates a filter strictly left to right, so a value
+#:    carrying `"` and `||` escapes its enclosing predicates — the vulnerability the
+#:    v0.7.0 audit found in ``_compose`` (server.py), reached through a different
+#:    argument. A key of ``x" || done = true || "`` would turn a scoped lookup into an
+#:    unscoped one.
+#: 2. **Silent over-matching.** `%` is `like`'s wildcard. A key of ``100%`` would match
+#:    every key beginning ``100``, so a create would be suppressed as a duplicate of an
+#:    unrelated ticket — a wrong answer that raises nothing.
+#:
+#: Same reasoning as ``contrib/duplicate_check._TOKEN``: a value that cannot *contain* the
+#: syntax needs no escaping routine, and a structural guarantee does not rot the way an
+#: escaping routine does. Must start alphanumeric so a value cannot lead with punctuation
+#: that reads as an operator.
+_LOOKUP_VALUE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 
 
 def _validate(kind: str, value: str) -> None:
@@ -88,6 +109,23 @@ def _validate(kind: str, value: str) -> None:
     if not isinstance(value, str) or not _VALUE.match(value):
         raise ValueError(
             f"marker value must be non-empty and free of whitespace and '<>'; got {value!r}"
+        )
+
+
+def validate_lookup_value(value: str) -> None:
+    """Reject a value that cannot safely be interpolated into a filter. ``ValueError``.
+
+    Call this on any value that will later be looked up — an idempotency key — at the
+    point the caller supplies it, not only inside :func:`lookup_fragment`. Validating in
+    both places is deliberate: writing a marker whose value can never be looked up is a
+    silent dead end, so the write path has to refuse it too.
+    """
+    if not isinstance(value, str) or not _LOOKUP_VALUE.match(value):
+        raise ValueError(
+            f"lookup value must match {_LOOKUP_VALUE.pattern!r} — letters, digits, "
+            f"'.', '_' and '-', starting alphanumeric. Quotes, '%' and whitespace are "
+            f"refused because the value is interpolated into a Vikunja filter "
+            f"expression. Got {value!r}"
         )
 
 
@@ -145,6 +183,7 @@ def lookup_fragment(kind: str, value: str) -> str:
     trusting the filter alone; ``task_create``'s idempotency path does exactly that.
     """
     _validate(kind, value)
+    validate_lookup_value(value)
     return f"{kind}={value}"
 
 
