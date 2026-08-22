@@ -1537,12 +1537,27 @@ def _validate_ref_url(ref_url: str) -> None:
             f"ref_url may not contain whitespace or '<>' — the marker line is "
             f"space-separated, so a space would forge a second entry. Got {ref_url!r}"
         )
+    if "\\" in ref_url:
+        # Browsers normalise `\` to `/` inside the authority; urlparse does not. The two
+        # therefore disagree about where the host ends, so a guard that trusts urlparse can
+        # pass a URL that navigates somewhere else. No backlink needs a backslash.
+        raise ValueError(f"ref_url may not contain a backslash; got {ref_url!r}")
     parsed = urlparse(ref_url)
     if parsed.scheme != "https":
         raise ValueError(
             f"ref_url must be https (a backlink is stored once and clicked for years, and "
             f"javascript:/data: links are stored-link injection). Got scheme "
             f"{parsed.scheme or '<none>'!r}"
+        )
+    if parsed.username is not None or parsed.password is not None:
+        # `https://github.com@evil.example.com/x` navigates to evil.example.com — the part
+        # before `@` is userinfo, not the host — while reading as a GitHub link to whoever
+        # opens the ticket. The hostname check below passes it, because urlparse reports
+        # the real host correctly; what fails is the gap between the check and the human.
+        # A commit backlink has no legitimate use for credentials in the URL.
+        raise ValueError(
+            f"ref_url may not carry userinfo before the host — `https://a@b/` reads as a "
+            f"link to `a` but navigates to `b`. Got {ref_url!r}"
         )
     host = parsed.hostname or ""
     if "." not in host:

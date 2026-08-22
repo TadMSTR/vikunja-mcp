@@ -256,3 +256,41 @@ async def test_a_malformed_ref_value_is_skipped_not_guessed_at(serve):
     serve(fixtures.task(id=361, description="<p>b</p>\n<hr>\n<p>vikunja-mcp: ref=nodelimiter</p>"))
     result = await server.task_get(361)
     assert "linked_refs" not in result
+
+
+# --- URL forms that read as one destination and resolve as another --------
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        pytest.param(
+            "https://github.com@evil.example.com/pull/14", id="userinfo-impersonates-host"
+        ),
+        pytest.param("https://user:pw@evil.example.com/x", id="userinfo-with-password"),
+        pytest.param("https://good.example.com\\@evil.example.com/x", id="backslash-authority"),
+    ],
+)
+async def test_a_url_whose_apparent_host_is_not_its_real_host_is_refused(wire, url):
+    """The footer is read by a human who decides whether to click it.
+
+    `https://github.com@evil.example.com/x` navigates to **evil.example.com** — the part
+    before `@` is userinfo, not the host — while reading as a GitHub link in a ticket. The
+    hostname check alone passes it, because `urlparse` correctly reports the real host; the
+    problem is the gap between what the guard checks and what a person sees.
+
+    Backslashes are refused for the neighbouring reason: browsers normalise `\\` to `/` in
+    the authority while `urlparse` does not, so the two disagree about where the host ends.
+    Neither form has a legitimate use in a commit backlink.
+    """
+    mock = wire()
+    with pytest.raises(ValueError):
+        await server.task_link_commit(361, "pr", url)
+    assert mock.sent == []
+
+
+async def test_an_at_sign_in_the_path_is_still_allowed(wire):
+    """Control: `@` is legitimate outside the authority — npm scopes, some Gitea routes."""
+    mock = wire()
+    await server.task_link_commit(361, "pr", "https://example.com/@scope/pkg/pull/3")
+    assert markers.parse(_written(mock))["ref"]

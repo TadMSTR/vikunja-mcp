@@ -60,8 +60,32 @@ PREFIX = "vikunja-mcp:"
 #
 # The payload cannot contain `<`, which is what stops the match running past `</p>` into
 # the rest of the body.
+#: Whitespace between the rule and the marker paragraph. **Bounded on purpose.**
+#:
+#: A description is attacker-influenced text that every read path runs this pattern over,
+#: so its cost is a denial-of-service surface reachable by anyone who can file a ticket.
+#: With unbounded `\s*` runs it was one: `(?:\s*<hr\s*/?>)?\s*<p>` puts two `\s*` adjacent,
+#: giving a run of N spaces N+1 ways to split, and even after separating them the leading
+#: `\s*` alone is re-explored at every one of N starting offsets. Measured on the unbounded
+#: form: 20k spaces took 1.0s, 100k took 24s, and `task_list` would have hung for every
+#: caller on a single such ticket.
+#:
+#: A real marker carries a single newline here, or nothing at all — the three forms in the
+#: module docstring are the whole vocabulary. A generous ceiling therefore costs nothing
+#: and makes the match cost linear in the body length. Covered by
+#: `test_the_marker_regex_does_not_backtrack_catastrophically`.
+_GAP = r"\s{0,16}"
+
 _MARKER_BLOCK = re.compile(
-    r"(?:\s*<hr\s*/?>)?\s*<p>\s*" + re.escape(PREFIX) + r"(?P<payload>[^<]*)</p>",
+    _GAP
+    + r"(?:<hr"
+    + _GAP
+    + r"/?>"
+    + _GAP
+    + r")?<p>"
+    + _GAP
+    + re.escape(PREFIX)
+    + r"(?P<payload>[^<]*)</p>",
     re.IGNORECASE,
 )
 

@@ -451,3 +451,39 @@ async def test_the_duplicate_hook_searches_the_title_not_the_marked_description(
 
     assert seen["title"] == "An ordinary ticket title"
     assert "provenance-key-1" not in str(seen)
+
+
+# ==========================================================================
+# The marker regex runs on every description on every read path
+# ==========================================================================
+
+
+@pytest.mark.parametrize(
+    "probe",
+    [
+        pytest.param(" " * 60000 + "<p>x</p>", id="leading-whitespace-run"),
+        pytest.param("<hr>" * 15000, id="rule-run"),
+        pytest.param("<hr> " * 12000 + "<p>x</p>", id="alternating-rule-and-space"),
+        pytest.param("<p>vikunja-mcp:" + "a" * 60000, id="unterminated-payload"),
+        pytest.param(("\n" * 200 + "<hr>") * 300, id="nested-newline-runs"),
+    ],
+)
+def test_the_marker_regex_does_not_backtrack_catastrophically(probe):
+    """A description is attacker-influenced text that every read path runs this over.
+
+    Measured before the fix: `" " * 20000` took 1.0s and `" " * 100000` took 24s, because
+    `(?:\\s*<hr...)?\\s*<p>` gave two adjacent `\\s*` an ambiguous split to explore at every
+    starting offset. One ticket with a long whitespace run in its body would have hung
+    `task_list` for every caller — a read-path DoS reachable by anyone who can file a
+    ticket.
+
+    Separating the two runs with the literal `<hr>` removes the ambiguity. The budget here
+    is deliberately loose: it is catching a complexity class, not a millisecond regression.
+    """
+    import time
+
+    start = time.perf_counter()
+    markers.parse(probe)
+    markers.strip(probe)
+    elapsed = time.perf_counter() - start
+    assert elapsed < 1.0, f"{elapsed:.2f}s on a {len(probe)}-char body — backtracking"
