@@ -24,6 +24,7 @@ Permission integers used by the sharing tools follow Vikunja's ``Right``:
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import functools
@@ -34,7 +35,7 @@ import re
 import socket
 import sys
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import quote, urlparse
 
@@ -733,6 +734,186 @@ async def task_create(
         due_date=due_date or None,
     )
     return await request("PUT", f"/projects/{project_id}/tasks", caller_token(), json=body)
+
+
+# ---------------------------------------------------------------------------
+# Backlog summary — counting without fetching
+# ---------------------------------------------------------------------------
+
+# Vikunja's full priority range: 0 unset, 1 low, 2 medium, 3 high, 4 urgent, 5 DO NOW.
+# Every value is queried, including 0, because "how much of this backlog has nobody
+# triaged" is one of the questions a summary is actually asked.
+_PRIORITIES = (0, 1, 2, 3, 4, 5)
+
+# Default ceiling on label buckets. Each label costs one upstream call, so an unbounded
+# vocabulary would quietly turn a cheap tool into an expensive one.
+_MAX_LABEL_BUCKETS = 25
+
+
+def _compose(*predicates: str) -> str:
+    """Join non-empty filter predicates with Vikunja's `&&`."""
+    return " && ".join(p for p in predicates if p)
+
+
+async def _count_matching(filter_expr: str) -> int:
+    """The exact number of tasks matching ``filter_expr``, in one one-row request.
+
+    Rests on an undocumented Vikunja behaviour, measured rather than read: with
+    ``per_page=1`` the ``x-pagination-total-pages`` header *is* the match count, because
+    one row per page makes pages and rows the same thing. Confirmed non-ceiling on an
+    exact multiple (49 items at ``per_page=7`` reports 7 pages, not 8) and confirmed
+    against live v2.3.0 on 2026-08-22 in all three regimes this has to survive:
+
+    - **0 matches** — header is ``0``, and ``client.request`` returns the bare ``[]``
+      because it only builds an envelope above one page. Counted as ``len([]) == 0``.
+    - **exactly 1** — header is ``1``, still no envelope, bare one-item list.
+    - **N > 1** — the envelope, where ``pagination.total_pages`` is the count.
+
+    The 0 and 1 cases are the ones worth stating: they never reach the envelope branch, so
+    an implementation that only read ``pagination`` would report 0 for both and be wrong on
+    every bucket holding exactly one task.
+
+    Being undocumented is why `test_filter_canary.py` exists — a Vikunja upgrade that
+    changed this would make every count silently wrong rather than fail.
+    """
+    result = await request(
+        "GET",
+        "/tasks",
+        caller_token(),
+        params={"filter": filter_expr or None, "per_page": 1, "page": 1},
+    )
+    if isinstance(result, dict) and "pagination" in result:
+        try:
+            return int(result["pagination"].get("total_pages", 0))
+        except (TypeError, ValueError):
+            return 0
+    if isinstance(result, list):
+        return len(result)
+    return 0
+
+
+def _unwrap_items(result: Any) -> list[Any]:
+    """The rows from a list response, whether or not it arrived in the envelope."""
+    if isinstance(result, dict) and "items" in result:
+        return result["items"] or []
+    return result if isinstance(result, list) else []
+
+
+@tool
+async def backlog_summary(
+    project_id: int | None = None,
+    filter: str = "",
+    include_done: bool = False,
+    max_label_buckets: int = _MAX_LABEL_BUCKETS,
+) -> dict:
+    """Counts describing the shape of a backlog, without paginating through it.
+
+    Answers "what is in here and what needs attention" in one small response: totals,
+    done vs open, a breakdown by priority, by label, and by staleness. Returns **counts
+    only — no task rows**. When you know which bucket you care about, follow up with
+    `task_list` using the same filter.
+
+    This is cheap by construction. Each bucket is one request that asks for a single row
+    and reads the match count off the pagination header, so a summary of a 470-task
+    tracker moves a few hundred bytes rather than several megabytes. The `calls` field in
+    the response reports exactly how many upstream requests it cost, so the price is
+    visible to whoever is paying it.
+
+    `project_id` scopes the summary to one project; omit it to summarise everything you
+    can see. `filter` is any additional Vikunja filter expression and is composed into
+    *every* bucket, so `filter="priority >= 3"` gives the shape of the urgent work alone.
+    `scope.filter` in the response is the exact expression the buckets were counted over —
+    read it rather than inferring what was included.
+
+    By default the buckets cover **open** tasks only, since "backlog" usually means work
+    outstanding; `total`, `done` and `not_done` always describe the full scope regardless.
+    Pass `include_done=true` to bucket everything.
+
+    Label buckets are capped at `max_label_buckets` (default 25) because each one costs a
+    call. When the cap bites, `labels_truncated` is true and `notes` says how many were
+    dropped — a truncated summary that looked complete would be worse than no summary.
+
+    Staleness reuses `VIKUNJA_STALE_AFTER_DAYS` and carries the same caveat as the
+    per-task `stale` field: it measures when a task was last *touched*, not whether its
+    text is still true. See `task_get`.
+    """
+    settings = get_settings()
+    excluded = settings.excluded_task_ids
+
+    # Applied to every bucket including the totals, so the counts are consistent with each
+    # other. Excluding an anchor task from the label buckets but not the total would just
+    # relocate the off-by-one rather than remove it.
+    base = _compose(
+        f"project = {project_id}" if project_id is not None else "",
+        filter,
+        *(f"id != {task_id}" for task_id in excluded),
+    )
+    bucket_scope = base if include_done else _compose(base, "done = false")
+
+    cutoff = datetime.now(UTC) - timedelta(days=settings.stale_after_days)
+    stale_cutoff = f'"{cutoff:%Y-%m-%d}"'
+
+    labels = [
+        label
+        for label in _unwrap_items(
+            await request("GET", "/labels", caller_token(), params={"per_page": 50})
+        )
+        if isinstance(label, dict) and label.get("id") is not None
+    ]
+    kept_labels = labels[:max_label_buckets]
+    dropped = len(labels) - len(kept_labels)
+
+    # Fired concurrently: they are independent one-row reads, and the bucket cap is what
+    # bounds the fan-out.
+    priority_counts, label_counts, (total, done, not_done, stale, fresh) = await asyncio.gather(
+        asyncio.gather(
+            *(_count_matching(_compose(bucket_scope, f"priority = {p}")) for p in _PRIORITIES)
+        ),
+        asyncio.gather(
+            *(
+                _count_matching(_compose(bucket_scope, f"labels in {label['id']}"))
+                for label in kept_labels
+            )
+        ),
+        asyncio.gather(
+            _count_matching(base),
+            _count_matching(_compose(base, "done = true")),
+            _count_matching(_compose(base, "done = false")),
+            _count_matching(_compose(bucket_scope, f"updated < {stale_cutoff}")),
+            _count_matching(_compose(bucket_scope, f"updated >= {stale_cutoff}")),
+        ),
+    )
+
+    notes: list[str] = []
+    if dropped:
+        notes.append(
+            f"{dropped} of {len(labels)} labels were not counted — max_label_buckets is "
+            f"{max_label_buckets}. Raise it, or narrow the summary with `filter`."
+        )
+
+    return {
+        "scope": {
+            "project_id": project_id,
+            "filter": bucket_scope,
+            "include_done": include_done,
+            "stale_after_days": settings.stale_after_days,
+            "stale_cutoff": f"{cutoff:%Y-%m-%d}",
+            "excluded_task_ids": excluded,
+        },
+        "total": total,
+        "done": done,
+        "not_done": not_done,
+        "by_priority": {str(p): c for p, c in zip(_PRIORITIES, priority_counts, strict=True)},
+        "by_label": {
+            label["title"]: count
+            for label, count in zip(kept_labels, label_counts, strict=True)
+            if label.get("title")
+        },
+        "by_staleness": {"stale": stale, "fresh": fresh},
+        "labels_truncated": bool(dropped),
+        "calls": len(_PRIORITIES) + len(kept_labels) + 5 + 1,
+        "notes": notes,
+    }
 
 
 def _strip_index_in_place(node: Any) -> None:
