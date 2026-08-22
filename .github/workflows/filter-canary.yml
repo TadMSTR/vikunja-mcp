@@ -44,6 +44,10 @@ jobs:
 
       - name: Start Vikunja (latest)
         run: |
+          # GitHub's default shell is `bash -e`, so -u and -o pipefail are not on. The
+          # token step below pipes curl into python, where a silent pipeline failure would
+          # hand the canary an empty bearer and turn every assertion into an auth error.
+          set -euo pipefail
           docker run -d --name vikunja-canary -p 127.0.0.1:3456:3456 \
             -e VIKUNJA_SERVICE_PUBLICURL=http://127.0.0.1:3456 \
             -e VIKUNJA_DATABASE_TYPE=sqlite \
@@ -52,6 +56,12 @@ jobs:
             -e VIKUNJA_SERVICE_ENABLEREGISTRATION=true \
             -e VIKUNJA_SERVICE_SECRET=canarysecretcanarysecretcanarysecret \
             vikunja/vikunja:latest
+          # The literal secret and the login password below are not credentials in any
+          # meaningful sense: this instance is created empty inside an ephemeral runner,
+          # holds only fixtures this job just made up, is bound to loopback, and is
+          # destroyed with the runner. Generating them would imply a confidentiality this
+          # container does not have. The derived JWT is still masked, since it appears in
+          # step output where a real one might one day.
           # The image defaults its file storage to a directory it cannot create as the
           # runtime uid, so it exits 1 without the FILES_BASEPATH override above. Found by
           # running exactly this locally first.
@@ -68,6 +78,7 @@ jobs:
       - name: Create a user and mint a token
         id: token
         run: |
+          set -euo pipefail
           curl -sf -X POST http://127.0.0.1:3456/api/v1/register \
             -H 'Content-Type: application/json' \
             -d '{"username":"canary","password":"canarypassword123","email":"canary@example.invalid"}' >/dev/null
