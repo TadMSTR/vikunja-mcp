@@ -25,12 +25,16 @@ Register it explicitly (``server._register_duplicate_check_if_enabled`` does thi
 Two pieces of measured Vikunja behaviour this rests on, both undocumented, both covered by
 ``tests/test_filter_canary.py``:
 
-1. **``like`` is case-sensitive.** Probed on live v2.3.0 (2026-08-22):
-   ``title like "%containerize%"`` matches nothing while ``title like "%Containerize%"``
-   matches the ticket whose title begins with that word, and ``%Docker%`` / ``%docker%``
-   return *different* sets (6 and 8). Lowercasing extracted terms — the obvious thing to do
-   — would therefore miss most duplicates, because titles capitalise. Every term is queried
-   in several cases at once; see :func:`_case_variants`.
+1. **``like`` case-sensitivity depends on the database backend, not on Vikunja.** Measured
+   2026-08-22 on two instances *both running v2.3.0*: on Postgres it is case-**sensitive**
+   (``title like "%containerize%"`` matches nothing while ``%Containerize%`` matches the
+   ticket whose title begins with that word, and ``%Docker%`` / ``%docker%`` return
+   different sets of 6 and 8); on a fresh SQLite instance the same queries are
+   case-**insensitive**. So a server that must run against either cannot assume one:
+   lowercasing extracted terms — the obvious thing to do — silently misses most duplicates
+   on Postgres, because titles capitalise, while assuming insensitivity breaks the other
+   way. Every term is therefore queried in several cases at once, which is correct under
+   both regimes; see :func:`_case_variants`.
 2. **``||`` works, ``or`` does not.** The word form returns
    ``400 The filter expression ... is invalid``.
 """
@@ -136,8 +140,12 @@ def extract_terms(title: str, limit: int = _MAX_TERMS) -> list[str]:
 def _case_variants(term: str) -> list[str]:
     """The casings of ``term`` worth querying, deduplicated and order-stable.
 
-    Necessary because Vikunja's ``like`` is case-sensitive (measured — see the module
-    docstring). Three forms cover what actually appears in titles: all-lower for identifiers
+    Necessary because ``like`` is case-sensitive on some database backends and not others
+    (measured — see the module docstring). Querying every form is what makes this correct
+    without having to detect the backend, and it costs nothing: the alternatives are OR-ed
+    into the one request that was going to be made anyway.
+
+    Three forms cover what actually appears in titles: all-lower for identifiers
     (``searxng-mcp``), capitalised for the ordinary prose case including the first word of
     a title, and all-upper for the acronyms this kind of corpus is full of (``MCP``, ``CI``,
     ``DLQ``, ``HTTP``).

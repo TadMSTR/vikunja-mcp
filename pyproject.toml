@@ -70,6 +70,11 @@ select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    # Live-instance canary over undocumented Vikunja filter behaviour. Skipped unless
+    # VIKUNJA_CANARY_URL and VIKUNJA_CANARY_TOKEN are set, so the default run stays offline.
+    "canary: requires a live Vikunja instance (see tests/test_filter_canary.py)",
+]
 
 [tool.coverage.run]
 source = ["vikunja_mcp"]
