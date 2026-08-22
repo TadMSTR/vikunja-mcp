@@ -53,8 +53,9 @@ reach Vikunja as one identity, which silently destroys the per-agent attribution
 
 ## Tools
 
-As of v0.2.0 the server covers the full Vikunja resource surface — 71 tools, each pinned to
-the correct verb by a wire test against the live Swagger spec.
+The server covers the full Vikunja resource surface, each tool pinned to the correct verb
+by a wire test against the live Swagger spec — 71 as of v0.2.0, plus `backlog_summary`
+(v0.7.0) and `task_link_commit` (v0.8.0) for **73**.
 
 | Group | Tools |
 |-------|-------|
@@ -64,6 +65,7 @@ the correct verb by a wire test against the live Swagger spec.
 | Tasks | `task_list`, `task_search`, `task_get`, `task_create`, `task_update`, `task_delete`, `tasks_bulk_update` |
 | Assignees | `task_assignee_list`, `task_assignee_add`, `task_assignee_remove`, `task_assignees_add_bulk` |
 | Relations / reminders | `task_relation_add`, `task_relation_remove`, `task_reminders_set` |
+| Backlinks | `task_link_commit` |
 | Kanban buckets / views | `bucket_list`, `bucket_create`, `bucket_update`, `bucket_delete`, `task_bucket_move`, `view_list`, `view_get`, `view_create`, `view_update`, `view_delete` |
 | Labels | `label_list`, `label_get`, `label_create`, `label_update`, `label_delete`, `task_label_add`, `task_label_remove` |
 | Comments | `comment_list`, `comment_create`, `comment_delete` |
@@ -213,6 +215,51 @@ what it cost, so the price is visible to whoever pays it.
 If your tracker has an "anchor" task carrying every label deliberately, name it in
 `VIKUNJA_SUMMARY_EXCLUDE_IDS` — otherwise it lands in every label bucket and inflates each
 count by exactly one, which is worse than an obviously broken number.
+
+### Idempotency keys
+
+Pass `idempotency_key` to `task_create` and a retried create returns the ticket it already
+made instead of filing a second one:
+
+```json
+{ "id": 517, "title": "...", "idempotent_hit": true }
+```
+
+The key is **caller-supplied** — never derived from the title, which would silently
+collapse two legitimately-similar tickets into one. It is scoped to the project, and must
+match `[A-Za-z0-9][A-Za-z0-9._-]*`: that charset is a security boundary, because the key is
+interpolated into a Vikunja filter expression where a quote or a `%` would escape the scope
+or silently over-match.
+
+Known race, accepted: lookup-then-create is not atomic and Vikunja has no conditional
+create, so two genuinely simultaneous creates with the same key can both file. The window
+is small and the failure degrades to today's behaviour. If the lookup itself fails the task
+is still created, with `idempotency_degraded: true` on the response — losing a filing to a
+convenience feature is worse than failing to deduplicate, but silently claiming a guarantee
+that did not hold is worse than both.
+
+### Commit and PR backlinks
+
+`task_link_commit(task_id, ref_type, ref_url)` records what shipped for a ticket. Read them
+back as `linked_refs` on `task_get`:
+
+```json
+{ "id": 519, "linked_refs": [
+    { "ref_type": "pr",     "ref_url": "https://github.com/o/r/pull/16" },
+    { "ref_type": "commit", "ref_url": "https://github.com/o/r/commit/138b02e8" } ] }
+```
+
+Links accumulate — a second never displaces the first, and re-linking the same pair is a
+no-op. `ref_url` must be https with a real hostname; `javascript:`, `data:` and plain
+`http` are refused, because this is a link a human clicks years later. Nothing fetches it,
+so this is stored-link injection rather than SSRF.
+
+Deliberately **not** in scope: transitioning ticket state from VCS events. Closing a ticket
+because a PR merged guesses at intent, and guessing wrong closes work that is not done.
+
+Both features store their metadata as a visible footer in the ticket description, under one
+shared convention — see [docs/markers.md](docs/markers.md), which is worth reading before
+touching the parser.
 
 ### Duplicate detection
 

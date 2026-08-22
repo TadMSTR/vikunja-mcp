@@ -46,7 +46,7 @@ from fastmcp import FastMCP
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from . import __version__, telemetry
+from . import __version__, markers, telemetry
 from .auth import caller_token
 from .client import request
 from .config import get_settings
@@ -516,6 +516,54 @@ def _staleness(updated: Any) -> dict[str, Any]:
     return {"days_since_update": days, "stale": days >= get_settings().stale_after_days}
 
 
+def _linked_refs(task: dict[str, Any]) -> dict[str, Any]:
+    """``{"linked_refs": [...]}`` when the task carries backlinks, otherwise ``{}``.
+
+    Derived here, in the projection, because this runs *before* the marker strip hook —
+    the description still carries the footer at this point. Reverse the order and the
+    parse finds nothing.
+
+    Omitted rather than set to ``[]`` when there are none, matching the convention
+    ``possible_duplicates`` established: an empty list reads as "checked, and this ticket
+    genuinely has no linked code", which is a stronger claim than "no marker was present"
+    and is indistinguishable from a ticket predating the feature.
+
+    **Every URL is re-validated here, and that is a security control.** A marker is
+    ordinary text in a field every ``task_create``/``task_update`` caller can write, so a
+    backlink can reach a description without ever passing :func:`_validate_ref_url`.
+    Security audit 2026-08-22 (HIGH) demonstrated it: a plain description of
+    ``vikunja-mcp: ref=commit|javascript:alert(1)`` surfaced here as a genuine entry.
+    ``linked_refs`` is presented as a structured, machine-parsed field, so a consumer that
+    trusts it *because it looks validated* had no way to tell that entry from one that
+    was. Re-validating on read is what makes the field's implicit promise true: whoever
+    wrote the marker, every URL this yields satisfies the same guard the write path
+    applies.
+
+    Deliberately the *same* predicate as the write path rather than a stricter one. A read
+    guard that rejected more would silently eat links this server itself wrote, and that
+    failure would read as data loss rather than as a control — asserted by
+    ``test_read_validation_matches_the_write_guard_exactly``.
+
+    Note this constrains the *consequences* of forgery, not the forgery: a forged ref to a
+    well-formed https URL still surfaces. That is deliberate and bounded — it is exactly
+    what the caller could have written by calling ``task_link_commit`` anyway, so it grants
+    nothing. What it can no longer do is smuggle a scheme the write path refuses.
+    """
+    kept = []
+    for ref in markers.linked_refs(task.get("description")):
+        try:
+            _validate_ref_url(ref["ref_url"])
+        except ValueError:
+            log.warning(
+                "vikunja_forged_ref_dropped",
+                task_id=task.get("id"),
+                ref_type=ref.get("ref_type"),
+            )
+            continue
+        kept.append(ref)
+    return {"linked_refs": kept} if kept else {}
+
+
 def _with_staleness(task: dict[str, Any]) -> dict[str, Any]:
     """The verbose path's projection: the untouched body plus the two derived fields.
 
@@ -527,7 +575,7 @@ def _with_staleness(task: dict[str, Any]) -> dict[str, Any]:
     reference to something the caller did not ask about, and dating it invites reading a
     staleness verdict on a ticket that was never fetched.
     """
-    return {**task, **_staleness(task.get("updated"))}
+    return {**task, **_staleness(task.get("updated")), **_linked_refs(task)}
 
 
 def _task_ref(task: dict[str, Any]) -> dict[str, Any]:
@@ -599,6 +647,7 @@ def _compact_task(task: dict[str, Any]) -> dict[str, Any]:
     for name, count_key in _COUNTED_COLLECTIONS.items():
         out[count_key] = _count(task.get(name))
     out.update(_staleness(task.get("updated")))
+    out.update(_linked_refs(task))
     return out
 
 
@@ -718,6 +767,45 @@ async def task_get(task_id: int | str, verbose: bool = False) -> dict:
     return _project(result, _with_staleness if verbose else _compact_task)
 
 
+# How many candidate rows an idempotency lookup will confirm before giving up. The filter
+# is a substring match, so it can return tickets that merely *quote* a key alongside the
+# one that carries it. One page is a generous ceiling for that — a key is normally unique —
+# and the failure past it degrades to creating a duplicate, which is today's behaviour.
+_IDEMPOTENCY_SCAN_LIMIT = 50
+
+
+async def _find_by_idempotency_key(project_id: int, key: str) -> dict[str, Any] | None:
+    """The task in ``project_id`` already carrying ``key``, or ``None``.
+
+    Two steps, and the second is the one that matters. The filter narrows server-side in a
+    single call, but ``like`` is a **substring** match: it also returns a ticket whose body
+    quotes ``idem=<key>`` in prose or a code block, and a ticket whose key merely *starts*
+    with this one (``k1`` matches a stored ``k12``). Returning either would suppress a
+    legitimate filing and hand back an unrelated ticket as though the caller had created
+    it — silently, because both outcomes look like success.
+
+    So every candidate is confirmed by re-parsing its markers, which is an exact match on a
+    real marker paragraph rather than a substring of arbitrary text.
+    """
+    filter_expr = _compose(
+        f"project = {project_id}",
+        f'description like "%{markers.lookup_fragment("idem", key)}%"',
+    )
+    result = await request(
+        "GET",
+        "/tasks",
+        caller_token(),
+        params={"filter": filter_expr, "per_page": _IDEMPOTENCY_SCAN_LIMIT, "page": 1},
+    )
+    rows = result["items"] if isinstance(result, dict) and "items" in result else result
+    if not isinstance(rows, list):
+        return None
+    for row in rows:
+        if isinstance(row, dict) and key in markers.parse(row.get("description")).get("idem", []):
+            return row
+    return None
+
+
 @tool
 async def task_create(
     project_id: int,
@@ -725,15 +813,70 @@ async def task_create(
     description: str = "",
     priority: int | None = None,
     due_date: str = "",
+    idempotency_key: str | None = None,
 ) -> dict:
-    """Create a task in a project. `title` is required. `due_date` is RFC3339 (or omit)."""
+    """Create a task in a project. `title` is required. `due_date` is RFC3339 (or omit).
+
+    **`idempotency_key`** makes a retried create safe. Pass a stable string identifying
+    *this* filing — a task id, a build name plus a finding id, anything the retry will
+    derive identically — and if a task in `project_id` already carries that key, it is
+    returned with `idempotent_hit: true` instead of a second one being filed.
+
+    The key must be **caller-supplied**, and is deliberately not derived from the title.
+    Deriving it would silently collapse two legitimately-similar tickets into one, which
+    is vikunja#331 (an agent passing one identifier where another was expected, silently
+    mutating three unrelated tickets) in a new costume.
+
+    Keys are **scoped to the project** and match letters, digits, `.`, `_` and `-`, from
+    an alphanumeric first character. That charset is a security boundary, not a style
+    rule: the key is interpolated into a Vikunja filter expression, and quotes or `%`
+    there would escape the scope or silently over-match.
+
+    Distinct from `VIKUNJA_DUPLICATE_CHECK`, which reports *semantically* similar tickets
+    and never suppresses anything. This suppresses, so it only ever acts on an exact key.
+
+    **Known race, accepted.** Lookup-then-create is not atomic and Vikunja offers no
+    conditional create, so two genuinely simultaneous creates with the same key can both
+    miss and both file. The window is small and the failure degrades to today's behaviour
+    — a duplicate — so this is documented rather than locked.
+
+    If the lookup itself fails, the task is still created and the response carries
+    `idempotency_degraded: true`. Losing a filing to a convenience feature would be worse
+    than failing to deduplicate it, but claiming a guarantee that did not hold would be
+    worse than both.
+    """
+    rendered = _md_to_html(description) or None
+    degraded = False
+
+    if idempotency_key is not None:
+        # Before any call: an unusable key should cost nothing and surface immediately.
+        markers.validate_lookup_value(idempotency_key)
+        try:
+            existing = await _find_by_idempotency_key(project_id, idempotency_key)
+        except Exception as exc:
+            # Broad by design, for the reason contrib/duplicate_check gives: enumerating
+            # what an upstream search can raise is the list that goes stale unnoticed.
+            log.warning(
+                "vikunja_idempotency_lookup_failed",
+                project_id=project_id,
+                error=str(exc),
+            )
+            existing, degraded = None, True
+        if existing is not None:
+            existing["idempotent_hit"] = True
+            return existing
+        rendered = markers.append(rendered or "", "idem", idempotency_key)
+
     body = _drop_none(
         title=title,
-        description=_md_to_html(description) or None,
+        description=rendered,
         priority=priority,
         due_date=due_date or None,
     )
-    return await request("PUT", f"/projects/{project_id}/tasks", caller_token(), json=body)
+    result = await request("PUT", f"/projects/{project_id}/tasks", caller_token(), json=body)
+    if degraded and isinstance(result, dict):
+        result["idempotency_degraded"] = True
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1011,6 +1154,50 @@ async def _strip_task_index(result: Any) -> Any:
     return result
 
 
+def _strip_markers_in_place(node: Any) -> None:
+    """Recursively rewrite every ``description`` to drop its metadata footer.
+
+    Walks the body the same way :func:`_strip_index_in_place` does, and for the same
+    reason: a task inlined under ``related_tasks`` carries its own description, so a
+    top-level-only strip leaks a marker on every ticket that links to another.
+
+    ``pagination`` is skipped — it is this server's own envelope metadata, never a task.
+
+    Only ``description`` is touched. A label's ``description`` is also visited and is
+    correctly a no-op: :func:`markers.strip` only ever removes a paragraph that opens with
+    the ``vikunja-mcp:`` namespace, and nothing writes one there.
+    """
+    if isinstance(node, dict):
+        if isinstance(node.get("description"), str):
+            node["description"] = markers.strip(node["description"])
+        for key, value in node.items():
+            if key != "pagination":
+                _strip_markers_in_place(value)
+    elif isinstance(node, list):
+        for item in node:
+            _strip_markers_in_place(item)
+
+
+async def _strip_task_markers(result: Any) -> Any:
+    """Drop metadata markers from every description in a create, read or update response.
+
+    Markers are machinery — an idempotency key and commit backlinks — not content. An
+    agent reading a ticket should get the body a human wrote, and a build report quoting a
+    description should not acquire a footer it has to explain.
+
+    Registered on the same tool set as the ``index`` strip, and for the same reasoning
+    recorded there: ``task_update``, ``tasks_bulk_update`` and ``task_bucket_move`` all
+    return a full task body too, so naming only the three read tools would leave the
+    marker visible on the paths that *write* it — which is where it is most surprising.
+
+    This runs after the projections, so :func:`_compact_task` has already read whatever
+    structured fields it derives from the marker (``linked_refs``) while the description
+    still carried it. Ordering matters: strip first and the parse finds nothing.
+    """
+    _strip_markers_in_place(result)
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Ticket-reference resolution — accepting "#454" where a task id is taken
 # ---------------------------------------------------------------------------
@@ -1201,6 +1388,7 @@ _TASK_REF_TOOLS = (
     "task_relation_add",
     "task_relation_remove",
     "task_reminders_set",
+    "task_link_commit",
     "attachment_list",
     "attachment_upload",
     "attachment_delete",
@@ -1227,6 +1415,7 @@ _INDEX_STRIPPED_TOOLS = (
     "task_reminders_set",
     "tasks_bulk_update",
     "task_bucket_move",
+    "task_link_commit",
 )
 
 # Mutating tools audited when VIKUNJA_AUDIT_LOG=1 — the set contrib/audit_log.py's own
@@ -1317,6 +1506,9 @@ def register_builtin_hooks() -> None:
     for name in _INDEX_STRIPPED_TOOLS:
         if _strip_task_index not in after_handlers(name):
             register_after(name, _strip_task_index)
+    for name in _INDEX_STRIPPED_TOOLS:
+        if _strip_task_markers not in after_handlers(name):
+            register_after(name, _strip_task_markers)
     for name in _TASK_REF_TOOLS:
         if _resolve_task_ref_kwarg not in before_handlers(name):
             register_before(name, _resolve_task_ref_kwarg)
@@ -1351,6 +1543,94 @@ async def task_update(
         percent_done=percent_done,
     )
     return await _apply_task_update(task_id, caller_token(), changes)
+
+
+def _validate_ref_url(ref_url: str) -> None:
+    """Refuse a backlink URL that is not a plausible https address. ``ValueError``.
+
+    This is **stored-link injection**, not SSRF: nothing here fetches the URL. What
+    happens to it is that it is written into a ticket body a human later clicks, so the
+    guard that matters is on the scheme rather than on the host's address range — this
+    deliberately does *not* reuse ``webhook_create``'s internal-host checks, because a
+    backlink to an internal Gitea is exactly the normal case on forge.
+
+    ``https`` only. ``javascript:`` and ``data:`` are the obvious attacks; plain ``http``
+    is refused too, because a backlink is written once and clicked for years, and there is
+    no forge host that needs it. A hostname must contain a dot, which rejects the
+    ``https://localhost`` class without pretending to validate that the host resolves.
+
+    Whitespace is refused because the marker line is space-separated and a space would
+    forge a sibling token.
+    """
+    if not isinstance(ref_url, str) or not ref_url:
+        raise ValueError("ref_url is required")
+    if not markers.value_is_storable(ref_url):
+        raise ValueError(
+            f"ref_url may not contain whitespace or '<>' — the marker line is "
+            f"space-separated, so a space would forge a second entry. Got {ref_url!r}"
+        )
+    if "\\" in ref_url:
+        # Browsers normalise `\` to `/` inside the authority; urlparse does not. The two
+        # therefore disagree about where the host ends, so a guard that trusts urlparse can
+        # pass a URL that navigates somewhere else. No backlink needs a backslash.
+        raise ValueError(f"ref_url may not contain a backslash; got {ref_url!r}")
+    parsed = urlparse(ref_url)
+    if parsed.scheme != "https":
+        raise ValueError(
+            f"ref_url must be https (a backlink is stored once and clicked for years, and "
+            f"javascript:/data: links are stored-link injection). Got scheme "
+            f"{parsed.scheme or '<none>'!r}"
+        )
+    if parsed.username is not None or parsed.password is not None:
+        # `https://github.com@evil.example.com/x` navigates to evil.example.com — the part
+        # before `@` is userinfo, not the host — while reading as a GitHub link to whoever
+        # opens the ticket. The hostname check below passes it, because urlparse reports
+        # the real host correctly; what fails is the gap between the check and the human.
+        # A commit backlink has no legitimate use for credentials in the URL.
+        raise ValueError(
+            f"ref_url may not carry userinfo before the host — `https://a@b/` reads as a "
+            f"link to `a` but navigates to `b`. Got {ref_url!r}"
+        )
+    host = parsed.hostname or ""
+    if "." not in host:
+        raise ValueError(f"ref_url needs a plausible hostname; got {host or '<none>'!r}")
+
+
+@tool
+async def task_link_commit(task_id: int | str, ref_type: str, ref_url: str) -> dict:
+    """Record a commit, PR or branch backlink on a ticket.
+
+    `task_id` accepts the global id (`482`), the ticket number (`"#463"`), or the
+    `"#463 (id 482)"` form forge tickets are written in — an agent linking a commit has
+    the ticket number in hand, not the global id.
+
+    `ref_type` is a short lowercase label (`commit`, `pr`, `mr`, `branch`, `tag`).
+    `ref_url` must be an https URL with a real hostname; `javascript:`/`data:`/`http:`
+    are refused. Nothing fetches the URL — this is not the `webhook_create` SSRF case —
+    but a human clicks it, so it must not be a stored-link injection.
+
+    Links **accumulate**: a second call adds to the ticket rather than replacing what is
+    there, and re-linking the same `ref_type` + `ref_url` is a no-op. Read them back as
+    the structured `linked_refs` field on `task_get`, not by parsing the description.
+
+    Deliberately **not** in scope: transitioning the ticket's state. Closing a ticket
+    because a PR merged guesses at intent, and guessing wrong closes work that is not
+    done. This records the link; a human or an explicit `task_update` closes the ticket.
+    """
+    # Both refusals happen before any upstream call, so a malformed link costs nothing.
+    _validate_ref_url(ref_url)
+    value = markers.encode_ref(ref_type, ref_url)
+
+    token = caller_token()
+    # Two GETs: one to read the description we are appending to, and one inside
+    # _apply_task_update. Worth it to reuse the audited full-replace merge (vikunja#173)
+    # rather than restate it here — this tool is called once per shipped change, not in a
+    # loop, so the extra read is not worth a second copy of that logic.
+    current = await request("GET", f"/tasks/{task_id}", token)
+    description = current.get("description") if isinstance(current, dict) else None
+    return await _apply_task_update(
+        task_id, token, {"description": markers.append(description, "ref", value)}
+    )
 
 
 @tool
