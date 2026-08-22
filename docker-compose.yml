@@ -58,6 +58,19 @@ services:
       # VIKUNJA_AUDIT_LOG: "1"
       # VIKUNJA_AUDIT_LOG_DIR: /var/log/vikunja-mcp
 
+      # Duplicate warnings on task_create are ON by default and cost one extra upstream
+      # search per create. Uncomment to turn them off.
+      # VIKUNJA_DUPLICATE_CHECK: "0"
+
+      # Age at which a task reads `stale: true`. Lower it after a bulk import, which
+      # rewrites `updated` on everything and makes the whole tracker look fresh.
+      # VIKUNJA_STALE_AFTER_DAYS: "90"
+
+      # Task ids excluded from every backlog_summary bucket — for a "vocabulary anchor"
+      # task carrying every label, which would otherwise inflate each label count by one.
+      # Your anchor's id, if you have one; there is no sensible default.
+      # VIKUNJA_SUMMARY_EXCLUDE_IDS: "<task-id>"
+
     # volumes:
     #   # uid/gid 1000 inside the container — chown the host directory to match.
     #   - ./audit-log:/var/log/vikunja-mcp

@@ -40,6 +40,9 @@ are decisions you have to make rather than defaults you can accept: `VIKUNJA_URL
 | `VIKUNJA_REQUEST_TIMEOUT` | `30` | Upstream timeout, seconds. |
 | `LOG_LEVEL` | `INFO` | |
 | `VIKUNJA_AUDIT_LOG` / `_DIR` | *(unset)* | Opt-in. Needs a writable mount — see [Audit log](#audit-log). |
+| `VIKUNJA_DUPLICATE_CHECK` | `1` (**on**) | Warns about probable duplicates on `task_create`. Costs one extra upstream search per create; set `0` to disable. |
+| `VIKUNJA_STALE_AFTER_DAYS` | `90` | Age at which a task reads `stale: true`. Must be ≥ 1. |
+| `VIKUNJA_SUMMARY_EXCLUDE_IDS` | *(unset)* | Task ids excluded from every `backlog_summary` bucket, comma-separated. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | *(unset)* | The `[telemetry]` extra **is** installed in the image, so this works out of the box. Use gRPC (`:4317`). |
 
 `VIKUNJA_URL` has no default on purpose. An unset value is a hard startup error rather than

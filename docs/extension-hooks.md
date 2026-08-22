@@ -34,6 +34,24 @@ fire around every invocation of it — including calls that arrive over MCP.
   exception aborts the chain and prevents the tool (and the upstream Vikunja call) running.
 - `tool` is the tool's Python function name (`"task_create"`, `"project_share_create"`, …).
 
+> **Catch inside your handler if the tool matters more than the hook.** The contract above
+> is not a footnote: a `before` handler that raises turns a convenience feature into a lost
+> write, and an `after` handler that raises reports failure for an operation that already
+> succeeded — whose natural retry duplicates it. `contrib/duplicate_check.py` wraps the
+> *entire* body of both its handlers for exactly this reason, and it is worth reading as the
+> worked example: the first draft guarded only the upstream call and left the bookkeeping
+> outside, which the test suite caught.
+
+## Shipped hooks
+
+| Module | Fires on | Default | Purpose |
+|--------|----------|---------|---------|
+| `contrib/audit_log.py` | mutating tools (`before`) | off — `VIKUNJA_AUDIT_LOG=1` | Actor/tool/args-hash trail; never logs raw arguments or the bearer token. |
+| `contrib/duplicate_check.py` | `task_create` (`before` + `after`) | **on** — `VIKUNJA_DUPLICATE_CHECK=0` disables | Attaches `possible_duplicates` to the created task. Reports, never refuses. |
+
+Both are wired from `server.register_builtin_hooks` rather than from an entry point in a
+deployment, so the wiring stays visible to this repo's tests and code review.
+
 ## Example
 
 ```python

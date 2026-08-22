@@ -93,8 +93,7 @@ class Settings(BaseSettings):
     # label deliberately, so the vocabulary is visible in the UI and cannot be pruned. Such
     # a task lands in *every* label bucket and inflates each count by exactly one — a
     # summary that is wrong by one everywhere, which is worse than one that is obviously
-    # broken. Forge has exactly that (its anchor is task 180, `[system] Vikunja label
-    # vocabulary anchor`), which is how the problem was found.
+    # broken. A tracker with exactly that convention is how the problem was found.
     #
     # The id is NOT baked in here. This is a public repo and another deployment's anchor is
     # a different id or does not exist; a hardcoded 180 would be the SC-01 pattern
