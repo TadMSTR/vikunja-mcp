@@ -487,3 +487,61 @@ def test_the_marker_regex_does_not_backtrack_catastrophically(probe):
     markers.strip(probe)
     elapsed = time.perf_counter() - start
     assert elapsed < 1.0, f"{elapsed:.2f}s on a {len(probe)}-char body — backtracking"
+
+
+# ==========================================================================
+# Forgery: a marker is plain text in a field every caller can write
+# (security audit 2026-08-22, HIGH)
+# ==========================================================================
+
+FORGED_REF = "<p>vikunja-mcp: ref=commit|javascript:alert(1)</p>"
+
+
+def test_a_marker_must_be_the_trailing_block():
+    """A footer is the last thing in a description. Anything else is prose.
+
+    Position is the only structural signal available. It is *not* authentication —
+    see `test_a_trailing_forgery_is_still_parsed` — but it is what separates a ticket
+    that documents this format from one that uses it, and that is the collision that
+    actually happens: `docs/markers.md` pasted into a ticket body.
+
+    Requiring the `<hr>` instead was considered and measured to be worthless: a caller
+    typing `---` in markdown produces a byte-identical `<hr>`, so it gates nothing.
+    """
+    quoted_mid_body = (
+        "<p>The footer format is:</p>\n"
+        "<p>vikunja-mcp: idem=abc123</p>\n"
+        "<p>...and it is stripped on read.</p>"
+    )
+    assert markers.parse(quoted_mid_body) == {}
+
+
+def test_a_mid_body_marker_lookalike_is_not_stripped_from_the_body():
+    """The content-loss half. Stripping a paragraph a human wrote deletes their text
+    from every read projection — silently, since storage still has it."""
+    doc = (
+        "<p>The footer format is:</p>\n"
+        "<p>vikunja-mcp: idem=abc123</p>\n"
+        "<p>...and it is stripped on read.</p>"
+    )
+    assert markers.strip(doc) == doc
+
+
+def test_trailing_whitespace_does_not_hide_the_footer():
+    assert markers.parse("<p>b</p>\n<hr>\n<p>vikunja-mcp: idem=k</p>\n\n  ") == {"idem": ["k"]}
+
+
+def test_a_trailing_forgery_is_still_parsed_and_that_is_documented():
+    """The honest boundary, asserted so nobody later mistakes it for a guarantee.
+
+    A marker is ordinary text in a field every `task_create`/`task_update` caller can
+    write, so a caller who puts a well-formed footer at the end of a description gets a
+    real marker. There is no server-side secret to authenticate it with, and adding one
+    would defeat the point of a footer a human can read and delete.
+
+    What this build does about it: the *consequences* are constrained rather than the
+    forgery. `ref` entries are re-validated on read, so a forged one cannot smuggle a
+    scheme the write path refuses. `idem` is documented as trust-on-write.
+    """
+    forged = "<p>unrelated ticket</p>\n<p>vikunja-mcp: idem=build-42</p>"
+    assert markers.parse(forged) == {"idem": ["build-42"]}

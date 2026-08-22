@@ -76,6 +76,31 @@ PREFIX = "vikunja-mcp:"
 #: `test_the_marker_regex_does_not_backtrack_catastrophically`.
 _GAP = r"\s{0,16}"
 
+#: The footer must be the **trailing** block of the description, and that is a security
+#: constraint rather than tidiness.
+#:
+#: A marker is ordinary text in a field every `task_create`/`task_update` caller can write,
+#: so nothing distinguishes a footer this module wrote from a paragraph that happens to
+#: start with the same eleven characters. Security audit 2026-08-22 (HIGH) demonstrated
+#: both halves of the consequence: a plain description of
+#: ``vikunja-mcp: ref=commit|javascript:alert(1)`` parsed as a genuine backlink, bypassing
+#: ``_validate_ref_url`` entirely; and ``vikunja-mcp: idem=<key>`` on any ticket hijacked
+#: every future idempotent create for that key.
+#:
+#: Requiring the introducing ``<hr>`` was considered and measured to be worthless — a
+#: caller typing ``---`` in markdown renders a byte-identical ``<hr>``, so it gates
+#: nothing. Position is the only structural signal left, and it is the one that separates
+#: the collision that actually happens: a ticket *documenting* this format (docs/markers.md
+#: pasted into a body) versus a ticket *using* it. All three stored forms put the footer
+#: last, so this costs nothing real.
+#:
+#: It is **not** authentication, and must not be described as such: a caller who puts a
+#: well-formed footer at the *end* of a description still gets a real marker. What the
+#: build does about that is constrain the consequences rather than the forgery —
+#: ``server._linked_refs`` re-validates every ``ref`` URL on read so a forged entry cannot
+#: smuggle a scheme the write path refuses, and ``idem`` is documented as trust-on-write.
+#: There is no server-side secret to sign with, and adding one would defeat the point of a
+#: footer a human can read and delete.
 _MARKER_BLOCK = re.compile(
     _GAP
     + r"(?:<hr"
@@ -85,7 +110,7 @@ _MARKER_BLOCK = re.compile(
     + r")?<p>"
     + _GAP
     + re.escape(PREFIX)
-    + r"(?P<payload>[^<]*)</p>",
+    + r"(?P<payload>[^<]*)</p>\s*\Z",
     re.IGNORECASE,
 )
 

@@ -294,3 +294,61 @@ async def test_an_at_sign_in_the_path_is_still_allowed(wire):
     mock = wire()
     await server.task_link_commit(361, "pr", "https://example.com/@scope/pkg/pull/3")
     assert markers.parse(_written(mock))["ref"]
+
+
+# --- forged refs are dropped on read (security audit 2026-08-22, HIGH) ----
+
+
+@pytest.mark.parametrize(
+    "forged_url",
+    [
+        pytest.param("javascript:alert(1)", id="javascript"),
+        pytest.param("data:text/html;base64,PHNjcmlwdD4=", id="data"),
+        pytest.param("http://example.com/x", id="plain-http"),
+        pytest.param("https://github.com@evil.example.com/x", id="userinfo"),
+        pytest.param("https://localhost/x", id="dotless-host"),
+    ],
+)
+async def test_a_forged_ref_url_is_dropped_on_read(serve, forged_url):
+    """A marker is text any `task_create`/`task_update` caller can write, so a backlink
+    can reach the description without ever passing `_validate_ref_url`.
+
+    Audit finding (HIGH): `description = "vikunja-mcp: ref=commit|javascript:alert(1)"`
+    surfaced as a genuine `linked_refs` entry. `linked_refs` is presented as a structured,
+    machine-parsed field, so a consumer that trusts it *because it looks validated* had no
+    way to tell it from one that actually was.
+
+    Re-validating on read is what makes the field's implicit promise true: every entry it
+    yields satisfies the same guard the write path applies, whoever wrote it.
+    """
+    stored = f"<p>b</p>\n<hr>\n<p>vikunja-mcp: ref=commit|{forged_url}</p>"
+    serve(fixtures.task(id=361, description=stored))
+    result = await server.task_get(361)
+    assert "linked_refs" not in result
+
+
+async def test_a_forged_ref_does_not_hide_the_legitimate_ones(serve):
+    """Dropping the bad entry must not discard the good ones beside it."""
+    stored = markers.append("<p>b</p>", "ref", f"pr{markers.REF_DELIMITER}{PR_URL}")
+    stored = markers.append(stored, "ref", f"commit{markers.REF_DELIMITER}javascript:alert(1)")
+    stored = markers.append(stored, "ref", f"commit{markers.REF_DELIMITER}{COMMIT_URL}")
+    serve(fixtures.task(id=361, description=stored))
+    result = await server.task_get(361)
+    assert result["linked_refs"] == [
+        {"ref_type": "pr", "ref_url": PR_URL},
+        {"ref_type": "commit", "ref_url": COMMIT_URL},
+    ]
+
+
+async def test_read_validation_matches_the_write_guard_exactly(serve):
+    """Control: a URL the write path accepts must survive the read path.
+
+    A read guard stricter than the write guard would silently eat links this server
+    itself wrote — the failure would look like data loss, not like a security control.
+    """
+    for good in [PR_URL, COMMIT_URL, "https://gitea.example.com/org/repo/pulls/3"]:
+        server._validate_ref_url(good)  # write path accepts it
+        stored = markers.append("<p>b</p>", "ref", f"pr{markers.REF_DELIMITER}{good}")
+        serve(fixtures.task(id=361, description=stored))
+        result = await server.task_get(361)
+        assert result["linked_refs"] == [{"ref_type": "pr", "ref_url": good}], good

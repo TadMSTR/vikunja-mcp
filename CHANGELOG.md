@@ -34,6 +34,26 @@ round-trip probe before any of it was built.
   state from VCS events.
 
 ### Security
+- **Markers are not authenticated, and the consequences are now constrained.** A marker is
+  ordinary text in a field every `task_create`/`task_update` caller can write, so a
+  description of `vikunja-mcp: ref=commit|javascript:alert(1)` parsed as a genuine backlink
+  and bypassed `_validate_ref_url` entirely (security audit 2026-08-22, HIGH). Two fixes:
+  the footer must now be the **trailing** block, and `linked_refs` **re-validates every URL
+  on read** with the same guard the write path uses, dropping and logging what fails.
+  Requiring the introducing `<hr>` was measured and rejected — typing `---` renders a
+  byte-identical one, so it gates nothing. What deliberately remains is documented in
+  `docs/markers.md`: a trailing forged `ref` to a well-formed https URL grants nothing a
+  caller could not do via `task_link_commit`, and `idem` is trust-on-write.
+- **Fixed: a marker-lookalike paragraph mid-body was silently deleted on read.** Same root
+  cause; the trailing constraint fixes it. A ticket documenting this format previously lost
+  that paragraph from every read projection while storage still held it.
+- **Fixed: ReDoS on every read path.** `_MARKER_BLOCK` runs over every description, and
+  unbounded `\s*` runs made a long whitespace run quadratic — 100k spaces took 24s, so one
+  ticket could hang `task_list` for every caller. Each gap is bounded at `\s{0,16}`; the
+  same input is now 0.045s.
+- **Fixed: `ref_url` host spoofing.** `https://github.com@evil.example.com/x` reads as a
+  GitHub link and navigates elsewhere. Userinfo and backslashes are refused; `@` later in
+  the path still works.
 - **Idempotency keys are filter operands, so they carry a charset, not an escape.** A key
   is interpolated into a Vikunja filter expression — the surface the 0.7.0 audit found
   `_compose` escaping. Vikunja evaluates filters left to right, so a key of

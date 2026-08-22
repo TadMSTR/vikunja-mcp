@@ -94,6 +94,58 @@ rather than a substring of arbitrary text.
 
 ---
 
+## Markers are not authenticated
+
+**A marker is ordinary text in a field every `task_create`/`task_update` caller can write.**
+Nothing distinguishes a footer this module wrote from a paragraph that starts with the same
+eleven characters. Security audit 2026-08-22 (HIGH) demonstrated both halves:
+
+```
+description = "vikunja-mcp: ref=commit|javascript:alert(1)"
+  -> parses as a genuine backlink, never touching _validate_ref_url
+
+description = "vikunja-mcp: idem=<key>"
+  -> makes that ticket the "existing" hit for every future create with <key>
+```
+
+Requiring the introducing `<hr>` does **not** help and was measured rather than assumed: a
+caller typing `---` in markdown renders a byte-identical `<hr>`, so it gates nothing.
+
+Two constraints apply instead. Neither is authentication, and neither should be described
+as such.
+
+**1. The footer must be the trailing block.** Position is the only structural signal
+available, and it separates the collision that actually happens — a ticket *documenting*
+this format versus one *using* it. All three stored forms put the footer last, so it costs
+nothing real. This also fixes a content-loss bug: before it, a ticket with a
+marker-lookalike paragraph mid-body had that paragraph silently deleted from every read
+projection.
+
+**2. `ref` URLs are re-validated on read.** `server._linked_refs` runs every decoded URL
+through the same `_validate_ref_url` the write path uses and drops what fails, logging
+`vikunja_forged_ref_dropped`. `linked_refs` is presented as a structured, machine-parsed
+field, so a consumer that trusts it *because it looks validated* needs that to be true.
+The read guard is deliberately the **same** predicate as the write guard, not a stricter
+one — a stricter read would silently eat links this server itself wrote, and that reads as
+data loss rather than as a control.
+
+### What remains, deliberately
+
+A caller who puts a well-formed footer at the **end** of a description still gets a real
+marker:
+
+- **`ref`** — they can forge a link to a well-formed https URL. This grants nothing: it is
+  exactly what they could have written by calling `task_link_commit`. What they can no
+  longer do is smuggle a scheme the write path refuses.
+- **`idem`** — trust-on-write. A planted key can suppress a future create in that project
+  and return an unrelated ticket. Bounded by the same trust boundary that already lets the
+  caller write any description at all, and unfixable without a server-side secret — which
+  would defeat the point of a footer a human can read and delete.
+
+`append()` preserves markers it finds, so linking a commit to a ticket carrying a forged
+footer adopts that footer into the rewritten line. That is the intended additive
+semantics; read-time validation is what protects the consumer.
+
 ## Interaction with duplicate detection
 
 `VIKUNJA_DUPLICATE_CHECK` (vikunja#463) searches **titles only** — `build_filter` emits

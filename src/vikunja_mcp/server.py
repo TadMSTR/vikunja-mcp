@@ -527,9 +527,41 @@ def _linked_refs(task: dict[str, Any]) -> dict[str, Any]:
     ``possible_duplicates`` established: an empty list reads as "checked, and this ticket
     genuinely has no linked code", which is a stronger claim than "no marker was present"
     and is indistinguishable from a ticket predating the feature.
+
+    **Every URL is re-validated here, and that is a security control.** A marker is
+    ordinary text in a field every ``task_create``/``task_update`` caller can write, so a
+    backlink can reach a description without ever passing :func:`_validate_ref_url`.
+    Security audit 2026-08-22 (HIGH) demonstrated it: a plain description of
+    ``vikunja-mcp: ref=commit|javascript:alert(1)`` surfaced here as a genuine entry.
+    ``linked_refs`` is presented as a structured, machine-parsed field, so a consumer that
+    trusts it *because it looks validated* had no way to tell that entry from one that
+    was. Re-validating on read is what makes the field's implicit promise true: whoever
+    wrote the marker, every URL this yields satisfies the same guard the write path
+    applies.
+
+    Deliberately the *same* predicate as the write path rather than a stricter one. A read
+    guard that rejected more would silently eat links this server itself wrote, and that
+    failure would read as data loss rather than as a control — asserted by
+    ``test_read_validation_matches_the_write_guard_exactly``.
+
+    Note this constrains the *consequences* of forgery, not the forgery: a forged ref to a
+    well-formed https URL still surfaces. That is deliberate and bounded — it is exactly
+    what the caller could have written by calling ``task_link_commit`` anyway, so it grants
+    nothing. What it can no longer do is smuggle a scheme the write path refuses.
     """
-    refs = markers.linked_refs(task.get("description"))
-    return {"linked_refs": refs} if refs else {}
+    kept = []
+    for ref in markers.linked_refs(task.get("description")):
+        try:
+            _validate_ref_url(ref["ref_url"])
+        except ValueError:
+            log.warning(
+                "vikunja_forged_ref_dropped",
+                task_id=task.get("id"),
+                ref_type=ref.get("ref_type"),
+            )
+            continue
+        kept.append(ref)
+    return {"linked_refs": kept} if kept else {}
 
 
 def _with_staleness(task: dict[str, Any]) -> dict[str, Any]:
