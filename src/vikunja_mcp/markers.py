@@ -112,6 +112,65 @@ def _validate(kind: str, value: str) -> None:
         )
 
 
+def value_is_storable(value: str) -> bool:
+    """Whether ``value`` can be stored in a marker without forging a sibling token.
+
+    Exposed so a caller can produce its own domain-specific error — ``task_link_commit``
+    explains the whitespace rule in terms of a URL — rather than raising this module's
+    generic one at a caller who never mentioned markers.
+    """
+    return isinstance(value, str) and bool(_VALUE.match(value))
+
+
+def linked_refs(html: str | None) -> list[dict[str, str]]:
+    """Every backlink on a ticket, decoded, in the order it was linked.
+
+    Malformed entries are dropped rather than guessed at, so a hand-edited footer degrades
+    to a shorter list instead of to a link with a plausible-looking half.
+    """
+    out = []
+    for value in parse(html).get("ref", []):
+        decoded = decode_ref(value)
+        if decoded is not None:
+            out.append(decoded)
+    return out
+
+
+#: Separates a backlink's type from its URL inside a single ``ref`` value.
+#:
+#: A marker line is space-separated, so the two halves cannot be stored as two tokens
+#: without losing which URL belongs to which type once a ticket carries several. A pipe is
+#: not valid in a URL without percent-encoding, which makes "contains a delimiter" a
+#: reliable signal that the input is malformed rather than a legitimate address — and
+#: :func:`encode_ref` refuses one rather than encoding it, so a round-trip can never
+#: silently split a URL into a bogus second link.
+REF_DELIMITER = "|"
+
+
+def encode_ref(ref_type: str, ref_url: str) -> str:
+    """The stored value for a backlink. Raises ``ValueError`` on anything ambiguous."""
+    if not isinstance(ref_type, str) or not _KIND.match(ref_type):
+        raise ValueError(
+            f"ref_type must match {_KIND.pattern!r} (lowercase, no spaces); got {ref_type!r}"
+        )
+    if not isinstance(ref_url, str) or REF_DELIMITER in ref_url:
+        raise ValueError(f"ref_url may not contain {REF_DELIMITER!r}; got {ref_url!r}")
+    return f"{ref_type}{REF_DELIMITER}{ref_url}"
+
+
+def decode_ref(value: str) -> dict[str, str] | None:
+    """Split a stored ``ref`` value back into its parts, or ``None`` if malformed.
+
+    ``None`` rather than a partial dict: a hand-edited footer should degrade to "no link",
+    never to a link with a plausible-looking half. Splits once, so a URL that somehow
+    carries a delimiter keeps the remainder in the URL instead of dropping it.
+    """
+    ref_type, sep, ref_url = value.partition(REF_DELIMITER)
+    if not sep or not ref_type or not ref_url:
+        return None
+    return {"ref_type": ref_type, "ref_url": ref_url}
+
+
 def validate_lookup_value(value: str) -> None:
     """Reject a value that cannot safely be interpolated into a filter. ``ValueError``.
 

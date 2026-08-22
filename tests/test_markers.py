@@ -198,6 +198,15 @@ def test_parse_ignores_a_token_without_a_value():
     assert markers.parse("<p>vikunja-mcp: idem= ref=</p>") == {}
 
 
+def test_parse_ignores_a_bare_word_in_the_footer():
+    """A human editing the footer types a word with no `=`. It is not half a marker."""
+    assert markers.parse("<p>vikunja-mcp: idem=abc123 oops</p>") == {"idem": ["abc123"]}
+
+
+def test_a_bare_word_alone_yields_nothing():
+    assert markers.parse("<p>vikunja-mcp: whoops</p>") == {}
+
+
 # --- the lookup key the idempotency path filters on ------------------------
 
 
@@ -384,3 +393,61 @@ def test_ref_values_may_still_hold_url_syntax():
     url = "pr|https://github.com/TadMSTR/vikunja-mcp/pull/14?x=1&y=2"
     out = markers.append("<p>body</p>", "ref", url)
     assert markers.parse(out)["ref"] == [url]
+
+
+# ==========================================================================
+# Cross-build interaction: markers are ordinary searchable text now
+# ==========================================================================
+
+
+def test_duplicate_detection_can_never_match_on_marker_text():
+    """vikunja#463's duplicate check must not start firing on the footer this build adds.
+
+    Markers live in `description`, and once they do, a check that consulted description
+    text would report every marked ticket as a probable duplicate of every other. The
+    symptom would be a plausible-looking false duplicate rather than an error, which is
+    why this is asserted rather than reasoned about.
+
+    The guarantee is structural: `build_filter` only ever emits `title like`. Asserted on
+    the generated filter — not on a result set — so it holds regardless of corpus.
+    """
+    from vikunja_mcp.contrib import duplicate_check
+
+    terms = duplicate_check.extract_terms("vikunja-mcp marker idem provenance footer")
+    generated = duplicate_check.build_filter(7, terms)
+
+    assert "description" not in generated
+    assert generated.count("like") == generated.count("title like")
+
+
+async def test_the_duplicate_hook_searches_the_title_not_the_marked_description():
+    """The other half of the guarantee: what the hook *feeds* the search.
+
+    `extract_terms` will happily tokenise anything handed to it — including a marker key,
+    which scores highly because it is long and hyphenated. So the protection is not that
+    extraction ignores markers; it is that the hook only ever passes `title`. Asserted at
+    that seam, because that is the line an innocent-looking refactor would change.
+    """
+    from vikunja_mcp.contrib import duplicate_check
+
+    seen: dict = {}
+
+    async def _capture(project_id, title, limit=5):
+        seen["project_id"], seen["title"] = project_id, title
+        return []
+
+    original = duplicate_check.find_possible_duplicates
+    duplicate_check.find_possible_duplicates = _capture
+    try:
+        await duplicate_check.before_task_create(
+            {
+                "project_id": 7,
+                "title": "An ordinary ticket title",
+                "description": markers.append("<p>body</p>", "idem", "provenance-key-1"),
+            }
+        )
+    finally:
+        duplicate_check.find_possible_duplicates = original
+
+    assert seen["title"] == "An ordinary ticket title"
+    assert "provenance-key-1" not in str(seen)

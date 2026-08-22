@@ -516,6 +516,22 @@ def _staleness(updated: Any) -> dict[str, Any]:
     return {"days_since_update": days, "stale": days >= get_settings().stale_after_days}
 
 
+def _linked_refs(task: dict[str, Any]) -> dict[str, Any]:
+    """``{"linked_refs": [...]}`` when the task carries backlinks, otherwise ``{}``.
+
+    Derived here, in the projection, because this runs *before* the marker strip hook —
+    the description still carries the footer at this point. Reverse the order and the
+    parse finds nothing.
+
+    Omitted rather than set to ``[]`` when there are none, matching the convention
+    ``possible_duplicates`` established: an empty list reads as "checked, and this ticket
+    genuinely has no linked code", which is a stronger claim than "no marker was present"
+    and is indistinguishable from a ticket predating the feature.
+    """
+    refs = markers.linked_refs(task.get("description"))
+    return {"linked_refs": refs} if refs else {}
+
+
 def _with_staleness(task: dict[str, Any]) -> dict[str, Any]:
     """The verbose path's projection: the untouched body plus the two derived fields.
 
@@ -527,7 +543,7 @@ def _with_staleness(task: dict[str, Any]) -> dict[str, Any]:
     reference to something the caller did not ask about, and dating it invites reading a
     staleness verdict on a ticket that was never fetched.
     """
-    return {**task, **_staleness(task.get("updated"))}
+    return {**task, **_staleness(task.get("updated")), **_linked_refs(task)}
 
 
 def _task_ref(task: dict[str, Any]) -> dict[str, Any]:
@@ -599,6 +615,7 @@ def _compact_task(task: dict[str, Any]) -> dict[str, Any]:
     for name, count_key in _COUNTED_COLLECTIONS.items():
         out[count_key] = _count(task.get(name))
     out.update(_staleness(task.get("updated")))
+    out.update(_linked_refs(task))
     return out
 
 
@@ -1339,6 +1356,7 @@ _TASK_REF_TOOLS = (
     "task_relation_add",
     "task_relation_remove",
     "task_reminders_set",
+    "task_link_commit",
     "attachment_list",
     "attachment_upload",
     "attachment_delete",
@@ -1365,6 +1383,7 @@ _INDEX_STRIPPED_TOOLS = (
     "task_reminders_set",
     "tasks_bulk_update",
     "task_bucket_move",
+    "task_link_commit",
 )
 
 # Mutating tools audited when VIKUNJA_AUDIT_LOG=1 — the set contrib/audit_log.py's own
@@ -1492,6 +1511,79 @@ async def task_update(
         percent_done=percent_done,
     )
     return await _apply_task_update(task_id, caller_token(), changes)
+
+
+def _validate_ref_url(ref_url: str) -> None:
+    """Refuse a backlink URL that is not a plausible https address. ``ValueError``.
+
+    This is **stored-link injection**, not SSRF: nothing here fetches the URL. What
+    happens to it is that it is written into a ticket body a human later clicks, so the
+    guard that matters is on the scheme rather than on the host's address range — this
+    deliberately does *not* reuse ``webhook_create``'s internal-host checks, because a
+    backlink to an internal Gitea is exactly the normal case on forge.
+
+    ``https`` only. ``javascript:`` and ``data:`` are the obvious attacks; plain ``http``
+    is refused too, because a backlink is written once and clicked for years, and there is
+    no forge host that needs it. A hostname must contain a dot, which rejects the
+    ``https://localhost`` class without pretending to validate that the host resolves.
+
+    Whitespace is refused because the marker line is space-separated and a space would
+    forge a sibling token.
+    """
+    if not isinstance(ref_url, str) or not ref_url:
+        raise ValueError("ref_url is required")
+    if not markers.value_is_storable(ref_url):
+        raise ValueError(
+            f"ref_url may not contain whitespace or '<>' — the marker line is "
+            f"space-separated, so a space would forge a second entry. Got {ref_url!r}"
+        )
+    parsed = urlparse(ref_url)
+    if parsed.scheme != "https":
+        raise ValueError(
+            f"ref_url must be https (a backlink is stored once and clicked for years, and "
+            f"javascript:/data: links are stored-link injection). Got scheme "
+            f"{parsed.scheme or '<none>'!r}"
+        )
+    host = parsed.hostname or ""
+    if "." not in host:
+        raise ValueError(f"ref_url needs a plausible hostname; got {host or '<none>'!r}")
+
+
+@tool
+async def task_link_commit(task_id: int | str, ref_type: str, ref_url: str) -> dict:
+    """Record a commit, PR or branch backlink on a ticket.
+
+    `task_id` accepts the global id (`482`), the ticket number (`"#463"`), or the
+    `"#463 (id 482)"` form forge tickets are written in — an agent linking a commit has
+    the ticket number in hand, not the global id.
+
+    `ref_type` is a short lowercase label (`commit`, `pr`, `mr`, `branch`, `tag`).
+    `ref_url` must be an https URL with a real hostname; `javascript:`/`data:`/`http:`
+    are refused. Nothing fetches the URL — this is not the `webhook_create` SSRF case —
+    but a human clicks it, so it must not be a stored-link injection.
+
+    Links **accumulate**: a second call adds to the ticket rather than replacing what is
+    there, and re-linking the same `ref_type` + `ref_url` is a no-op. Read them back as
+    the structured `linked_refs` field on `task_get`, not by parsing the description.
+
+    Deliberately **not** in scope: transitioning the ticket's state. Closing a ticket
+    because a PR merged guesses at intent, and guessing wrong closes work that is not
+    done. This records the link; a human or an explicit `task_update` closes the ticket.
+    """
+    # Both refusals happen before any upstream call, so a malformed link costs nothing.
+    _validate_ref_url(ref_url)
+    value = markers.encode_ref(ref_type, ref_url)
+
+    token = caller_token()
+    # Two GETs: one to read the description we are appending to, and one inside
+    # _apply_task_update. Worth it to reuse the audited full-replace merge (vikunja#173)
+    # rather than restate it here — this tool is called once per shipped change, not in a
+    # loop, so the extra read is not worth a second copy of that logic.
+    current = await request("GET", f"/tasks/{task_id}", token)
+    description = current.get("description") if isinstance(current, dict) else None
+    return await _apply_task_update(
+        task_id, token, {"description": markers.append(description, "ref", value)}
+    )
 
 
 @tool
