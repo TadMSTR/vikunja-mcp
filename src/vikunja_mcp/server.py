@@ -1231,6 +1231,39 @@ def _register_audit_log_if_enabled() -> None:
     register_audit_log(_AUDITED_TOOLS, logger=FileAuditLogger(audit_dir))
 
 
+def _register_duplicate_check_if_enabled() -> None:
+    """Env-gated wiring for contrib/duplicate_check.py (vikunja#463, id 482).
+
+    Same wiring shape as the audit log — ``contrib/`` is not imported by default, and the
+    registration lives here where this repo's tests and code review can see it — but the
+    **default is on**, which is the opposite of the audit log's.
+
+    The reasoning is the ticket's: a feature that must be opted into will not be, and the
+    correction it enforces ("consolidate, don't re-file") is precisely the kind that erodes
+    under context pressure. That argument was only accepted because the cost was measured
+    rather than assumed. Run over all 470 tickets in forge's tracker on 2026-08-22, each
+    title fed back through the detector: **19 produced a warning (4.0%), 0 errored**, and by
+    inspection about twelve of the nineteen are genuine — including three exact-title pairs,
+    one triplicate, and one ticket a human had already annotated "[duplicate]". So 96% of
+    creates see nothing, and the ones that do are mostly right.
+
+    Set ``VIKUNJA_DUPLICATE_CHECK=0`` to turn it off. The cost when on is one extra upstream
+    search per ``task_create``; any failure of that search degrades to no warning and never
+    to a failed create (see ``contrib/duplicate_check.py``).
+
+    Precision depends on how a tracker writes its titles, so an adopter whose corpus looks
+    nothing like forge's should re-measure before trusting the number above.
+    """
+    if os.environ.get("VIKUNJA_DUPLICATE_CHECK", "1").strip().lower() not in ("1", "true", "yes"):
+        return
+    if any(getattr(h, "is_duplicate_check_hook", False) for h in before_handlers("task_create")):
+        return  # already wired — register_builtin_hooks() can be called more than once
+
+    from .contrib.duplicate_check import register_duplicate_check
+
+    register_duplicate_check()
+
+
 def register_builtin_hooks() -> None:
     """Register the hooks this server ships with. Idempotent.
 
@@ -1246,6 +1279,7 @@ def register_builtin_hooks() -> None:
         if _resolve_task_ref_kwarg not in before_handlers(name):
             register_before(name, _resolve_task_ref_kwarg)
     _register_audit_log_if_enabled()
+    _register_duplicate_check_if_enabled()
 
 
 register_builtin_hooks()
