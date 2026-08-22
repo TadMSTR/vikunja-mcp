@@ -40,6 +40,17 @@ field on its response.
   (builds and deletes its own fixtures), skipped unless `VIKUNJA_CANARY_URL` and
   `VIKUNJA_CANARY_TOKEN` are set, and run weekly in CI against `vikunja/vikunja:latest`.
 
+### Security
+- **`backlog_summary`'s caller-supplied `filter` can no longer escape the tool's own scope.**
+  Every predicate is now composed into its own parenthesised group. Previously they were
+  joined with a bare `&&`, and because Vikunja evaluates filter expressions strictly
+  left to right, a caller `filter` containing a top-level `||` broke out of the predicates
+  composed before it — `done = false && id = 999999 || done = true` returns 264 *done*
+  tasks, having escaped the `done = false` it opens with. Not privilege escalation (the
+  caller already reaches whatever its own token permits), but the tool would report counts
+  for one scope while `scope.filter` claimed another. Found by the build audit; the
+  reproduction, the fix, and the left-to-right evaluation order are all pinned by tests.
+
 ### Notes
 - **`like` case-sensitivity depends on the database backend, not on Vikunja.** Measured on
   two instances both running v2.3.0: case-sensitive on Postgres, case-insensitive on
