@@ -41,6 +41,13 @@ A parser anchored on the written form matches none of a human-edited ticket's ma
 Nothing would raise: strip-on-read would leak markers into agent-visible text and
 ``linked_refs`` would parse back empty, both silently. Hence :data:`_MARKER_BLOCK` treats
 all whitespace around the rule as optional, and the tests assert every form.
+
+**A marker is not authenticated.** It is ordinary text in a field every
+``task_create``/``task_update`` caller can write, so a well-formed footer at the end of a
+description is indistinguishable from one this module wrote. Two constraints bound the
+consequences rather than the forgery — the footer must be the *trailing* block, and
+``server._linked_refs`` re-validates every ``ref`` URL on read. See :data:`_MARKER_BLOCK`
+for what is accepted and why, and ``docs/markers.md`` for the whole picture.
 """
 
 from __future__ import annotations
@@ -51,15 +58,6 @@ import re
 #: means a foreign tool's footer is never mistaken for one of ours.
 PREFIX = "vikunja-mcp:"
 
-# A marker paragraph, with the rule that introduces it and any whitespace around both.
-#
-# `<p>` must *start* with the prefix (after optional whitespace): a sentence mentioning the
-# format mid-prose is content, not metadata. Anchoring on a bare `<p>` is also what keeps
-# quoted examples out — markdown renders a fenced block to `<pre><code>`, which never
-# matches here, so a ticket documenting this feature does not parse as using it.
-#
-# The payload cannot contain `<`, which is what stops the match running past `</p>` into
-# the rest of the body.
 #: Whitespace between the rule and the marker paragraph. **Bounded on purpose.**
 #:
 #: A description is attacker-influenced text that every read path runs this pattern over,
@@ -94,13 +92,23 @@ _GAP = r"\s{0,16}"
 #: pasted into a body) versus a ticket *using* it. All three stored forms put the footer
 #: last, so this costs nothing real.
 #:
-#: It is **not** authentication, and must not be described as such: a caller who puts a
-#: well-formed footer at the *end* of a description still gets a real marker. What the
-#: build does about that is constrain the consequences rather than the forgery —
-#: ``server._linked_refs`` re-validates every ``ref`` URL on read so a forged entry cannot
-#: smuggle a scheme the write path refuses, and ``idem`` is documented as trust-on-write.
-#: There is no server-side secret to sign with, and adding one would defeat the point of a
-#: footer a human can read and delete.
+#: SECURITY[accepted]: a caller who writes a well-formed footer at the *end* of a
+#: description gets a real marker, so an `idem=` key can be planted to suppress a future
+#: idempotent create in that project and return an unrelated ticket. Accepted by Ted
+#: 2026-08-22 on the audit's HIGH finding. Bounded by the trust boundary that already
+#: exists — forging it requires `task_create`/`task_update` on the target project, which
+#: the caller has anyway — and not closable without a server-side secret to sign with.
+#: This server is deliberately stateless with per-caller tokens, so a shared secret would
+#: not bind identity, and signing would defeat the point of a footer a human can read and
+#: delete. The `ref` half of the same finding IS closed: `server._linked_refs` re-validates
+#: every URL on read. Revisit if a marker ever carries a capability rather than a hint.
+#: Audit: 2026-08-22/vikunja-mcp-ticket-metadata-2026-08.
+#:
+#: Two further properties the pattern carries, both load-bearing: ``<p>`` must *start* with
+#: the prefix, so a sentence mentioning the format mid-prose stays content rather than
+#: metadata; and the payload cannot contain ``<``, which is what stops a match running past
+#: ``</p>`` into the rest of the body. Anchoring on a bare ``<p>`` is also what keeps quoted
+#: examples out — markdown renders a fenced block to ``<pre><code>``, which never matches.
 _MARKER_BLOCK = re.compile(
     _GAP
     + r"(?:<hr"
