@@ -285,7 +285,9 @@ nothing like that, measure before trusting the number.
 Matching is lexical and title-scoped: the most distinctive terms of the title must *all*
 appear in a candidate's title. Descriptions are not searched, deliberately — on a corpus
 where tickets quote each other, a description match usually means "discusses", not
-"duplicates".
+"duplicates". This is narrower than `task_search`, which does match against descriptions —
+a `task_search` hit on an existing ticket is not by itself evidence that ticket is a
+duplicate.
 
 ## Configuration
 
