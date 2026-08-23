@@ -31,7 +31,7 @@ are decisions you have to make rather than defaults you can accept: `VIKUNJA_URL
 
 | Variable | Default in image | Notes |
 |---|---|---|
-| `VIKUNJA_URL` | *(none — refuses to start)* | Base URL of your Vikunja, **without** the `/api/v1` suffix. |
+| `VIKUNJA_URL` | *(none — refuses to start)* | Base URL of your Vikunja, **without** the `/api/v2` suffix. Requires Vikunja **2.4.0 or newer**. |
 | `VIKUNJA_HOST` | `0.0.0.0` | Overridden from the repo default of `127.0.0.1`. See below. |
 | `VIKUNJA_PORT` | `8501` | Change this and the `ports` mapping together. |
 | `VIKUNJA_TRANSPORT` | `http` | Leave it. A container is only useful over HTTP. |

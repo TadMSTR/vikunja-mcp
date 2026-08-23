@@ -5,15 +5,24 @@ teams, sharing, buckets/kanban, views, assignees, relations, reminders, attachme
 bulk). Every tool resolves the caller's own Vikunja token per request (see auth.py) and
 forwards it upstream, so Vikunja sees the acting agent, not a shared service account.
 
-Endpoint coverage is *derived* from the live Vikunja Swagger spec (/api/v1/docs.json) but
-*verified* against the live router, because swagger is not trustworthy for verbs on this
-API. Vikunja's REST idiom is unusual to begin with: **PUT creates, POST updates**.
+Endpoint coverage is *derived* from the live Vikunja OpenAPI spec (/api/v2/openapi.json)
+but *verified* against the live router. v2's spec is reflected from Go types at runtime
+rather than assembled from build-time annotations, so it is a far better oracle than v1's
+swagger was — but the router stays the ground truth, because a spec that agrees with
+itself is not evidence about what the server routes.
 
-Known divergence — do not "correct" it back. Swagger documents ``PUT /labels/{id}`` and no
-``POST /labels/{id}``; the router accepts ``DELETE, GET, POST`` and rejects ``PUT``. Taking
-swagger at its word is what shipped the v0.2.1 ``label_update`` bug. ``scripts/verify-routes.py``
-is the ground truth: it sends an unroutable verb to every implemented path and asserts the
-method appears in Echo's ``Allow:`` header. Run it after changing any verb or path.
+**Verbs are conventional on v2 and were not on v1.** v1's idiom was PUT-creates /
+POST-updates; v2 is POST creates (201), PUT replaces, PATCH merges, DELETE returns 204
+empty. Every call site was re-checked individually during the port rather than swapped in
+bulk, because the two literals trade places and a global replace corrupts whichever set it
+is not aimed at. One route does *not* follow the pattern: ``POST /teams/{team}/members/
+{user}/admin`` is a toggle, not an update, and stays POST.
+
+``scripts/verify-routes.py`` is what enforces this: it sends an unroutable verb to every
+implemented path and asserts the method appears in Echo's ``Allow:`` header. That probe
+answers identically on v2 (checked 2026-08-23). Run it after changing any verb or path —
+it is the check that would have caught the v0.2.1 ``label_update`` bug, where swagger
+documented ``PUT /labels/{id}`` and the router accepted only ``POST``.
 
 Every tool is wrapped by :func:`instrument`, which fires the pre/post extension hooks
 (see ``hooks.py``) and records telemetry (see ``telemetry.py``) around the call.
@@ -142,9 +151,9 @@ def _drop_none(**fields: Any) -> dict[str, Any]:
 
     Vikunja's *generic* update endpoints (projects, labels, teams, filters, views,
     buckets) only write the fields present in the posted object, so omitting a field
-    leaves it untouched. NOTE: the **task** update endpoint (`POST /tasks/{id}`) is the
-    exception — it is a full replace. Task writes must not rely on this helper alone;
-    see ``_apply_task_update``.
+    leaves it untouched. The **task** endpoint used to be the exception — v1's
+    ``POST /tasks/{id}`` was a full replace, which is why ``_apply_task_update`` existed —
+    but v2 offers ``PATCH`` and task updates now go through it like everything else.
     """
     return {k: v for k, v in fields.items() if v is not None}
 
@@ -191,6 +200,22 @@ def _md_to_html(text: str | None) -> str | None:
 
     The conversion is idempotent — re-rendering HTML read back from `task_get` is safe.
 
+    **Why this is not delegated to Vikunja on v2.** v2 can do the conversion server-side:
+    `?format=markdown` (or `X-Vikunja-Format: markdown` on PATCH) accepts GFM and converts
+    it to HTML on write. Tempting, and not taken, because conversion and sanitisation are
+    not separable here. `nh3.clean()` below is a security control over the HTML that ends
+    up stored, and it can only run on HTML this process produced. Send Markdown and
+    Vikunja stores whatever *its* converter emits, sanitised to whatever policy it has —
+    which the spec does not state, and "the output looked fine" is not a demonstration of
+    equivalence. Delegating the conversion therefore does not merely move the conversion;
+    it removes the sanitiser from the path. So the conversion stays local, every write
+    sends HTML, and `format` is not set on any call.
+
+    That also sidesteps the lossy-round-trip trap the same spec section describes:
+    Markdown cannot express every HTML construct, so a field round-tripped through
+    `format=markdown` is stored as the degraded conversion — a little worse on each pass.
+    Nothing here round-trips a description it did not author.
+
     # SECURITY[control]: Python-Markdown passes embedded raw HTML through unmodified (no
     # safe_mode since 3.0) — `<script>`, `onerror=`, etc. would otherwise be stored
     # verbatim and execute in whoever's browser next opens the task in Vikunja's TipTap
@@ -208,40 +233,36 @@ def _md_to_html(text: str | None) -> str | None:
     return nh3.clean(html)
 
 
-# Collections Vikunja returns on a task but stores in their own tables, not as task
-# columns. They are not affected by the full-replace behaviour of POST /tasks/{id}, so
-# read-merge-write does not need to echo them back — and echoing `related_tasks` is
-# actively expensive, because Vikunja inlines the *entire* body of every related task
-# (one task_search over a well-linked ticket returned 155k characters). Dropped from the
-# merged body before re-posting; verified by probe that relations, labels and assignees
-# all survive their omission.
-_READ_ONLY_TASK_COLLECTIONS = ("related_tasks", "attachments", "reactions")
-
-
 async def _apply_task_update(task_id: int, token: str, changes: dict[str, Any]) -> dict:
-    """Merge ``changes`` over the current task and POST the full object.
+    """Write ``changes`` to a task and leave every other column alone.
 
-    Vikunja's ``POST /tasks/{id}`` is a **full replace**: any column the body omits is
-    reset to its zero value. Unlike the generic project/label/etc. update endpoints, a
-    partial POST here silently wipes untouched fields (ticket #173 / task 183). To honor
-    the partial-update contract, fetch the task, overlay the caller's changed fields, and
-    re-post the whole object so untouched columns survive.
+    One ``PATCH`` with a JSON Merge Patch body: fields present in ``changes`` are written,
+    fields absent from it are untouched. That is the whole implementation, and it is worth
+    saying what it replaced.
+
+    On v1 this was a read-merge-write. ``POST /tasks/{id}`` was a **full replace** — any
+    column the body omitted was reset to its zero value — so a partial update had to fetch
+    the task, overlay the caller's fields and re-post the entire object (ticket #173 /
+    task 183). That cost a request per update, needed a list of read-only collections to
+    strip back out of the merged body (``related_tasks`` alone inlines the full body of
+    every related task; one probe returned 155k characters), and carried an accepted
+    TOCTOU window in which a concurrent writer's change was silently overwritten by our
+    stale re-post.
+
+    v2's ``PATCH`` removes all three at once. The window is gone because there is no read
+    to go stale, not because it was narrowed — so the ``SECURITY[accepted]`` marker that
+    used to sit here is retired rather than carried forward.
+
+    **Do not reintroduce a full-replace path**, dormant or otherwise. A disabled one is
+    how the bug class comes back; ``PUT /tasks/{id}`` exists on v2 and does exactly what
+    v1's POST did.
     """
-    # SECURITY[accepted]: GET-then-POST TOCTOU window — a concurrent writer's change to
-    # this task between our GET and re-POST is silently overwritten by our stale re-post.
-    # Accepted given forge's low-concurrency, agent-driven, per-agent-token write pattern;
-    # no locking/ETag/version check added. Revisit if forge moves to higher-concurrency
-    # multi-agent writes on shared tasks, or Vikunja exposes cheap If-Match support.
-    # Audit: 2026-07-19/vikunja-mcp-task-update-full-replace-2026-07.
     if not changes:
         return await request("GET", f"/tasks/{task_id}", token)
-    current = await request("GET", f"/tasks/{task_id}", token)
-    if not isinstance(current, dict):
-        return await request("POST", f"/tasks/{task_id}", token, json=changes)
-    for heavy in _READ_ONLY_TASK_COLLECTIONS:
-        current.pop(heavy, None)
-    current.update(changes)
-    return await request("POST", f"/tasks/{task_id}", token, json=current)
+    # httpx sends this as application/json. Vikunja accepts that for a merge patch —
+    # verified live on 2026-08-23 against v2.5.0, including that unnamed fields survive —
+    # so the application/merge-patch+json content type the spec also lists is not needed.
+    return await request("PATCH", f"/tasks/{task_id}", token, json=changes)
 
 
 # Base64 attachment size ceiling — reject before decoding a huge blob into memory (F-04).
@@ -361,7 +382,7 @@ async def project_list(
     Capped at `per_page` (default 50). When more pages exist the result becomes
     `{"items": [...], "pagination": {"truncated": true, ...}}` — raise `page` to read on.
     """
-    params = {"page": page, "per_page": per_page, "s": search or None, "is_archived": is_archived}
+    params = {"page": page, "per_page": per_page, "q": search or None, "is_archived": is_archived}
     return await request("GET", "/projects", caller_token(), params=params)
 
 
@@ -385,7 +406,7 @@ async def project_create(
         parent_project_id=parent_project_id,
         hex_color=hex_color or None,
     )
-    return await request("PUT", "/projects", caller_token(), json=body)
+    return await request("POST", "/projects", caller_token(), json=body)
 
 
 @tool
@@ -403,7 +424,7 @@ async def project_update(
         hex_color=hex_color,
         is_archived=is_archived,
     )
-    return await request("POST", f"/projects/{project_id}", caller_token(), json=body)
+    return await request("PUT", f"/projects/{project_id}", caller_token(), json=body)
 
 
 @tool
@@ -727,14 +748,20 @@ async def task_search(query: str, page: int = 1, per_page: int = 50, verbose: bo
     where tickets quote each other, most hits are tickets that merely *discuss* the term.
     Use `task_list(filter='title like "%term%"')` when you need title-scoped matching.
 
-    Note this searches with Vikunja's `s` parameter, which cannot be combined with
+    Note this searches with Vikunja's `q` parameter, which cannot be combined with
     `filter`. Use `task_list` when you need a filter.
+
+    `q` is tokenised, and the tokens are matched independently: a hyphenated term like
+    `vikunja-mcp` searches for `vikunja` OR `mcp` and matched 447 of 517 tasks on forge,
+    where `backrest` matched 13. Quote or narrow the term when a hyphen would broaden it
+    past usefulness, and read a large hit count as "the query was broad", not "the corpus
+    is full of this".
 
     Capped at `per_page` (default 50). When more pages exist the result becomes
     `{"items": [...], "pagination": {"truncated": true, ...}}` — raise `page` to read on.
     A "find every ticket about X" question is not answered by page 1 alone.
     """
-    params = {"s": query, "page": page, "per_page": per_page}
+    params = {"q": query, "page": page, "per_page": per_page}
     result = await request("GET", "/tasks", caller_token(), params=params)
     return _project(result, _with_staleness if verbose else _summarise_task)
 
@@ -873,7 +900,7 @@ async def task_create(
         priority=priority,
         due_date=due_date or None,
     )
-    result = await request("PUT", f"/projects/{project_id}/tasks", caller_token(), json=body)
+    result = await request("POST", f"/projects/{project_id}/tasks", caller_token(), json=body)
     if degraded and isinstance(result, dict):
         result["idempotency_degraded"] = True
     return result
@@ -930,41 +957,49 @@ def _compose(*predicates: str) -> str:
     return " && ".join(f"({p})" for p in predicates if p)
 
 
+# Page number used by the counting query. Any page past the end of the result set returns
+# an empty `items` with the same `total`, so the count costs a ~150-byte envelope instead
+# of a ~4 KB task row — measured live on v2.5.0 against a 514-task project, where the
+# 37-request summary moved 5 KB rather than 109 KB.
+#
+# Chosen as "beyond any plausible result set" rather than computed, since knowing the last
+# page would require the count this query exists to obtain. Every failure mode is safe:
+# a Vikunja that clamped the page to the last one, or ignored it, would return a row and
+# cost the bytes back, and `total` — the number actually read — is unaffected either way.
+# Pinned in `tests/test_filter_canary.py` so an upgrade that changed it is visible.
+_COUNT_PAGE = 1_000_000
+
+
 async def _count_matching(filter_expr: str) -> int:
-    """The exact number of tasks matching ``filter_expr``, in one one-row request.
+    """The exact number of tasks matching ``filter_expr``, in one row-free request.
 
-    Rests on an undocumented Vikunja behaviour, measured rather than read: with
-    ``per_page=1`` the ``x-pagination-total-pages`` header *is* the match count, because
-    one row per page makes pages and rows the same thing. Confirmed non-ceiling on an
-    exact multiple (49 items at ``per_page=7`` reports 7 pages, not 8) and confirmed
-    against live v2.3.0 on 2026-08-22 in all three regimes this has to survive:
+    The count comes from the response envelope's ``total``, which v2 reports directly.
+    ``per_page`` and ``page`` only bound the transfer (see ``_COUNT_PAGE``); neither
+    produces the number, which is why the envelope is read raw (``unwrap_list=False``).
+    Reading it through the reshaped form would be wrong here in the one case that matters:
+    a single-match bucket is one page, so the reshape hands back the bare row list — and
+    on a past-the-end page that list is empty, making every 1-match bucket report 0.
 
-    - **0 matches** — header is ``0``, and ``client.request`` returns the bare ``[]``
-      because it only builds an envelope above one page. Counted as ``len([]) == 0``.
-    - **exactly 1** — header is ``1``, still no envelope, bare one-item list.
-    - **N > 1** — the envelope, where ``pagination.total_pages`` is the count.
-
-    The 0 and 1 cases are the ones worth stating: they never reach the envelope branch, so
-    an implementation that only read ``pagination`` would report 0 for both and be wrong on
-    every bucket holding exactly one task.
-
-    Being undocumented is why `test_filter_canary.py` exists — a Vikunja upgrade that
-    changed this would make every count silently wrong rather than fail.
+    On v1 this was an inference rather than a read: that API exposed no total-item count,
+    so the count was taken from ``x-pagination-total-pages`` at ``per_page=1``, where one
+    row per page makes pages and rows the same thing. It worked, and it was undocumented,
+    and it made three distinct response shapes (bare ``[]``, bare one-item list, envelope)
+    all have to be handled to avoid reporting 0 for every bucket holding exactly one task.
+    v2 replaced all of that with a number, so the shape handling goes with it.
     """
     result = await request(
         "GET",
         "/tasks",
         caller_token(),
-        params={"filter": filter_expr or None, "per_page": 1, "page": 1},
+        params={"filter": filter_expr or None, "per_page": 1, "page": _COUNT_PAGE},
+        unwrap_list=False,
     )
-    if isinstance(result, dict) and "pagination" in result:
-        try:
-            return int(result["pagination"].get("total_pages", 0))
-        except (TypeError, ValueError):
-            return 0
-    if isinstance(result, list):
-        return len(result)
-    return 0
+    if not isinstance(result, dict):
+        return 0
+    try:
+        return int(result.get("total", 0))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _unwrap_items(result: Any) -> list[Any]:
@@ -989,10 +1024,10 @@ async def backlog_summary(
     `task_list` using the same filter.
 
     This is cheap by construction. Each bucket is one request that asks for a single row
-    and reads the match count off the pagination header, so a summary of a 470-task
-    tracker moves a few hundred bytes rather than several megabytes. The `calls` field in
-    the response reports exactly how many upstream requests it cost, so the price is
-    visible to whoever is paying it.
+    and reads the match count off the response envelope's `total`, so a summary of a
+    500-task tracker moves a few hundred bytes rather than several megabytes. The `calls`
+    field in the response reports exactly how many upstream requests it cost, so the price
+    is visible to whoever is paying it.
 
     `project_id` scopes the summary to one project; omit it to summarise everything you
     can see. `filter` is any additional Vikunja filter expression and is composed into
@@ -1205,7 +1240,7 @@ async def _strip_task_markers(result: Any) -> Any:
 # The Vikunja release the `index` filter below was verified against. Named in the error
 # message when a resolve fails upstream, because that filter is *undocumented* (see
 # `_resolve_index`) and an upgrade dropping it is the most likely cause.
-_VERIFIED_VIKUNJA_VERSION = "v2.3.0"
+_VERIFIED_VIKUNJA_VERSION = "v2.5.0"
 
 # The "#456 (id 475)" form that forge tickets, CLAUDE.md files and Matrix messages are
 # written in. When the global id is spelled out, take it and skip the API call entirely.
@@ -1236,6 +1271,7 @@ async def _resolve_index(index: int, token: str) -> int:
     One filtered call, no cache. ``index`` is a first-class filterable field — probed live
     with a negative control (``bogusfield = 1`` returns 400, so Vikunja rejects unknown
     filter fields rather than ignoring them, which proves the filter is genuinely applied).
+    Both halves re-verified against ``/api/v2`` on Vikunja v2.5.0, 2026-08-23.
 
     **This filter is undocumented.** Vikunja's published filter-field list names twelve
     fields and ``index`` is not among them; it works anyway on the version recorded in
@@ -1243,6 +1279,20 @@ async def _resolve_index(index: int, token: str) -> int:
     direction (``bucket_id`` works, ``position`` 500s). That is an accepted dependency, but
     it must fail loudly — hence the re-raise below naming the verified version, and the live
     guard test in ``tests/test_task_refs.py``.
+
+    **Why not v2's documented route.** v2 ships ``GET /projects/{project}/tasks/by-index/
+    {index}`` (operationId ``tasks-read-by-index``), which is exactly this lookup, documented.
+    It is not used, and the reason is authorization rather than taste: that route is
+    collected for API-token permissions under group ``projects``, permission
+    ``tasks_by_index`` (upstream ``pkg/models/api_routes.go``), and no token issued before
+    v2 carries it. Every such token gets ``401 invalid token`` — confirmed live on v2.5.0
+    against three indices, including a task the same token had just created, while every
+    other route the server uses returned 200. This server forwards the *caller's* token
+    verbatim (see ``auth.py``), so it cannot grant itself the permission; adopting the route
+    would break ``#N`` resolution for every existing deployment until each token was
+    re-issued. There is deliberately **no fallback between the two** — a fallback would fire
+    exactly when a loud error is wanted. Revisit as a single switch once tokens carry the
+    permission; tracked in vikunja#514.
 
     Raises:
         ValueError: no task carries that index, or more than one does.
@@ -1531,8 +1581,8 @@ async def task_update(
 ) -> dict:
     """Update a task. Only the fields you pass change. Set `done=true` to complete it.
 
-    Implemented as read-merge-write: Vikunja's task endpoint is a full replace, so we
-    fetch the task and overlay your fields before posting (see ``_apply_task_update``).
+    One `PATCH`, no read first: the fields you pass are written and every other column is
+    left alone by the server (see ``_apply_task_update``).
     """
     changes = _drop_none(
         title=title,
@@ -1622,10 +1672,9 @@ async def task_link_commit(task_id: int | str, ref_type: str, ref_url: str) -> d
     value = markers.encode_ref(ref_type, ref_url)
 
     token = caller_token()
-    # Two GETs: one to read the description we are appending to, and one inside
-    # _apply_task_update. Worth it to reuse the audited full-replace merge (vikunja#173)
-    # rather than restate it here — this tool is called once per shipped change, not in a
-    # loop, so the extra read is not worth a second copy of that logic.
+    # One GET, to read the description this appends to — an append needs the current text
+    # and no endpoint offers that server-side. The second GET this used to cost is gone
+    # with the read-merge-write path (_apply_task_update is now a single PATCH).
     current = await request("GET", f"/tasks/{task_id}", token)
     description = current.get("description") if isinstance(current, dict) else None
     return await _apply_task_update(
@@ -1648,19 +1697,23 @@ async def tasks_bulk_update(task_ids: list[int], values: dict) -> dict:
     `values` is what makes that column eligible to be written, and columns you do not name
     are left alone.
 
-    This is the bulk counterpart to ``_apply_task_update``: both exist because Vikunja's
-    task writes are full replaces by default. The single-task path solves it with
-    read-merge-write; the bulk path solves it with the ``fields`` array below, which does
-    the same job server-side without N GETs and N TOCTOU windows.
+    This is the bulk counterpart to ``_apply_task_update``. The single-task path is a
+    ``PATCH``; the bulk path has no ``PATCH`` to use, so it names the columns explicitly
+    in ``fields`` — same outcome, server-side, without N requests.
     """
-    # Vikunja's POST /tasks/bulk is a full replace *per task*: without `fields`, every
-    # column absent from `values` is reset to its zero value on every task in the list
-    # (ticket #333 / task 347 — same root cause as #173, verified destroying description,
-    # priority and percent_done on a live probe). `models.BulkTask.fields` restricts the
-    # write to the named columns. It is real but undocumented in swagger, so the probe
-    # recorded in the #333 ticket is its specification.
+    # `PUT /tasks/bulk` is a full replace *per task*: without `fields`, every column absent
+    # from `values` is reset to its zero value on every task in the list (ticket #333 /
+    # task 347 — same root cause as #173, verified destroying description, priority and
+    # percent_done on a live probe). `fields` restricts the write to the named columns.
+    #
+    # This is the one place the port did NOT gain a PATCH: v2 routes only `PUT` on
+    # /tasks/bulk (confirmed against the live router — `Allow: OPTIONS, PUT`). What it
+    # gained instead is documentation. v1's swagger did not mention `fields` at all, so
+    # the probe in #333 was its only specification; v2's spec now states outright that
+    # only the named fields are written and the rest of each task is left untouched.
+    # The undocumented dependency is discharged, not worked around.
     body = {"task_ids": task_ids, "fields": list(values.keys()), "values": values}
-    return await request("POST", "/tasks/bulk", caller_token(), json=body)
+    return await request("PUT", "/tasks/bulk", caller_token(), json=body)
 
 
 # ===========================================================================
@@ -1675,7 +1728,7 @@ async def label_list(page: int = 1, per_page: int = 50, search: str = "") -> Any
     Capped at `per_page` (default 50). When more pages exist the result becomes
     `{"items": [...], "pagination": {"truncated": true, ...}}` — raise `page` to read on.
     """
-    params = {"page": page, "per_page": per_page, "s": search or None}
+    params = {"page": page, "per_page": per_page, "q": search or None}
     return await request("GET", "/labels", caller_token(), params=params)
 
 
@@ -1689,7 +1742,7 @@ async def label_get(label_id: int) -> dict:
 async def label_create(title: str, description: str = "", hex_color: str = "") -> dict:
     """Create a label. `title` is required."""
     body = _drop_none(title=title, description=description or None, hex_color=hex_color or None)
-    return await request("PUT", "/labels", caller_token(), json=body)
+    return await request("POST", "/labels", caller_token(), json=body)
 
 
 @tool
@@ -1701,7 +1754,7 @@ async def label_update(
 ) -> dict:
     """Update a label. Only the fields you pass change."""
     body = _drop_none(title=title, description=description, hex_color=hex_color)
-    return await request("POST", f"/labels/{label_id}", caller_token(), json=body)
+    return await request("PUT", f"/labels/{label_id}", caller_token(), json=body)
 
 
 @tool
@@ -1714,7 +1767,7 @@ async def label_delete(label_id: int) -> dict:
 async def task_label_add(task_id: int | str, label_id: int) -> dict:
     """Attach an existing label to a task."""
     return await request(
-        "PUT", f"/tasks/{task_id}/labels", caller_token(), json={"label_id": label_id}
+        "POST", f"/tasks/{task_id}/labels", caller_token(), json={"label_id": label_id}
     )
 
 
@@ -1744,7 +1797,7 @@ async def comment_list(task_id: int | str, page: int = 1, per_page: int = 50) ->
 async def comment_create(task_id: int | str, comment: str) -> dict:
     """Add a comment to a task. `comment` may contain markdown or HTML."""
     return await request(
-        "PUT",
+        "POST",
         f"/tasks/{task_id}/comments",
         caller_token(),
         json={"comment": _md_to_html(comment)},
@@ -1777,7 +1830,7 @@ async def task_assignee_list(task_id: int | str, page: int = 1, per_page: int = 
 async def task_assignee_add(task_id: int | str, user_id: int) -> dict:
     """Assign a user to a task."""
     return await request(
-        "PUT", f"/tasks/{task_id}/assignees", caller_token(), json={"user_id": user_id}
+        "POST", f"/tasks/{task_id}/assignees", caller_token(), json={"user_id": user_id}
     )
 
 
@@ -1785,7 +1838,7 @@ async def task_assignee_add(task_id: int | str, user_id: int) -> dict:
 async def task_assignees_add_bulk(task_id: int | str, user_ids: list[int]) -> dict:
     """Assign several users to a task in one call (carries Plane assignees on migration)."""
     body = {"assignees": [{"id": uid} for uid in user_ids]}
-    return await request("POST", f"/tasks/{task_id}/assignees/bulk", caller_token(), json=body)
+    return await request("PUT", f"/tasks/{task_id}/assignees/bulk", caller_token(), json=body)
 
 
 @tool
@@ -1806,7 +1859,7 @@ async def task_assignee_remove(task_id: int | str, user_id: int) -> dict:
 async def task_relation_add(task_id: int | str, other_task_id: int, relation_kind: str) -> dict:
     """Relate two tasks. `relation_kind` is e.g. `subtask`, `related`, `blocking`, `precedes`."""
     body = {"other_task_id": other_task_id, "relation_kind": relation_kind}
-    return await request("PUT", f"/tasks/{task_id}/relations", caller_token(), json=body)
+    return await request("POST", f"/tasks/{task_id}/relations", caller_token(), json=body)
 
 
 @tool
@@ -1831,8 +1884,8 @@ async def task_reminders_set(task_id: int | str, reminders: list[str]) -> dict:
     """Set a task's reminders. `reminders` is a list of RFC3339 timestamps.
 
     Replaces the task's reminder set (Vikunja stores reminders on the task object). Pass
-    an empty list to clear all reminders. Read-merge-write so the task's other fields are
-    preserved — the task endpoint is a full replace (see ``_apply_task_update``).
+    an empty list to clear all reminders. Only `reminders` is written — every other field
+    on the task is left alone by the server (see ``_apply_task_update``).
     """
     changes = {"reminders": [{"reminder": r} for r in reminders]}
     return await _apply_task_update(task_id, caller_token(), changes)
@@ -1868,7 +1921,7 @@ async def attachment_upload(task_id: int | str, filename: str, content_base64: s
     except (binascii.Error, ValueError) as exc:
         raise VikunjaAPIError(0, f"attachment content is not valid base64: {exc}") from exc
     files = {"files": (filename, raw)}
-    return await request("PUT", f"/tasks/{task_id}/attachments", caller_token(), files=files)
+    return await request("POST", f"/tasks/{task_id}/attachments", caller_token(), files=files)
 
 
 @tool
@@ -1899,7 +1952,7 @@ async def filter_create(title: str, filter_query: str, description: str = "") ->
         description=description or None,
         filters={"filter": filter_query},
     )
-    return await request("PUT", "/filters", caller_token(), json=body)
+    return await request("POST", "/filters", caller_token(), json=body)
 
 
 @tool
@@ -1915,7 +1968,7 @@ async def filter_update(
         description=description,
         filters={"filter": filter_query} if filter_query is not None else None,
     )
-    return await request("POST", f"/filters/{filter_id}", caller_token(), json=body)
+    return await request("PUT", f"/filters/{filter_id}", caller_token(), json=body)
 
 
 @tool
@@ -1936,7 +1989,7 @@ async def team_list(page: int = 1, per_page: int = 50, search: str = "") -> Any:
     Capped at `per_page` (default 50). When more pages exist the result becomes
     `{"items": [...], "pagination": {"truncated": true, ...}}` — raise `page` to read on.
     """
-    params = {"page": page, "per_page": per_page, "s": search or None}
+    params = {"page": page, "per_page": per_page, "q": search or None}
     return await request("GET", "/teams", caller_token(), params=params)
 
 
@@ -1950,7 +2003,7 @@ async def team_get(team_id: int) -> dict:
 async def team_create(name: str, description: str = "") -> dict:
     """Create a team. `name` is required."""
     body = _drop_none(name=name, description=description or None)
-    return await request("PUT", "/teams", caller_token(), json=body)
+    return await request("POST", "/teams", caller_token(), json=body)
 
 
 @tool
@@ -1962,7 +2015,7 @@ async def team_update(
 ) -> dict:
     """Update a team. Only the fields you pass change."""
     body = _drop_none(name=name, description=description, is_public=is_public)
-    return await request("POST", f"/teams/{team_id}", caller_token(), json=body)
+    return await request("PUT", f"/teams/{team_id}", caller_token(), json=body)
 
 
 @tool
@@ -1975,7 +2028,7 @@ async def team_delete(team_id: int) -> dict:
 async def team_member_add(team_id: int, username: str, admin: bool = False) -> dict:
     """Add a user to a team. Set `admin=true` to make them a team admin."""
     body = {"username": username, "admin": admin}
-    return await request("PUT", f"/teams/{team_id}/members", caller_token(), json=body)
+    return await request("POST", f"/teams/{team_id}/members", caller_token(), json=body)
 
 
 @tool
@@ -2014,14 +2067,14 @@ async def project_team_list(project_id: int, page: int = 1, per_page: int = 50) 
 async def project_team_add(project_id: int, team_id: int, permission: int = 0) -> dict:
     """Share a project with a team. `permission`: 0=read, 1=write, 2=admin."""
     body = {"team_id": team_id, "permission": permission}
-    return await request("PUT", f"/projects/{project_id}/teams", caller_token(), json=body)
+    return await request("POST", f"/projects/{project_id}/teams", caller_token(), json=body)
 
 
 @tool
 async def project_team_update(project_id: int, team_id: int, permission: int) -> dict:
     """Change a team's permission on a shared project. `permission`: 0=read, 1=write, 2=admin."""
     return await request(
-        "POST",
+        "PUT",
         f"/projects/{project_id}/teams/{team_id}",
         caller_token(),
         json={"permission": permission},
@@ -2049,14 +2102,14 @@ async def project_user_list(project_id: int, page: int = 1, per_page: int = 50) 
 async def project_user_add(project_id: int, username: str, permission: int = 0) -> dict:
     """Share a project with a user. `permission`: 0=read, 1=write, 2=admin."""
     body = {"username": username, "permission": permission}
-    return await request("PUT", f"/projects/{project_id}/users", caller_token(), json=body)
+    return await request("POST", f"/projects/{project_id}/users", caller_token(), json=body)
 
 
 @tool
 async def project_user_update(project_id: int, user_id: int, permission: int) -> dict:
     """Change a user's permission on a shared project. `permission`: 0=read, 1=write, 2=admin."""
     return await request(
-        "POST",
+        "PUT",
         f"/projects/{project_id}/users/{user_id}",
         caller_token(),
         json={"permission": permission},
@@ -2113,7 +2166,7 @@ async def project_share_create(
         name=name or None,
         sharing_type=sharing_type,
     )
-    return await request("PUT", f"/projects/{project_id}/shares", caller_token(), json=body)
+    return await request("POST", f"/projects/{project_id}/shares", caller_token(), json=body)
 
 
 @tool
@@ -2148,7 +2201,7 @@ async def view_get(project_id: int, view_id: int) -> dict:
 async def view_create(project_id: int, title: str, view_kind: str) -> dict:
     """Create a project view. `view_kind` is one of `list`, `gantt`, `table`, `kanban`."""
     body = {"title": title, "view_kind": view_kind}
-    return await request("PUT", f"/projects/{project_id}/views", caller_token(), json=body)
+    return await request("POST", f"/projects/{project_id}/views", caller_token(), json=body)
 
 
 @tool
@@ -2172,7 +2225,7 @@ async def view_update(
         done_bucket_id=done_bucket_id,
     )
     return await request(
-        "POST", f"/projects/{project_id}/views/{view_id}", caller_token(), json=body
+        "PUT", f"/projects/{project_id}/views/{view_id}", caller_token(), json=body
     )
 
 
@@ -2210,7 +2263,7 @@ async def bucket_create(
     """Create a kanban bucket (column) in a view. `limit` caps tasks (0 = no limit)."""
     body = _drop_none(title=title, limit=limit)
     return await request(
-        "PUT", f"/projects/{project_id}/views/{view_id}/buckets", caller_token(), json=body
+        "POST", f"/projects/{project_id}/views/{view_id}/buckets", caller_token(), json=body
     )
 
 
@@ -2225,7 +2278,7 @@ async def bucket_update(
     """Update a kanban bucket. Only the fields you pass change."""
     body = _drop_none(title=title, limit=limit)
     return await request(
-        "POST",
+        "PUT",
         f"/projects/{project_id}/views/{view_id}/buckets/{bucket_id}",
         caller_token(),
         json=body,
@@ -2249,7 +2302,7 @@ async def task_bucket_move(
     """Move a task into a kanban bucket (column) — drives status changes on migration."""
     body = {"task_id": task_id, "bucket_id": bucket_id}
     return await request(
-        "POST",
+        "PUT",
         f"/projects/{project_id}/views/{view_id}/buckets/{bucket_id}/tasks",
         caller_token(),
         json=body,
@@ -2297,7 +2350,7 @@ async def webhook_create(
     """
     _validate_webhook_target(target_url)
     body = _drop_none(target_url=target_url, events=events, secret=secret or None)
-    return await request("PUT", f"/projects/{project_id}/webhooks", caller_token(), json=body)
+    return await request("POST", f"/projects/{project_id}/webhooks", caller_token(), json=body)
 
 
 @tool

@@ -45,12 +45,18 @@ def test_every_discovered_route_is_concrete(vr):
 
 
 def test_known_routes_are_present(vr):
-    """Spot-check the endpoint whose verb swagger gets wrong, and a nested path."""
+    """Spot-check the endpoint whose verb swagger got wrong on v1, and a nested path.
+
+    ``/labels/{id}`` is the route that shipped the v0.2.1 bug: v1 swagger documented PUT
+    and the router accepted only POST. v2 routes it as PUT (update), which is what the
+    live ``Allow:`` header reports — the reason this file exists is that the header, not
+    the spec, is what settles it.
+    """
     routes = set(vr.discover_routes(vr.SERVER_PY))
-    assert ("POST", f"/labels/{vr.PROBE_ID}") in routes
+    assert ("PUT", f"/labels/{vr.PROBE_ID}") in routes
     assert ("GET", "/user") in routes
     assert (
-        "POST",
+        "PUT",
         f"/projects/{vr.PROBE_ID}/views/{vr.PROBE_ID}/buckets/{vr.PROBE_ID}",
     ) in routes
 

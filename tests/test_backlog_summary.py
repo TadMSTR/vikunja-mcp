@@ -5,11 +5,14 @@ most of these tests assert the **number of upstream calls**, not just the output
 version that quietly fetched every task and counted client-side would satisfy an
 output-only test perfectly while destroying the only reason the tool exists.
 
-The counting itself rests on an undocumented Vikunja behaviour: with `per_page=1`,
-`x-pagination-total-pages` is the exact match count. Probed against live v2.3.0 on
-2026-08-22 across all three regimes — 0 matches (`pages=0`, body `[]`), exactly 1
-(`pages=1`, bare list), and N (envelope, `total_pages=N`) — because those three take
-different paths through `client.request` and only the third one is obvious.
+The counting itself reads `total` off v2's list envelope — the size of the whole result
+set, reported by the API. On v1 there was no such number and the count was inferred from
+`x-pagination-total-pages` at `per_page=1`, where one row per page makes pages and rows
+the same thing; that inference is gone, and with it the reason it had to be probed.
+
+Three response regimes still have to be covered, because `client.request` hands back a
+different *shape* for each and only the third is obvious: 0 matches (bare `[]`), exactly 1
+(bare one-item list), and N (the envelope). Verified against live v2.5.0 on 2026-08-23.
 """
 
 from __future__ import annotations
@@ -43,16 +46,17 @@ class Upstream:
         self.labels = labels if labels is not None else []
         self.calls: list[dict] = []
 
-    async def __call__(self, method, path, token, *, params=None, json=None, files=None):
-        self.calls.append({"path": path, "params": dict(params or {})})
+    async def __call__(
+        self, method, path, token, *, params=None, json=None, files=None, unwrap_list=True
+    ):
+        self.calls.append({"path": path, "params": dict(params or {}), "unwrap_list": unwrap_list})
         if path == "/labels":
             return self.labels
         n = self.counts.get((params or {}).get("filter"), 0)
-        if n == 0:
-            return []  # pages=0 -> client.request returns the bare empty list
-        if n == 1:
-            return [{"id": 1}]  # pages=1 -> not >1, so no envelope
-        return {"items": [{"id": 1}], "pagination": {"page": 1, "total_pages": n, "count": 1}}
+        # The count query asks for a page past the end, so `items` is empty at every count
+        # — including the ones that hold matches. That is the shape being reproduced here:
+        # a fake that returned a row would let a row-counting regression pass.
+        return {"items": [], "total": n, "page": params["page"], "per_page": 1, "total_pages": n}
 
     @property
     def task_calls(self) -> list[dict]:
@@ -74,18 +78,63 @@ def upstream(monkeypatch):
 
 
 @pytest.mark.parametrize("matches", [0, 1, 2, 49, 206])
-async def test_count_is_exact_in_every_pagination_regime(upstream, matches):
-    """0, 1 and N take three different paths through client.request. All must count."""
+async def test_count_is_exact_for_any_number_of_matches(upstream, matches):
+    """1 is the case worth naming: it is the bucket size a row-counter reports as 0."""
     fake = upstream({"project = 7": matches})
     assert await server._count_matching("project = 7") == matches
     assert fake.task_calls[0]["params"]["per_page"] == 1
 
 
-async def test_count_query_asks_for_one_row(upstream):
-    """`per_page=1` is what makes total_pages the match count — not an arbitrary choice."""
+async def test_count_query_asks_for_a_page_past_the_end(upstream):
+    """No rows are wanted — only the envelope's `total`, which every page reports."""
     fake = upstream({"done = false": 5})
     await server._count_matching("done = false")
-    assert fake.task_calls[0]["params"] == {"filter": "done = false", "per_page": 1, "page": 1}
+    assert fake.task_calls[0]["params"] == {
+        "filter": "done = false",
+        "per_page": 1,
+        "page": server._COUNT_PAGE,
+    }
+    assert server._COUNT_PAGE > 1
+
+
+async def test_count_reads_the_raw_envelope(upstream):
+    """`unwrap_list=False` is load-bearing, not a style choice.
+
+    A one-match bucket is a single page, so the reshaped form is the bare row list — and
+    the count query deliberately lands on a page holding no rows, so that list is empty.
+    Reading through the reshape would report 0 for every bucket holding exactly one task,
+    which is the v1 bug class this tool was careful to avoid in the first place.
+    """
+    fake = upstream({"done = false": 1})
+    assert await server._count_matching("done = false") == 1
+    assert fake.task_calls[0]["unwrap_list"] is False
+
+
+async def test_count_reads_total_not_total_pages(monkeypatch):
+    """The two are equal at `per_page=1`, so every other test here would pass either way.
+
+    That equality is exactly what made the v1 inference work, and it is why the swap to
+    `total` needs one case where the two numbers *disagree* — otherwise the assertion is a
+    constant match and a regression back to page-counting would go unnoticed.
+    """
+
+    async def fake(method, path, token, *, params=None, json=None, files=None, unwrap_list=True):
+        return {"items": [], "total": 206, "page": 1, "per_page": 1, "total_pages": 3}
+
+    monkeypatch.setattr(server, "request", fake)
+    monkeypatch.setattr(server, "caller_token", lambda: "TOK")
+    assert await server._count_matching("project = 7") == 206
+
+
+async def test_count_degrades_to_zero_on_an_unusable_total(monkeypatch):
+    """A malformed count must not take the whole summary down with it."""
+
+    async def fake(method, path, token, *, params=None, json=None, files=None, unwrap_list=True):
+        return {"items": [], "total": "many"}
+
+    monkeypatch.setattr(server, "request", fake)
+    monkeypatch.setattr(server, "caller_token", lambda: "TOK")
+    assert await server._count_matching("project = 7") == 0
 
 
 # --- it counts rather than fetching ---------------------------------------
@@ -332,13 +381,23 @@ async def test_paginated_label_list_is_handled(upstream, monkeypatch):
     """`label_list` wraps in the same envelope once labels span pages."""
     fake = Upstream({}, labels=None)
 
-    async def fake_request(method, path, token, *, params=None, json=None, files=None):
+    async def fake_request(
+        method, path, token, *, params=None, json=None, files=None, unwrap_list=True
+    ):
         if path == "/labels":
             return {
                 "items": _labels("type:bug", "type:chore"),
-                "pagination": {"page": 1, "total_pages": 2, "count": 2, "truncated": True},
+                "pagination": {
+                    "page": 1,
+                    "total_pages": 2,
+                    "count": 2,
+                    "total": 4,
+                    "truncated": True,
+                },
             }
-        return await Upstream.__call__(fake, method, path, token, params=params)
+        return await Upstream.__call__(
+            fake, method, path, token, params=params, unwrap_list=unwrap_list
+        )
 
     monkeypatch.setattr(server, "request", fake_request)
     monkeypatch.setattr(server, "caller_token", lambda: "TOK")

@@ -6,6 +6,86 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-08-23
+
+Ported from Vikunja's `/api/v1` to `/api/v2`. v1 is frozen upstream at 2.4.0 — every route
+Vikunja adds from there lands on v2 only — deprecated at 3.0 and removed at 4.0, so this is
+the version that stops the server being frozen against a frozen API.
+
+Every one of the 78 call sites was checked against the live OpenAPI spec and then against
+the live router before and after the change; both sweeps are green with 0 mismatches across
+69 distinct routes.
+
+### Changed — BREAKING
+- **Minimum Vikunja is now 2.4.0.** `client._api_base()` targets `/api/v2`. There is no
+  dual-version mode and version selection is deliberately not configurable — supporting
+  both would mean an abstraction over the verb, pagination and error differences below, for
+  a fallback to an API that is being removed.
+- **Verbs are inverted** relative to v1, which used PUT to create and POST to update. v2 is
+  conventional: POST creates (201), PUT replaces, PATCH merges, DELETE returns 204 empty.
+  One route does not follow it — `POST /teams/{team}/members/{user}/admin` is a toggle and
+  stays POST on both versions.
+- **Search parameter `s` → `q`** on `task_search`, `task_list`, `project_list`,
+  `label_list` and `team_list`. Worth calling out because v2 does not reject `s`, it
+  *ignores* it: a missed rename returns the unfiltered result set rather than an error.
+- **Errors are RFC 9457 `application/problem+json`.** The human-readable text moved from
+  `message` to `detail`; `code` still carries Vikunja's numeric error code and is now
+  appended to the surfaced message. `message` is still read as a fallback — some middleware
+  (the API-token check among them) still answers in v1's shape.
+- **Pagination is a body envelope, not headers.** The outward shape tool callers see is
+  unchanged (`{"items": [...], "pagination": {...}}` when truncated, a bare list otherwise),
+  populated from `{items, total, page, per_page, total_pages}` rather than
+  `x-pagination-*`. `page` is now read from the response rather than echoed from the
+  request.
+- `$schema` is stripped from single-resource bodies. v2 stamps every response with a link
+  to its own JSON Schema; it is transport metadata and would otherwise be repeated into an
+  agent's context on every read.
+
+### Added
+- **`pagination.total`** — the size of the whole result set, which v1 could not report at
+  all (its `x-pagination-result-count` counted the rows in one response). `count` keeps its
+  meaning of "rows in this response", so the two are now distinguishable rather than merely
+  warned about.
+- `client.request(..., unwrap_list=False)` returns the raw v2 list envelope for callers
+  that want its fields rather than its rows.
+
+### Removed
+- **The read-merge-write path behind `task_update`.** v1's `POST /tasks/{id}` was a full
+  replace, so a partial update had to fetch the task, overlay the caller's fields and
+  re-post the whole object (#173). v2's `PATCH` does it in one request. That deletes a
+  request per update, the list of heavy read-only collections that had to be stripped back
+  out of the merged body, and the `SECURITY[accepted]` TOCTOU window in which a concurrent
+  writer's change was overwritten by a stale re-post — the window is gone because there is
+  no longer a read to go stale, not because it was narrowed.
+
+### Fixed
+- `backlog_summary` no longer infers its counts. Each bucket reads `total` off the response
+  envelope instead of treating `x-pagination-total-pages` at `per_page=1` as a match count,
+  and asks for a page past the end of the result set so no task row is transferred at all.
+  Re-measured against a 514-task tracker: 37 requests, ~125 ms, **15.5 KB** of upstream
+  traffic (down from 109 KB when the count query returns a row), 1.2 KB of tool response.
+
+### Notes
+- **`tasks_bulk_update` keeps its `fields` array and moves POST → PUT.** v2 routes only
+  `PUT` on `/tasks/bulk`, so there is no bulk `PATCH` to move to. What did change is that
+  `fields` is documented upstream now — v1 swagger never mentioned it, and the probe on
+  ticket #333 was its only specification.
+- **`#N` ticket resolution still uses the undocumented `filter=index = N`.** v2 ships
+  `GET /projects/{project}/tasks/by-index/{index}`, which is the same lookup, documented —
+  and it returns 401 for any API token lacking the `projects → tasks_by_index` permission,
+  which no token created before v2 carries. This server forwards the caller's token, so it
+  cannot grant itself one; adopting the route would break `#N` refs for every existing
+  deployment until each token was re-issued. No fallback between the two was added: a
+  fallback fires exactly when a loud error is wanted. The filter and its negative control
+  were re-verified against v2 on 2.5.0.
+- **Markdown conversion is still done here, not delegated.** v2 can convert server-side via
+  `?format=markdown`, but `nh3.clean()` can only sanitize HTML this process produced —
+  delegating the conversion would remove the sanitizer from the path rather than move it.
+  `format` is not set on any call, so every write sends HTML and nothing round-trips a
+  description through Markdown's lossy conversion.
+- ETag / `If-Match` conditional requests are a real v2 affordance and are deliberately out
+  of scope here; adding them during a port would make the diff hard to review.
+
 ## [0.8.0] — 2026-08-22
 
 Structured metadata that Vikunja has no field for, under one convention used twice.

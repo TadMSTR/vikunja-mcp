@@ -43,7 +43,7 @@ STUB_USER = {"id": 42, "username": "stub-user"}
 
 @contextlib.asynccontextmanager
 async def stub_vikunja():
-    """A loopback HTTP server that answers GET /api/v1/user, capturing the auth header."""
+    """A loopback HTTP server that answers GET /api/v2/user, capturing the auth header."""
     seen: dict[str, str] = {}
 
     async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:

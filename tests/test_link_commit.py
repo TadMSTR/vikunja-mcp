@@ -66,8 +66,12 @@ def wire(monkeypatch):
 
 
 def _written(mock):
-    """The description the last POST actually sent upstream."""
-    return [body for method, body in mock.sent if method == "POST"][-1]["description"]
+    """The description the last write actually sent upstream.
+
+    The write is a PATCH on v2 (v1 needed a full-replace POST), and it carries only the
+    fields being changed — so ``description`` being present here is the whole point.
+    """
+    return [body for method, body in mock.sent if method == "PATCH"][-1]["description"]
 
 
 # --- recording a link -----------------------------------------------------
@@ -129,7 +133,7 @@ async def test_a_ticket_number_is_accepted_as_the_task_id(wire):
     mock = wire()
     await server.task_link_commit("#334", "pr", PR_URL)
     # The ref hook resolves "#334" upstream before any write lands.
-    assert [m for m, _ in mock.sent if m == "POST"]
+    assert [m for m, _ in mock.sent if m == "PATCH"]
 
 
 # --- ref_url is agent-supplied and a human will click it ------------------

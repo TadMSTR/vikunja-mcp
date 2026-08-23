@@ -39,19 +39,20 @@ async def call(tool, **kwargs):
 async def test_project_create_uses_put(_patch_calls):
     await call(server.project_create, title="Roadmap")
     method, path, token = _patch_calls.call_args.args
-    assert (method, path, token) == ("PUT", "/projects", "TOK")
+    assert (method, path, token) == ("POST", "/projects", "TOK")
     assert _patch_calls.call_args.kwargs["json"] == {"title": "Roadmap"}
 
 
 async def test_project_update_uses_post_and_only_sends_changed_fields(_patch_calls):
     await call(server.project_update, project_id=3, is_archived=True)
-    assert _patch_calls.call_args.args[:2] == ("POST", "/projects/3")
+    assert _patch_calls.call_args.args[:2] == ("PUT", "/projects/3")
     assert _patch_calls.call_args.kwargs["json"] == {"is_archived": True}
 
 
-async def test_project_list_passes_search_as_s(_patch_calls):
+async def test_project_list_passes_search_as_q(_patch_calls):
     await call(server.project_list, search="alpha")
-    assert _patch_calls.call_args.kwargs["params"]["s"] == "alpha"
+    assert _patch_calls.call_args.kwargs["params"]["q"] == "alpha"
+    assert "s" not in _patch_calls.call_args.kwargs["params"]
 
 
 # --- pagination on the four tools that were missing it (vikunja#341) ------
@@ -80,64 +81,56 @@ async def test_view_list_page_reaches_the_wire(_patch_calls):
 # --- tasks ----------------------------------------------------------------
 
 
-async def test_task_create_targets_project_subpath_with_put(_patch_calls):
+async def test_task_create_targets_project_subpath_with_post(_patch_calls):
     await call(server.task_create, project_id=8, title="Ship it", priority=4)
-    assert _patch_calls.call_args.args[:2] == ("PUT", "/projects/8/tasks")
+    assert _patch_calls.call_args.args[:2] == ("POST", "/projects/8/tasks")
     assert _patch_calls.call_args.kwargs["json"] == {"title": "Ship it", "priority": 4}
 
 
-async def test_task_update_reads_merges_writes_full_body(_patch_calls):
-    # GET returns the current task; the POST must carry the *merged* full object so
-    # description/priority survive a done-only update (regression for ticket #173).
-    current = {"id": 5, "title": "Ship it", "description": "keep me", "priority": 4, "done": False}
-    _patch_calls.side_effect = [current, {"ok": True}]
+async def test_task_update_patches_without_reading_first(_patch_calls):
+    """One PATCH, no GET. Untouched columns are the server's problem now, not ours.
+
+    This is the v2 replacement for the read-merge-write regression test that guarded
+    ticket #173. The v1 endpoint was a full replace, so the guarantee had to be bought
+    with a GET and a merged body; ``PATCH`` gives it directly. Asserting the call *count*
+    is what makes this a regression test rather than a restatement — a reintroduced
+    read-merge-write would still produce a correct final body and would still be the bug.
+    """
+    _patch_calls.return_value = {"id": 5, "done": True}
 
     await call(server.task_update, task_id=5, done=True)
 
-    assert _patch_calls.call_count == 2
-    get_call, post_call = _patch_calls.call_args_list
-    assert get_call.args[:2] == ("GET", "/tasks/5")
-    assert post_call.args[:2] == ("POST", "/tasks/5")
-    body = post_call.kwargs["json"]
-    assert body["done"] is True
-    assert body["description"] == "keep me"  # preserved, not wiped
-    assert body["priority"] == 4  # preserved, not wiped
+    assert _patch_calls.call_count == 1
+    assert _patch_calls.call_args.args[:2] == ("PATCH", "/tasks/5")
+    assert _patch_calls.call_args.kwargs["json"] == {"done": True}
 
 
-async def test_task_update_drops_heavy_read_only_collections_from_the_repost(_patch_calls):
-    """`related_tasks` inlines every related task's full body — do not echo it back.
+async def test_task_update_sends_only_the_named_fields(_patch_calls):
+    """A merge patch must carry the caller's fields and nothing else.
 
-    Vikunja stores these in their own tables, so they are unaffected by the task
-    endpoint's full-replace behaviour. Probed live: relations and labels survive their
-    omission, while the re-posted body stops carrying a nested copy of every neighbour.
+    The v1 path had to echo the whole task back and then strip the three heavy read-only
+    collections out of it — ``related_tasks`` inlines the full body of every neighbour,
+    and one live probe returned 155k characters. A patch body that reached for the current
+    task at all would put them back. Nothing is fetched, so nothing can be echoed.
     """
-    current = {
-        "id": 5,
-        "title": "Ship it",
-        "description": "keep me",
-        "related_tasks": {"related": [{"id": 9, "description": "a very large blob"}]},
-        "attachments": [{"id": 1}],
-        "reactions": {"1": ["ted"]},
-        "labels": [{"id": 36}],
-    }
-    _patch_calls.side_effect = [current, {"ok": True}]
-
     await call(server.task_update, task_id=5, title="Renamed")
 
-    body = _patch_calls.call_args_list[1].kwargs["json"]
-    assert "related_tasks" not in body
-    assert "attachments" not in body
-    assert "reactions" not in body
-    # labels are left in place — only the three heavy collections are dropped
-    assert body["labels"] == [{"id": 36}]
-    assert body["title"] == "Renamed"
-    assert body["description"] == "keep me"
+    body = _patch_calls.call_args.kwargs["json"]
+    assert body == {"title": "Renamed"}
+    for heavy in ("related_tasks", "attachments", "reactions", "labels", "description"):
+        assert heavy not in body
 
 
-async def test_task_search_uses_s_param(_patch_calls):
+async def test_task_search_uses_q_param(_patch_calls):
+    """v2 renamed the search parameter ``s`` -> ``q``, and ignores ``s`` silently.
+
+    Verified live on v2.5.0: ``s=<anything>`` returns the unfiltered result set, so a
+    missed rename is a wrong answer rather than an error.
+    """
     await call(server.task_search, query="deploy")
     assert _patch_calls.call_args.args[:2] == ("GET", "/tasks")
-    assert _patch_calls.call_args.kwargs["params"]["s"] == "deploy"
+    assert _patch_calls.call_args.kwargs["params"]["q"] == "deploy"
+    assert "s" not in _patch_calls.call_args.kwargs["params"]
 
 
 async def test_task_delete(_patch_calls):
@@ -146,9 +139,14 @@ async def test_task_delete(_patch_calls):
 
 
 async def test_tasks_bulk_update_restricts_write_to_named_fields(_patch_calls):
-    """#333: without `fields`, POST /tasks/bulk zeroes every column absent from `values`."""
+    """#333: without `fields`, PUT /tasks/bulk zeroes every column absent from `values`.
+
+    The verb moved POST -> PUT with the port, but the mechanism did not: v2 routes only
+    PUT on this path (no PATCH), so `fields` is still what scopes the write. What did
+    change is that `fields` is now documented upstream rather than probe-derived.
+    """
     await call(server.tasks_bulk_update, task_ids=[1, 2], values={"done": True})
-    assert _patch_calls.call_args.args[:2] == ("POST", "/tasks/bulk")
+    assert _patch_calls.call_args.args[:2] == ("PUT", "/tasks/bulk")
     assert _patch_calls.call_args.kwargs["json"] == {
         "task_ids": [1, 2],
         "fields": ["done"],
@@ -171,12 +169,12 @@ async def test_tasks_bulk_update_serialises_multi_key_values_in_order(_patch_cal
 
 async def test_label_create_uses_put(_patch_calls):
     await call(server.label_create, title="bug")
-    assert _patch_calls.call_args.args[:2] == ("PUT", "/labels")
+    assert _patch_calls.call_args.args[:2] == ("POST", "/labels")
 
 
 async def test_task_label_add_sends_label_id(_patch_calls):
     await call(server.task_label_add, task_id=2, label_id=11)
-    assert _patch_calls.call_args.args[:2] == ("PUT", "/tasks/2/labels")
+    assert _patch_calls.call_args.args[:2] == ("POST", "/tasks/2/labels")
     assert _patch_calls.call_args.kwargs["json"] == {"label_id": 11}
 
 
@@ -185,7 +183,7 @@ async def test_task_label_add_sends_label_id(_patch_calls):
 
 async def test_comment_create(_patch_calls):
     await call(server.comment_create, task_id=4, comment="looks good")
-    assert _patch_calls.call_args.args[:2] == ("PUT", "/tasks/4/comments")
+    assert _patch_calls.call_args.args[:2] == ("POST", "/tasks/4/comments")
     # comment is converted to Vikunja's HTML rich-text format on the way in.
     assert _patch_calls.call_args.kwargs["json"] == {"comment": "<p>looks good</p>"}
 
@@ -248,7 +246,7 @@ async def test_project_update_converts_description(_patch_calls):
 
 async def test_filter_create_wraps_query(_patch_calls):
     await call(server.filter_create, title="open", filter_query="done = false")
-    assert _patch_calls.call_args.args[:2] == ("PUT", "/filters")
+    assert _patch_calls.call_args.args[:2] == ("POST", "/filters")
     assert _patch_calls.call_args.kwargs["json"]["filters"] == {"filter": "done = false"}
 
 
@@ -264,7 +262,7 @@ async def test_webhook_create_is_project_scoped(_patch_calls):
         events=["task.created"],
         secret="s3cret",
     )
-    assert _patch_calls.call_args.args[:2] == ("PUT", "/projects/1/webhooks")
+    assert _patch_calls.call_args.args[:2] == ("POST", "/projects/1/webhooks")
     body = _patch_calls.call_args.kwargs["json"]
     assert body["events"] == ["task.created"]
     assert body["secret"] == "s3cret"
@@ -294,14 +292,14 @@ async def test_whoami(_patch_calls):
         (server.task_get, {"task_id": 2}, ("GET", "/tasks/2")),
         (server.task_list, {}, ("GET", "/tasks")),
         (server.label_get, {"label_id": 3}, ("GET", "/labels/3")),
-        (server.label_update, {"label_id": 3, "title": "x"}, ("POST", "/labels/3")),
+        (server.label_update, {"label_id": 3, "title": "x"}, ("PUT", "/labels/3")),
         (server.label_delete, {"label_id": 3}, ("DELETE", "/labels/3")),
         (server.label_list, {}, ("GET", "/labels")),
         (server.task_label_remove, {"task_id": 2, "label_id": 3}, ("DELETE", "/tasks/2/labels/3")),
         (server.comment_list, {"task_id": 2}, ("GET", "/tasks/2/comments")),
         (server.comment_delete, {"task_id": 2, "comment_id": 5}, ("DELETE", "/tasks/2/comments/5")),
         (server.filter_get, {"filter_id": 7}, ("GET", "/filters/7")),
-        (server.filter_update, {"filter_id": 7, "title": "x"}, ("POST", "/filters/7")),
+        (server.filter_update, {"filter_id": 7, "title": "x"}, ("PUT", "/filters/7")),
         (server.filter_delete, {"filter_id": 7}, ("DELETE", "/filters/7")),
         (server.webhook_list, {"project_id": 1}, ("GET", "/projects/1/webhooks")),
         (

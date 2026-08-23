@@ -373,7 +373,13 @@ async def test_strip_does_not_touch_pagination_metadata(monkeypatch):
 
     out = await call(server.task_list)
 
-    assert out["pagination"] == {"page": 2, "total_pages": 9, "count": 2, "truncated": True}
+    assert out["pagination"] == {
+        "page": 2,
+        "total_pages": 9,
+        "count": 2,
+        "total": 18,
+        "truncated": True,
+    }
 
 
 async def test_mutating_tools_that_return_a_task_body_strip_index_too(monkeypatch):

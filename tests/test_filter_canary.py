@@ -72,11 +72,16 @@ class Api:
         return self._c.get(path, params=params)
 
     def count(self, filter_expr: str) -> int:
-        """Match count via the `per_page=1` / `total_pages` trick this server relies on."""
+        """Match count from the list envelope's `total`, as `_count_matching` reads it."""
         resp = self.get("/tasks", filter=filter_expr, per_page=1)
         resp.raise_for_status()
-        header = resp.headers.get("x-pagination-total-pages")
-        return int(header) if header is not None else len(resp.json())
+        return int(resp.json()["total"])
+
+    def rows(self, path: str, **params) -> list:
+        """The rows of a list response. v2 always wraps them; v1 returned a bare array."""
+        resp = self.get(path, **params)
+        resp.raise_for_status()
+        return resp.json()["items"] or []
 
     def status(self, filter_expr: str) -> int:
         return self.get("/tasks", filter=filter_expr, per_page=1).status_code
@@ -86,18 +91,18 @@ class Api:
 def canary():
     """A disposable project holding known tasks and a label. Torn down unconditionally."""
     client = httpx.Client(
-        base_url=f"{_URL}/api/v1",
+        base_url=f"{_URL}/api/v2",
         headers={"Authorization": f"Bearer {_TOKEN}"},
         timeout=30.0,
     )
     project_id = None
     label_id = None
     try:
-        project = client.put("/projects", json={"title": f"vikunja-mcp {_MARK} canary"})
+        project = client.post("/projects", json={"title": f"vikunja-mcp {_MARK} canary"})
         project.raise_for_status()
         project_id = project.json()["id"]
 
-        label = client.put("/labels", json={"title": f"{_MARK}-label"})
+        label = client.post("/labels", json={"title": f"{_MARK}-label"})
         label.raise_for_status()
         label_id = label.json()["id"]
 
@@ -108,12 +113,12 @@ def canary():
             # unambiguous expected count of 1.
             if position == 0:
                 body["description"] = f"<p>{_BODY_MARK}</p>"
-            created = client.put(f"/projects/{project_id}/tasks", json=body)
+            created = client.post(f"/projects/{project_id}/tasks", json=body)
             created.raise_for_status()
             tasks.append(created.json())
 
         # Exactly one task carries the label, so `labels in` is 1 and `not in` is the rest.
-        client.put(f"/tasks/{tasks[0]['id']}/labels", json={"label_id": label_id})
+        client.post(f"/tasks/{tasks[0]['id']}/labels", json={"label_id": label_id})
 
         yield (
             Api(client),
@@ -135,32 +140,51 @@ def canary():
 # --- the counting trick backlog_summary is built on ----------------------
 
 
-def test_per_page_1_total_pages_is_the_exact_match_count(canary):
-    """`backlog_summary` reports every bucket as this number. If it becomes a ceiling or a
-    page estimate, every count this server produces is silently wrong."""
+def test_envelope_total_is_the_exact_match_count(canary):
+    """`backlog_summary` reports every bucket as this number. If it becomes a ceiling or an
+    estimate, every count this server produces is silently wrong."""
     api, fx = canary
     assert api.count(fx["scope"]) == len(_TITLES)
 
 
-def test_count_is_exact_and_not_a_ceiling(canary):
-    """Seven items at per_page=7 must be 1 page, not 2 — pinning that pages are not rounded
-    up from some other quantity."""
+def test_total_counts_rows_not_pages(canary):
+    """The distinction v1 could not make, and the one the port depends on.
+
+    Seven items at `per_page=7` is one page. A `total` that reported pages would be 1 here
+    and would be indistinguishable from the row count at `per_page=1`, which is exactly how
+    v1's inference worked — so this is the case that proves the number changed meaning.
+    """
     api, fx = canary
-    resp = api.get("/tasks", filter=fx["scope"], per_page=len(_TITLES))
-    assert resp.headers.get("x-pagination-total-pages") == "1"
-    assert len(resp.json()) == len(_TITLES)
+    body = api.get("/tasks", filter=fx["scope"], per_page=len(_TITLES)).json()
+    assert body["total"] == len(_TITLES)
+    assert body["total_pages"] == 1
+    assert len(body["items"]) == len(_TITLES)
 
 
-def test_zero_matches_reports_zero_pages(canary):
+def test_a_page_past_the_end_still_reports_the_total(canary):
+    """**What makes `backlog_summary` cheap.** `_count_matching` asks for `_COUNT_PAGE`.
+
+    A page beyond the result set must come back empty *and* still carry the real `total`.
+    That is what turns each of the 37 bucket queries from a ~4 KB task row into a ~150
+    byte envelope. If Vikunja ever clamped the page to the last one, this goes red and the
+    cost — not the correctness — is what changed: `total` is read either way.
+    """
+    api, fx = canary
+    body = api.get("/tasks", filter=fx["scope"], per_page=1, page=1_000_000).json()
+    assert body["total"] == len(_TITLES)
+    assert not body["items"]
+
+
+def test_zero_matches_reports_zero(canary):
     """The 0 regime: `client.request` returns a bare `[]` here, never the envelope, so a
     counter reading only `pagination` would report 0 for every single-item bucket too."""
     api, _ = canary
-    resp = api.get("/tasks", filter=f'title like "%{_NONSENSE}%"', per_page=1)
-    assert resp.headers.get("x-pagination-total-pages") == "0"
-    assert resp.json() == []
+    body = api.get("/tasks", filter=f'title like "%{_NONSENSE}%"', per_page=1).json()
+    assert body["total"] == 0
+    assert not body["items"]
 
 
-def test_exactly_one_match_reports_one_page(canary):
+def test_exactly_one_match_reports_one(canary):
     api, fx = canary
     assert api.count(f'{fx["scope"]} && description like "%{_BODY_MARK}%"') == 1
 
@@ -354,6 +378,29 @@ def test_index_is_filterable(canary):
     api, fx = canary
     index = fx["tasks"][0]["index"]
     assert api.count(f"{fx['scope']} && index = {index}") == 1
+
+
+def test_by_index_route_is_still_unauthorised_for_this_token(canary):
+    """Records *why* the filter above is still in use, rather than v2's documented route.
+
+    `GET /projects/{project}/tasks/by-index/{index}` does the same lookup and is
+    documented, but it is collected for API-token permissions as group `projects`,
+    permission `tasks_by_index` — which no token minted before v2 carries. Measured on
+    v2.5.0: 401 for every forge agent token, while every other route the server uses
+    returns 200.
+
+    A **200 here is the informative outcome**: it means the token running this canary holds
+    the permission, and vikunja#514 (switch `_resolve_index` to the route) is unblocked for
+    that deployment. Anything other than those two is a change neither the code nor this
+    file anticipates.
+    """
+    api, fx = canary
+    index = fx["tasks"][0]["index"]
+    status = api.get(f"/projects/{fx['project_id']}/tasks/by-index/{index}").status_code
+    assert status in (200, 401), (
+        f"by-index returned {status}; expected 401 (token lacks projects.tasks_by_index) "
+        "or 200 (it holds it — see vikunja#514)."
+    )
 
 
 # --- the parser is genuinely parsing -------------------------------------

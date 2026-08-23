@@ -22,7 +22,7 @@ _client: httpx.AsyncClient | None = None
 
 def _api_base() -> str:
     cfg = get_settings()
-    return f"{cfg.url.rstrip('/')}/api/v1"
+    return f"{cfg.url.rstrip('/')}/api/v2"
 
 
 def get_client() -> httpx.AsyncClient:
@@ -41,50 +41,61 @@ async def aclose() -> None:
         _client = None
 
 
-def _pagination_envelope(
-    resp: httpx.Response, data: list[Any], params: dict[str, Any]
-) -> dict[str, Any] | None:
-    """Wrap a truncated list response so the caller can see it is incomplete.
+def _is_list_envelope(data: Any) -> bool:
+    """True if ``data`` is one of v2's paginated list bodies.
 
-    Vikunja paginates every list endpoint (default 50 per page) and reports the extent
-    only in headers. Returning the bare list therefore hands an agent a silently truncated
-    answer: "find every ticket about X" reads at most one page and looks complete. That is
-    a correctness problem, not an ergonomics one, so a truncated result is re-shaped into
-    ``{"items": [...], "pagination": {...}}`` while a complete one is returned untouched.
-
-    Returns None when the response is not a truncated list, meaning "return ``data`` as-is".
-
-    On the two headers: ``x-pagination-total-pages`` is the page count, and
-    ``x-pagination-result-count`` is the number of items in *this* response, not the size
-    of the whole result set — probed at per_page 1/5/50, where it came back 1/5/50 against
-    340/68/7 total pages. It is surfaced as ``count`` for that reason; calling it
-    ``result_count`` invites exactly the misreading the envelope exists to prevent.
-    Vikunja exposes no total-item count, so none is reported rather than inferred.
+    v2 answers every list endpoint with ``{"items": [...], "total": n, "page": n,
+    "per_page": n, "total_pages": n}`` — the envelope *is* the body, where v1 put the
+    extent in ``x-pagination-*`` headers and returned a bare array. Both ``items`` and
+    ``total_pages`` are required here, so a single resource that merely happens to carry
+    an ``items`` field cannot be mistaken for a list response.
     """
-    raw_total = resp.headers.get("x-pagination-total-pages")
-    if not raw_total:
-        return None
-    try:
-        total_pages = int(raw_total)
-    except ValueError:
-        log.info("vikunja_pagination_header_unparsable", value=raw_total)
-        return None
-    if total_pages <= 1:
-        return None
+    return isinstance(data, dict) and "items" in data and "total_pages" in data
 
-    # The requested page is taken from the params we actually sent — explicit, never
-    # inferred from the response. Vikunja defaults to page 1 when the caller omits it.
+
+def _int_or(value: Any, fallback: int) -> int:
+    """``int(value)``, or ``fallback`` when it is missing or unparsable."""
     try:
-        page = int(params.get("page", 1))
+        return int(value)
     except (TypeError, ValueError):
-        page = 1
+        log.info("vikunja_pagination_field_unparsable", value=value)
+        return fallback
+
+
+def _unwrap_list(data: dict[str, Any]) -> Any:
+    """Turn a v2 list envelope into what the tools expect: bare list, or truncation envelope.
+
+    Vikunja paginates every list endpoint (default 50 per page). Returning only the rows
+    therefore hands an agent a silently truncated answer: "find every ticket about X" reads
+    at most one page and looks complete. That is a correctness problem, not an ergonomics
+    one, so a truncated result is re-shaped into ``{"items": [...], "pagination": {...}}``
+    while a complete one is returned as the bare list callers already handle.
+
+    The outward shape is deliberately unchanged from the v1 client — every list-consuming
+    tool in ``server.py`` branches on ``"items" in result`` — with one addition:
+
+    ``total`` is now reported. v1 exposed no total-item count (``x-pagination-result-count``
+    counted the rows in *this* response, not the result set), so the v1 client reported
+    none rather than inferring one. v2's body carries a real ``total``, so that limitation
+    is gone and the number is passed through.
+
+    ``count`` still means "rows in this response" and is still sourced from ``len(items)``.
+    It is deliberately not named ``result_count``: reading it as the size of the whole
+    result set is precisely the misreading the envelope exists to prevent. ``total`` now
+    sits beside it, so the two are distinguishable rather than merely warned about.
+    """
+    items = data.get("items") or []
+    total_pages = _int_or(data.get("total_pages"), 1)
+    if total_pages <= 1:
+        return items
 
     return {
-        "items": data,
+        "items": items,
         "pagination": {
-            "page": page,
+            "page": _int_or(data.get("page"), 1),
             "total_pages": total_pages,
-            "count": len(data),
+            "count": len(items),
+            "total": _int_or(data.get("total"), len(items)),
             "truncated": True,
         },
     }
@@ -93,16 +104,34 @@ def _pagination_envelope(
 def _extract_error(resp: httpx.Response) -> str:
     """Pull Vikunja's error message out of the body, falling back to raw text.
 
-    Vikunja error bodies look like ``{"code": 403, "message": "..."}``. We surface the
-    message so the agent sees *why* a call failed without a debugger.
+    v2 answers errors as RFC 9457 ``application/problem+json``:
+    ``{"title": "Bad Request", "status": 400, "detail": "...", "code": 4016}``. The
+    human-readable text that v1 put in ``message`` now lives in ``detail``; ``title`` is
+    the generic status name and is only a fallback, since "Bad Request" alone tells an
+    agent nothing. ``code`` is Vikunja's own numeric error code, unchanged from v1 and
+    documented at https://vikunja.io/docs/errors/ — appended when present because it is
+    the one part of the body that is stable enough to match on.
+
+    ``message`` is still read as a last resort before the raw text: a handful of routes
+    (link-share auth, the token middleware) answer from Echo rather than the v2 handler
+    stack and still emit the v1 ``{"code", "message"}`` shape. Observed live on v2.5.0 —
+    ``GET /api/v2/projects/{p}/tasks/by-index/{i}`` with a token lacking the
+    ``projects → tasks_by_index`` permission returns exactly that. Dropping the fallback
+    would turn those into an empty reason phrase.
     """
     try:
         body = resp.json()
     except ValueError:
         return resp.text.strip() or resp.reason_phrase
-    if isinstance(body, dict) and body.get("message"):
-        return str(body["message"])
-    return resp.text.strip() or resp.reason_phrase
+    if not isinstance(body, dict):
+        return resp.text.strip() or resp.reason_phrase
+
+    detail = body.get("detail") or body.get("message") or body.get("title")
+    if not detail:
+        return resp.text.strip() or resp.reason_phrase
+
+    code = body.get("code")
+    return f"{detail} (Vikunja code {code})" if code else str(detail)
 
 
 async def request(
@@ -113,23 +142,34 @@ async def request(
     params: dict[str, Any] | None = None,
     json: Any = None,
     files: Any = None,
+    unwrap_list: bool = True,
 ) -> Any:
     """Make one authenticated request to Vikunja and return the decoded JSON.
 
-    Returns the decoded body unchanged, with one exception: a **list** body that Vikunja
-    reports as spanning more than one page is wrapped as
-    ``{"items": [...], "pagination": {...}}`` so the caller can tell a first page from a
-    complete answer (see :func:`_pagination_envelope`). Single-page lists and all non-list
-    bodies pass through untouched.
+    Two reshapes, both of them narrowing v2's envelope back to what the tools expect:
+
+    * A **list** body arrives as ``{"items": [...], "total": n, ...}``. It is returned as
+      the bare row list, unless it spans more than one page, in which case it is wrapped
+      as ``{"items": [...], "pagination": {...}}`` so the caller can tell a first page
+      from a complete answer (see :func:`_unwrap_list`).
+    * ``$schema`` is dropped from a single-resource body. v2 stamps every response with a
+      link to its own JSON Schema; it is transport metadata, identical on every row of a
+      kind, and it would otherwise be repeated into an agent's context on every read.
+      Only the top level is touched — list rows do not carry it.
 
     Args:
         method: HTTP verb.
-        path: API path relative to /api/v1 (leading slash optional).
+        path: API path relative to /api/v2 (leading slash optional).
         token: the caller's Vikunja bearer token (see auth.caller_token).
         params: query string parameters.
         json: request body, serialized as JSON.
         files: multipart file payload (attachment upload). Mutually exclusive with ``json``;
             when set, httpx encodes a ``multipart/form-data`` body instead of JSON.
+        unwrap_list: when False, a list response is returned as the raw v2 envelope
+            instead of being reshaped. Exists for callers that want the envelope's own
+            fields rather than its rows — ``server._count_matching`` reads ``total`` and
+            never looks at ``items``, and the reshape would hide it behind a row count
+            that is wrong for any query whose page holds no rows.
 
     Raises:
         VikunjaAPIError: on a network failure (status 0) or any 4xx/5xx response.
@@ -156,19 +196,27 @@ async def request(
         log.info("vikunja_api_error", method=method, path=path, status=resp.status_code)
         raise VikunjaAPIError(resp.status_code, detail)
 
+    # v2's DELETE contract is 204 with an empty body, which is what this already returns.
+    # Correct as written — do not "fix" it to parse a body that is not sent.
     if resp.status_code == 204 or not resp.content:
         return {"ok": True}
 
     data = resp.json()
-    if isinstance(data, list):
-        envelope = _pagination_envelope(resp, data, clean_params)
-        if envelope is not None:
+    if _is_list_envelope(data):
+        if not unwrap_list:
+            data.pop("$schema", None)
+            return data
+        unwrapped = _unwrap_list(data)
+        if isinstance(unwrapped, dict):
             log.info(
                 "vikunja_result_truncated",
                 method=method,
                 path=path,
-                page=envelope["pagination"]["page"],
-                total_pages=envelope["pagination"]["total_pages"],
+                page=unwrapped["pagination"]["page"],
+                total_pages=unwrapped["pagination"]["total_pages"],
+                total=unwrapped["pagination"]["total"],
             )
-            return envelope
+        return unwrapped
+    if isinstance(data, dict):
+        data.pop("$schema", None)
     return data

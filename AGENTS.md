@@ -4,9 +4,12 @@ Operating contract for Claude sessions working in this repo.
 
 ## What this server does
 
-Exposes the Vikunja REST API (`/api/v1`) as MCP tools for projects, tasks, labels,
+Exposes the Vikunja REST API (`/api/v2`) as MCP tools for projects, tasks, labels,
 comments, saved filters, and webhooks. It is a thin, stateless translator — no business
 logic, no caching, no persistence.
+
+**Minimum Vikunja is 2.4.0**, the release that shipped `/api/v2`. The version is applied in
+`client._api_base()`, not configured — dual-version support was considered and rejected.
 
 ## Module boundaries
 
@@ -31,30 +34,48 @@ logic, no caching, no persistence.
 3. **`authorization` must be explicitly opted into** `get_http_headers(include={...})` — the
    library strips it by default. `tests/test_auth.py::test_authorization_header_is_explicitly_requested`
    guards this; do not remove it.
-4. **PUT creates, POST updates** in Vikunja. Keep `*_create` on PUT and `*_update` on POST.
-   `tests/test_server.py` pins every mapping.
+4. **POST creates, PUT replaces, PATCH merges** on v2. Keep `*_create` on POST and
+   `*_update` on PUT. `tests/test_server.py` pins every mapping and
+   `scripts/verify-routes.py` checks it against the live router.
+
+   Two things to know before touching a verb. First, this **inverts** v1's idiom
+   (PUT-creates / POST-updates), so a global find-and-replace in either direction corrupts
+   the set it is not aimed at — work call sites individually. Second, one route does not
+   follow the pattern: `POST /teams/{team}/members/{user}/admin` is a toggle, not an
+   update, and is POST on both versions.
+
 5. **Partial updates are honored by two different mechanisms — know which one applies.**
-   Vikunja is not consistent here, and conflating the two reintroduces a data-loss bug.
 
    | Resource | Endpoint behaviour | Mechanism | Do not |
    |----------|-------------------|-----------|--------|
    | projects, labels, teams, filters, views, buckets | writes only the fields present in the body | `_drop_none` | send nulls for unspecified fields |
-   | a single task (`POST /tasks/{id}`) | **full replace** — omitted columns reset to zero | `_apply_task_update` read-merge-write | "simplify" it to a partial POST — that is ticket #173 |
-   | many tasks (`POST /tasks/bulk`) | **full replace per task** | `fields` array naming the columns to write | send a bare `values` object — that is ticket #333 |
+   | a single task (`PATCH /tasks/{id}`) | JSON Merge Patch — omitted fields untouched | `_apply_task_update`, one request | reintroduce a read-merge-write, or route this through `PUT /tasks/{id}` — that is ticket #173 |
+   | many tasks (`PUT /tasks/bulk`) | **full replace per task** | `fields` array naming the columns to write | send a bare `values` object — that is ticket #333 |
 
-   The two task paths are a pair: both exist because task writes are full replaces. The
-   single-task path solves it client-side because it must; the bulk path solves it
-   server-side via `fields` because N read-merge-writes would mean N GETs and N TOCTOU
-   windows. `models.BulkTask.fields` is real but undocumented in swagger — the probe
-   recorded on ticket #333 is its specification.
+   The two task paths were a pair on v1: both existed because task writes were full
+   replaces, and the single-task path paid for it with a GET, a merged body and a TOCTOU
+   window. v2's `PATCH` deletes that half of the problem. The bulk half remains, because
+   v2 routes only `PUT` on `/tasks/bulk` — no PATCH exists there. What changed for it is
+   documentation: `fields` was undocumented in v1 swagger and the probe on ticket #333 was
+   its only specification; v2's spec now states it outright.
 
-6. **List results may be truncated, and the envelope says so.** `client.request` wraps a
-   multi-page list as `{"items": [...], "pagination": {...}}` and returns single-page
+   **`related_tasks` is populated on v2 list rows**, with each related task's full body
+   inlined (measured: 3.7–10 KB per entry). Nothing echoes it back any more — there is no
+   merged body to echo it into — but any new code that reads a list must keep projecting
+   it away, which is invariant 6's job.
+
+6. **List results may be truncated, and the envelope says so.** v2 answers every list with
+   `{"items", "total", "page", "per_page", "total_pages"}`; `client.request` reshapes that
+   into `{"items": [...], "pagination": {...}}` when it spans pages and returns single-page
    lists bare. Do not make the envelope unconditional (callers would all need updating for
    no gain) and do not remove it (a silently truncated list is a wrong answer, not a short
-   one). `_apply_task_update` also drops `related_tasks`/`attachments`/`reactions` from the
-   re-posted body — they live in their own tables and echoing them back is what made one
-   `task_search` return 155k characters.
+   one).
+
+   `pagination.total` is the size of the result set and `pagination.count` is the rows in
+   this response. They are not interchangeable, and at `per_page=1` they happen to be
+   equal — which is what makes a page-counting regression easy to miss. Pass
+   `unwrap_list=False` when you want the raw envelope; `_count_matching` does, because it
+   reads `total` off a page that deliberately holds no rows.
 
 7. **`index` and `id` are different numbers, and only `id` may leave this server.**
    `index` is per-project; `id` is global. Their difference is not constant (offsets of 8,
@@ -87,10 +108,18 @@ logic, no caching, no persistence.
 
    | Behaviour | Probe | Control | Verified on |
    |---|---|---|---|
-   | `index` is filterable | `filter=index = 454` → one row, id 473 | `filter=bogusfield = 1` → **400** `The task field 'bogusfield' is invalid` | Vikunja v2.3.0, 2026-08-21 |
+   | `index` is filterable | `filter=index = 454` → one row, id 473 | `filter=bogusfield = 1` → **400** `The task field 'bogusfield' is invalid` | v2.3.0 2026-08-21; re-run on `/api/v2` @ v2.5.0, 2026-08-23 |
    | `index` filter is project-scopable | `filter=project = 7 && index = 454` → `[473]` | `filter=project = 2 && index = 454` → `[]` | same |
-   | `index` is **not** sortable | — | `sort_by` accepts `id, title, done, done_at, due_date, start_date, end_date, priority, percent_done, created, updated, position` | same |
-   | `s` cannot be combined with `filter` | — | — | Vikunja filter docs; this is why `task_search` and `task_list` stay separate tools |
+   | `index` is **not** sortable | — | `sort_by` accepts `id, title, done, done_at, due_date, start_date, end_date, priority, percent_done, created, updated, position` | v2.3.0, 2026-08-21 |
+   | `q` cannot be combined with `filter` | — | — | Vikunja filter docs; this is why `task_search` and `task_list` stay separate tools |
+   | a page past the end reports the real `total` with no rows | `per_page=1&page=1000000` → `total=237`, `items=[]`, 145 bytes | `page=1` → same `total`, one row, 4122 bytes | `/api/v2` @ v2.5.0, 2026-08-23 |
+   | v2's documented `by-index` route is **unusable** with an API token | `GET /projects/7/tasks/by-index/509` → **401**, incl. on a task the same token had just created | every other route the server uses → 200 with that token | same |
+
+   That last row is why `#N` resolution still goes through the undocumented `index` filter
+   rather than the documented route the port was expected to adopt. The route is collected
+   for token permissions as group `projects`, permission `tasks_by_index` (upstream
+   `pkg/models/api_routes.go`), which no token minted before v2 carries — and this server
+   forwards the caller's token, so it cannot grant itself one. Tracked in vikunja#514.
 
    The control matters more than the probe: Vikunja *rejects* unknown filter fields rather
    than ignoring them, which is what proves the `index` filter is genuinely applied

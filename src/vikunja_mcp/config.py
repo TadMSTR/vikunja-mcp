@@ -44,7 +44,7 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # Base URL of the Vikunja instance (without the /api/v1 suffix — the client appends it).
+    # Base URL of the Vikunja instance (without the /api/v2 suffix — the client appends it).
     # No default: an environment-specific hostname baked in here would (a) publish it to
     # every reader of this public repo and (b) let a misconfigured deployment silently fall
     # back to someone else's instance instead of failing. See vikunja#344 (id 363, SC-01).
@@ -165,7 +165,7 @@ def get_settings() -> Settings:
             raise ConfigError(
                 "VIKUNJA_URL is not set. This server has no default Vikunja instance — "
                 "set VIKUNJA_URL to the base URL of your Vikunja deployment (without the "
-                "/api/v1 suffix) before starting."
+                "/api/v2 suffix) before starting."
             )
 
         # Both of these are hard refusals at startup, not warnings.
