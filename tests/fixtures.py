@@ -1,5 +1,11 @@
 """Task bodies whose **shape** was captured from a live Vikunja v2.3.0 API response.
 
+Re-checked against ``/api/v2`` on Vikunja v2.5.0 on 2026-08-23: the task body itself is
+unchanged between API versions — same field names, same ``snake_case``, same
+null-vs-empty conventions, including the ``related_tasks`` dict-of-lists below. What
+changed is the *list* wrapper around it, which is why :func:`paginated` gained ``total``
+and the raw list bodies did not move.
+
 Why this module exists rather than a hand-written dict per test: the Phase 1 assertion in
 v0.5.0 is "no read path returns a bare ``index``". A hand-written mock that simply forgets
 to include ``index`` cannot fail that assertion, so the suite would go green while the bug
@@ -133,12 +139,22 @@ def task_list(count: int = 3) -> list[dict[str, Any]]:
     return out
 
 
-def paginated(items: list[dict[str, Any]], page: int = 1, total_pages: int = 4) -> dict[str, Any]:
+def paginated(
+    items: list[dict[str, Any]],
+    page: int = 1,
+    total_pages: int = 4,
+    total: int | None = None,
+) -> dict[str, Any]:
     """The envelope ``client.request`` wraps a multi-page list body in.
 
     ``pagination`` is this server's own metadata, not a task. Every projection and strip
     has to leave it intact, or a caller loses the ability to tell page 1 from a complete
     answer.
+
+    ``total`` is the size of the whole result set and is new in the v2 port — v1 exposed
+    no such number. It defaults to a value consistent with ``total_pages`` rather than to
+    ``len(items)``, so a fixture built from this helper cannot accidentally make the two
+    interchangeable.
     """
     return {
         "items": items,
@@ -146,6 +162,7 @@ def paginated(items: list[dict[str, Any]], page: int = 1, total_pages: int = 4) 
             "page": page,
             "total_pages": total_pages,
             "count": len(items),
+            "total": len(items) * total_pages if total is None else total,
             "truncated": True,
         },
     }

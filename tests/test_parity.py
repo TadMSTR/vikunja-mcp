@@ -36,19 +36,19 @@ async def call(tool, **kwargs):
 
 async def test_team_create_uses_put(_patch_calls):
     await call(server.team_create, name="Platform")
-    assert _patch_calls.call_args.args[:2] == ("PUT", "/teams")
+    assert _patch_calls.call_args.args[:2] == ("POST", "/teams")
     assert _patch_calls.call_args.kwargs["json"] == {"name": "Platform"}
 
 
 async def test_team_update_uses_post(_patch_calls):
     await call(server.team_update, team_id=3, name="Renamed")
-    assert _patch_calls.call_args.args[:2] == ("POST", "/teams/3")
+    assert _patch_calls.call_args.args[:2] == ("PUT", "/teams/3")
     assert _patch_calls.call_args.kwargs["json"] == {"name": "Renamed"}
 
 
 async def test_team_member_add_sends_username_and_admin(_patch_calls):
     await call(server.team_member_add, team_id=3, username="agent-writer", admin=True)
-    assert _patch_calls.call_args.args[:2] == ("PUT", "/teams/3/members")
+    assert _patch_calls.call_args.args[:2] == ("POST", "/teams/3/members")
     assert _patch_calls.call_args.kwargs["json"] == {"username": "agent-writer", "admin": True}
 
 
@@ -62,25 +62,25 @@ async def test_team_member_remove_uses_username_path(_patch_calls):
 
 async def test_project_team_add_uses_put_with_permission(_patch_calls):
     await call(server.project_team_add, project_id=5, team_id=2, permission=1)
-    assert _patch_calls.call_args.args[:2] == ("PUT", "/projects/5/teams")
+    assert _patch_calls.call_args.args[:2] == ("POST", "/projects/5/teams")
     assert _patch_calls.call_args.kwargs["json"] == {"team_id": 2, "permission": 1}
 
 
 async def test_project_team_update_uses_post(_patch_calls):
     await call(server.project_team_update, project_id=5, team_id=2, permission=2)
-    assert _patch_calls.call_args.args[:2] == ("POST", "/projects/5/teams/2")
+    assert _patch_calls.call_args.args[:2] == ("PUT", "/projects/5/teams/2")
     assert _patch_calls.call_args.kwargs["json"] == {"permission": 2}
 
 
 async def test_project_user_add_uses_put(_patch_calls):
     await call(server.project_user_add, project_id=5, username="agent-research", permission=0)
-    assert _patch_calls.call_args.args[:2] == ("PUT", "/projects/5/users")
+    assert _patch_calls.call_args.args[:2] == ("POST", "/projects/5/users")
     assert _patch_calls.call_args.kwargs["json"] == {"username": "agent-research", "permission": 0}
 
 
 async def test_project_share_create_uses_put_and_drops_empty(_patch_calls):
     await call(server.project_share_create, project_id=5, permission=1)
-    assert _patch_calls.call_args.args[:2] == ("PUT", "/projects/5/shares")
+    assert _patch_calls.call_args.args[:2] == ("POST", "/projects/5/shares")
     # password/name omitted → not in body; permission + sharing_type present.
     assert _patch_calls.call_args.kwargs["json"] == {"permission": 1, "sharing_type": 0}
 
@@ -90,19 +90,19 @@ async def test_project_share_create_uses_put_and_drops_empty(_patch_calls):
 
 async def test_bucket_create_uses_put(_patch_calls):
     await call(server.bucket_create, project_id=1, view_id=4, title="In Progress")
-    assert _patch_calls.call_args.args[:2] == ("PUT", "/projects/1/views/4/buckets")
+    assert _patch_calls.call_args.args[:2] == ("POST", "/projects/1/views/4/buckets")
     assert _patch_calls.call_args.kwargs["json"] == {"title": "In Progress"}
 
 
 async def test_bucket_update_uses_post(_patch_calls):
     await call(server.bucket_update, project_id=1, view_id=4, bucket_id=9, limit=5)
-    assert _patch_calls.call_args.args[:2] == ("POST", "/projects/1/views/4/buckets/9")
+    assert _patch_calls.call_args.args[:2] == ("PUT", "/projects/1/views/4/buckets/9")
     assert _patch_calls.call_args.kwargs["json"] == {"limit": 5}
 
 
 async def test_task_bucket_move_posts_task_and_bucket(_patch_calls):
     await call(server.task_bucket_move, project_id=1, view_id=4, bucket_id=9, task_id=42)
-    assert _patch_calls.call_args.args[:2] == ("POST", "/projects/1/views/4/buckets/9/tasks")
+    assert _patch_calls.call_args.args[:2] == ("PUT", "/projects/1/views/4/buckets/9/tasks")
     assert _patch_calls.call_args.kwargs["json"] == {"task_id": 42, "bucket_id": 9}
 
 
@@ -111,13 +111,13 @@ async def test_task_bucket_move_posts_task_and_bucket(_patch_calls):
 
 async def test_view_create_uses_put(_patch_calls):
     await call(server.view_create, project_id=1, title="Board", view_kind="kanban")
-    assert _patch_calls.call_args.args[:2] == ("PUT", "/projects/1/views")
+    assert _patch_calls.call_args.args[:2] == ("POST", "/projects/1/views")
     assert _patch_calls.call_args.kwargs["json"] == {"title": "Board", "view_kind": "kanban"}
 
 
 async def test_view_update_uses_post_with_done_bucket(_patch_calls):
     await call(server.view_update, project_id=1, view_id=4, done_bucket_id=9)
-    assert _patch_calls.call_args.args[:2] == ("POST", "/projects/1/views/4")
+    assert _patch_calls.call_args.args[:2] == ("PUT", "/projects/1/views/4")
     assert _patch_calls.call_args.kwargs["json"] == {"done_bucket_id": 9}
 
 
@@ -126,13 +126,13 @@ async def test_view_update_uses_post_with_done_bucket(_patch_calls):
 
 async def test_task_assignee_add_uses_put(_patch_calls):
     await call(server.task_assignee_add, task_id=7, user_id=3)
-    assert _patch_calls.call_args.args[:2] == ("PUT", "/tasks/7/assignees")
+    assert _patch_calls.call_args.args[:2] == ("POST", "/tasks/7/assignees")
     assert _patch_calls.call_args.kwargs["json"] == {"user_id": 3}
 
 
 async def test_task_assignees_bulk_wraps_ids(_patch_calls):
     await call(server.task_assignees_add_bulk, task_id=7, user_ids=[3, 4])
-    assert _patch_calls.call_args.args[:2] == ("POST", "/tasks/7/assignees/bulk")
+    assert _patch_calls.call_args.args[:2] == ("PUT", "/tasks/7/assignees/bulk")
     assert _patch_calls.call_args.kwargs["json"] == {"assignees": [{"id": 3}, {"id": 4}]}
 
 
@@ -146,7 +146,7 @@ async def test_task_assignee_remove_uses_userid_path(_patch_calls):
 
 async def test_task_relation_add_uses_put(_patch_calls):
     await call(server.task_relation_add, task_id=7, other_task_id=8, relation_kind="subtask")
-    assert _patch_calls.call_args.args[:2] == ("PUT", "/tasks/7/relations")
+    assert _patch_calls.call_args.args[:2] == ("POST", "/tasks/7/relations")
     assert _patch_calls.call_args.kwargs["json"] == {
         "other_task_id": 8,
         "relation_kind": "subtask",
@@ -174,32 +174,33 @@ async def test_team_member_remove_username_is_encoded(_patch_calls):
 # --- reminders ------------------------------------------------------------
 
 
-async def test_task_reminders_set_preserves_other_fields(_patch_calls):
-    current = {"id": 7, "title": "T", "description": "keep me", "priority": 3}
-    _patch_calls.side_effect = [current, {"ok": True}]
+async def test_task_reminders_set_patches_only_reminders(_patch_calls):
+    """Other fields are preserved by *not being sent*, which is a stronger claim than v1's.
 
+    On v1 this tool read the task and re-posted a merged body, so "description survives"
+    had to be asserted on a body that contained it. On v2 the body must contain nothing
+    but ``reminders`` — a description appearing here at all would mean something reached
+    for the current task.
+    """
     await call(server.task_reminders_set, task_id=7, reminders=["2026-07-10T09:00:00Z"])
 
-    get_call, post_call = _patch_calls.call_args_list
-    assert get_call.args[:2] == ("GET", "/tasks/7")
-    assert post_call.args[:2] == ("POST", "/tasks/7")
-    body = post_call.kwargs["json"]
-    assert body["reminders"] == [{"reminder": "2026-07-10T09:00:00Z"}]
-    assert body["description"] == "keep me"  # preserved
+    assert _patch_calls.call_count == 1
+    assert _patch_calls.call_args.args[:2] == ("PATCH", "/tasks/7")
+    assert _patch_calls.call_args.kwargs["json"] == {
+        "reminders": [{"reminder": "2026-07-10T09:00:00Z"}]
+    }
 
 
-async def test_task_reminders_set_empty_clears_and_preserves(_patch_calls):
-    current = {"id": 7, "title": "T", "description": "keep me", "reminders": [{"reminder": "x"}]}
-    _patch_calls.side_effect = [current, {"ok": True}]
+async def test_task_reminders_set_empty_clears_without_touching_anything_else(_patch_calls):
+    """An empty list must reach the wire as ``[]`` — clearing is a write, not an omission.
 
+    ``_drop_none`` semantics would make an omitted field mean "leave alone", so a merge
+    patch that dropped the empty list would silently do nothing at all.
+    """
     await call(server.task_reminders_set, task_id=7, reminders=[])
 
-    get_call, post_call = _patch_calls.call_args_list
-    assert get_call.args[:2] == ("GET", "/tasks/7")
-    assert post_call.args[:2] == ("POST", "/tasks/7")
-    body = post_call.kwargs["json"]
-    assert body["reminders"] == []
-    assert body["description"] == "keep me"
+    assert _patch_calls.call_args.args[:2] == ("PATCH", "/tasks/7")
+    assert _patch_calls.call_args.kwargs["json"] == {"reminders": []}
 
 
 async def test_task_update_no_fields_is_get_only_no_op(_patch_calls):
@@ -225,7 +226,7 @@ async def test_attachment_upload_decodes_and_sends_multipart(_patch_calls):
         filename="log.txt",
         content_base64=base64.b64encode(b"hello").decode(),
     )
-    assert _patch_calls.call_args.args[:2] == ("PUT", "/tasks/7/attachments")
+    assert _patch_calls.call_args.args[:2] == ("POST", "/tasks/7/attachments")
     files = _patch_calls.call_args.kwargs["files"]
     assert files["files"][0] == "log.txt"
     assert files["files"][1] == b"hello"
@@ -237,7 +238,7 @@ async def test_attachment_upload_decodes_and_sends_multipart(_patch_calls):
 async def test_tasks_bulk_update_sends_ids_fields_and_values(_patch_calls):
     """`fields` restricts the write; without it the endpoint replaces the whole task (#333)."""
     await call(server.tasks_bulk_update, task_ids=[1, 2, 3], values={"done": True})
-    assert _patch_calls.call_args.args[:2] == ("POST", "/tasks/bulk")
+    assert _patch_calls.call_args.args[:2] == ("PUT", "/tasks/bulk")
     assert _patch_calls.call_args.kwargs["json"] == {
         "task_ids": [1, 2, 3],
         "fields": ["done"],
@@ -269,7 +270,7 @@ async def test_tasks_bulk_update_sends_ids_fields_and_values(_patch_calls):
         (
             server.project_user_update,
             {"project_id": 1, "user_id": 2, "permission": 1},
-            ("POST", "/projects/1/users/2"),
+            ("PUT", "/projects/1/users/2"),
         ),
         (
             server.project_user_remove,

@@ -8,6 +8,9 @@ A [FastMCP](https://github.com/jlowin/fastmcp) server that exposes the
 saved filters, and webhooks — designed for multi-agent use behind
 [scoped-mcp](https://github.com/TadMSTR/scoped-mcp).
 
+Targets Vikunja's **`/api/v2`**, so it requires **Vikunja 2.4.0 or newer**. v1 is frozen
+upstream at 2.4.0 (new routes land on v2 only) and removed at 4.0.
+
 ## Why it's shaped this way — token passthrough
 
 Run over HTTP, this server holds **no** Vikunja credentials. Vikunja issues a per-user API
@@ -27,7 +30,7 @@ resolved out of Vault). The payoff:
 flowchart LR
     A[Agent] -->|MCP + own bearer token| S[scoped-mcp<br/>per-agent process]
     S -->|mcp_proxy injects<br/>Authorization header| V[vikunja-mcp<br/>:8501 stateless]
-    V -->|forwards token verbatim| K[(Vikunja REST API<br/>/api/v1)]
+    V -->|forwards token verbatim| K[(Vikunja REST API<br/>/api/v2)]
     W[Vault] -.->|per-agent token<br/>resolved into manifest| S
 ```
 
@@ -54,8 +57,8 @@ reach Vikunja as one identity, which silently destroys the per-agent attribution
 ## Tools
 
 The server covers the full Vikunja resource surface, each tool pinned to the correct verb
-by a wire test against the live Swagger spec — 71 as of v0.2.0, plus `backlog_summary`
-(v0.7.0) and `task_link_commit` (v0.8.0) for **73**.
+by a wire test and by a sweep against the live router — 71 as of v0.2.0, plus
+`backlog_summary` (v0.7.0) and `task_link_commit` (v0.8.0) for **73**.
 
 | Group | Tools |
 |-------|-------|
@@ -74,8 +77,9 @@ by a wire test against the live Swagger spec — 71 as of v0.2.0, plus `backlog_
 | Teams | `team_list`, `team_get`, `team_create`, `team_update`, `team_delete`, `team_member_add`, `team_member_remove`, `team_member_toggle_admin` |
 | Webhooks | `webhook_events`, `webhook_list`, `webhook_create`, `webhook_delete` |
 
-> Vikunja's REST idiom: **PUT creates, POST updates.** The tool names hide this, but it's
-> why `*_create` and `*_update` hit the same path with different verbs.
+> Vikunja v2's REST idiom: **POST creates, PUT replaces, PATCH merges.** The tool names
+> hide this, but it's why `*_create` and `*_update` hit the same path with different verbs.
+> (v1 had these inverted — PUT created and POST updated. Nothing here targets v1.)
 
 Notes:
 
@@ -123,11 +127,19 @@ and a string naming several (`"#456 (id 475) blocks #331 (id 342)"`) raises rath
 taking the first — position is not evidence.
 
 > Resolution uses `filter=index = N`, which works but is **not documented** by Vikunja —
-> its published filter-field list does not include `index`. Verified against Vikunja
-> **v2.3.0** with a negative control (`bogusfield = 1` → 400, so unknown fields are
+> its published filter-field list does not include `index`. Verified against `/api/v2` on
+> Vikunja **v2.5.0** with a negative control (`bogusfield = 1` → 400, so unknown fields are
 > rejected rather than ignored). If an upgrade removes it, resolution fails loudly with a
 > message naming this caveat; it never falls back to treating `"#454"` as id 454.
 > `tests/test_task_refs.py` carries an opt-in live canary for exactly this.
+>
+> **Why not v2's documented route?** v2 ships `GET /projects/{project}/tasks/by-index/
+> {index}`, which is this lookup, documented — and it returns **401 for an API token**
+> that does not carry the `projects → tasks_by_index` permission, which no token created
+> before v2 does. Since this server forwards *your* token rather than holding one of its
+> own, adopting the route would break `#N` refs for every existing deployment until each
+> token was re-issued. If your token does carry that permission, the switch is a one-line
+> change tracked upstream in the repo's issue for it.
 
 Not resolved: `tasks_bulk_update`'s `task_ids`, and `other_task_id` on the relation tools.
 Both still take plain ints, so a `"#454"` there is refused at schema validation.
@@ -154,16 +166,26 @@ Pass `verbose=true` on any of the three to get the upstream body back untouched.
 ambiguity — and the convenience `url` field is only added on the projected path.
 
 `pagination` is never projected: a truncated list still reports
-`{"truncated": true, "total_pages": N}` so one page is not mistaken for a whole answer.
+`{"truncated": true, "total_pages": N, "total": M, "count": K}` so one page is not mistaken
+for a whole answer. `total` is the size of the whole result set and `count` is the rows in
+*this* response — v1 could not report the former at all, and v2 does.
 
 ## Markdown descriptions & comments
 
 `description` on `task_create`/`task_update`/`project_create`/`project_update`, and the
 comment body on `comment_create`, accept plain **markdown**. Vikunja itself stores these
-fields as HTML (TipTap rich text), so the server converts markdown to HTML server-side
-before writing, then sanitizes the result with an allowlist HTML cleaner (`nh3.clean()`) —
-raw HTML embedded in agent-authored markdown (e.g. a stray `<script>` tag) is stripped, not
-passed through. No caller-side conversion is needed; just write normal markdown.
+fields as HTML (TipTap rich text), so this server converts markdown to HTML before writing,
+then sanitizes the result with an allowlist HTML cleaner (`nh3.clean()`) — raw HTML embedded
+in agent-authored markdown (e.g. a stray `<script>` tag) is stripped, not passed through. No
+caller-side conversion is needed; just write normal markdown.
+
+Vikunja v2 can do the conversion itself (`?format=markdown`), and this server deliberately
+does not use it. Conversion and sanitization are not separable: `nh3.clean()` can only run
+on HTML this process produced, so delegating the conversion would not move the sanitizer —
+it would remove it from the path. Sending `format=markdown` on a write is also lossy by
+upstream's own account (Markdown cannot express every HTML construct, so the field is
+stored as its degraded conversion), which makes it a poor fit for a server that writes
+fields humans later edit.
 
 ## Extension hooks
 
@@ -207,10 +229,12 @@ every timestamp was. Set `VIKUNJA_STALE_AFTER_DAYS` accordingly after an import.
 ### `backlog_summary`
 
 Counts, not rows — totals, done/open, and breakdowns by priority, label and staleness.
-Each bucket is one request that asks for a single row and reads the match count off the
-pagination header, so orienting in a backlog stops costing a pagination sweep. Measured on
-a 470-task tracker: 37 requests, ~150 ms, ~1.2 KB of response. The `calls` field reports
-what it cost, so the price is visible to whoever pays it.
+Each bucket is one request that reads the match count off the response envelope's `total`
+and asks for a page holding no rows at all, so orienting in a backlog stops costing a
+pagination sweep. Re-measured on v2 against a 514-task tracker: **37 requests, ~125 ms,
+15.5 KB of upstream traffic, 1.2 KB of tool response** — and 10.7 KB of that upstream
+figure is the single label listing, not the counts. The `calls` field reports what it
+cost, so the price is visible to whoever pays it.
 
 If your tracker has an "anchor" task carrying every label deliberately, name it in
 `VIKUNJA_SUMMARY_EXCLUDE_IDS` — otherwise it lands in every label bucket and inflates each
@@ -297,7 +321,7 @@ comes from the caller's `Authorization` header.
 
 | Var | Purpose | Default |
 |-----|---------|---------|
-| `VIKUNJA_URL` | Base URL of the Vikunja instance (no `/api/v1`) | **required** — no default; the server refuses to start if unset |
+| `VIKUNJA_URL` | Base URL of the Vikunja instance (no `/api/v2`) | **required** — no default; the server refuses to start if unset |
 | `VIKUNJA_HOST` | Bind address | `127.0.0.1` |
 | `VIKUNJA_PORT` | Bind port | `8501` |
 | `VIKUNJA_TRANSPORT` | `http` or `stdio` | `http` |

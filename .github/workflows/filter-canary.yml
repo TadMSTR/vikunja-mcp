@@ -2,10 +2,9 @@ name: Filter canary
 
 # Runs tests/test_filter_canary.py against a throwaway Vikunja on the FLOATING `:latest`
 # tag, which is the whole point: this server depends on undocumented filter behaviour
-# (`index` filtering, `title like`, `description like`, `labels not in`, `id !=`, and
-# `per_page=1` -> `total_pages` as an exact count), and an upstream change to any of it
-# would otherwise surface as a tool quietly returning wrong or empty results rather than
-# as a failure.
+# (`index` filtering, `title like`, `description like`, `labels not in`, `id !=`), and an
+# upstream change to any of it would otherwise surface as a tool quietly returning wrong or
+# empty results rather than as a failure.
 #
 # Deliberately NOT part of the CI required for a merge. It tests a moving external target,
 # so a red run here means "upstream moved, go look" — not "this pull request is bad".
@@ -66,25 +65,33 @@ jobs:
           # runtime uid, so it exits 1 without the FILES_BASEPATH override above. Found by
           # running exactly this locally first.
           for _ in $(seq 1 60); do
-            curl -sf --max-time 3 http://127.0.0.1:3456/api/v1/info >/dev/null && break
+            curl -sf --max-time 3 http://127.0.0.1:3456/api/v2/info >/dev/null && break
             sleep 1
           done
-          curl -sf --max-time 5 http://127.0.0.1:3456/api/v1/info
+          curl -sf --max-time 5 http://127.0.0.1:3456/api/v2/info
 
       - name: Report the version under test
         run: |
-          echo "Vikunja version: $(curl -s http://127.0.0.1:3456/api/v1/info | python -c 'import json,sys; print(json.load(sys.stdin)["version"])')"
+          echo "Vikunja version: $(curl -s http://127.0.0.1:3456/api/v2/info | python -c 'import json,sys; print(json.load(sys.stdin)["version"])')"
 
       - name: Create a user and mint a token
         id: token
         run: |
           set -euo pipefail
+          # /register is v1-only — it is absent from v2's spec and 404s there (checked
+          # against v2.5.0). Everything else in this job is on v2; this one line is what
+          # will need revisiting when upstream removes v1 at 4.0.
           curl -sf -X POST http://127.0.0.1:3456/api/v1/register \
             -H 'Content-Type: application/json' \
             -d '{"username":"canary","password":"canarypassword123","email":"canary@example.invalid"}' >/dev/null
           # Vikunja accepts the login JWT as a bearer token on the API, so no separate API
           # token has to be provisioned. Throwaway instance, throwaway credential.
-          JWT=$(curl -sf -X POST http://127.0.0.1:3456/api/v1/login \
+          #
+          # NOTE: a JWT carries the user's full permissions, where production forwards a
+          # scoped API token. The canary therefore cannot catch a token-permission
+          # regression — see vikunja#515, and the by-index case in the canary itself, which
+          # is written to accept either outcome for exactly this reason.
+          JWT=$(curl -sf -X POST http://127.0.0.1:3456/api/v2/login \
             -H 'Content-Type: application/json' \
             -d '{"username":"canary","password":"canarypassword123"}' \
             | python -c 'import json,sys; print(json.load(sys.stdin)["token"])')

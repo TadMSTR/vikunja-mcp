@@ -52,7 +52,8 @@ def wire(monkeypatch):
 
 
 def _writes(mock):
-    return [c for c in mock.await_args_list if c.args[0] == "PUT"]
+    # v2 creates with POST (v1 used PUT); this is task_create's call.
+    return [c for c in mock.await_args_list if c.args[0] == "POST"]
 
 
 def _reads(mock):

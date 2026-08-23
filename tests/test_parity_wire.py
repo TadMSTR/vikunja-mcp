@@ -20,7 +20,7 @@ import respx
 
 from vikunja_mcp import server
 
-BASE = "https://vikunja.test/api/v1"
+BASE = "https://vikunja.test/api/v2"
 
 
 @pytest.fixture(autouse=True)
@@ -34,77 +34,77 @@ def _fn(tool):
 
 @respx.mock
 async def test_team_create_puts_on_the_wire():
-    route = respx.put(f"{BASE}/teams").mock(return_value=httpx.Response(200, json={"id": 1}))
+    route = respx.post(f"{BASE}/teams").mock(return_value=httpx.Response(200, json={"id": 1}))
     await _fn(server.team_create)(name="Platform")
     assert route.called
-    assert route.calls.last.request.method == "PUT"
+    assert route.calls.last.request.method == "POST"
     assert route.calls.last.request.headers["authorization"] == "Bearer TOK"
 
 
 @respx.mock
 async def test_team_update_posts_on_the_wire():
-    route = respx.post(f"{BASE}/teams/3").mock(return_value=httpx.Response(200, json={"id": 3}))
+    route = respx.put(f"{BASE}/teams/3").mock(return_value=httpx.Response(200, json={"id": 3}))
     await _fn(server.team_update)(team_id=3, name="x")
-    assert route.calls.last.request.method == "POST"
+    assert route.calls.last.request.method == "PUT"
 
 
 @respx.mock
 async def test_project_share_create_puts_on_the_wire():
-    route = respx.put(f"{BASE}/projects/5/shares").mock(
+    route = respx.post(f"{BASE}/projects/5/shares").mock(
         return_value=httpx.Response(200, json={"id": 1})
     )
     await _fn(server.project_share_create)(project_id=5, permission=1)
-    assert route.calls.last.request.method == "PUT"
+    assert route.calls.last.request.method == "POST"
 
 
 @respx.mock
 async def test_project_team_add_puts_and_update_posts():
-    add = respx.put(f"{BASE}/projects/5/teams").mock(return_value=httpx.Response(200, json={}))
-    upd = respx.post(f"{BASE}/projects/5/teams/2").mock(return_value=httpx.Response(200, json={}))
+    add = respx.post(f"{BASE}/projects/5/teams").mock(return_value=httpx.Response(200, json={}))
+    upd = respx.put(f"{BASE}/projects/5/teams/2").mock(return_value=httpx.Response(200, json={}))
     await _fn(server.project_team_add)(project_id=5, team_id=2, permission=1)
     await _fn(server.project_team_update)(project_id=5, team_id=2, permission=2)
-    assert add.calls.last.request.method == "PUT"
-    assert upd.calls.last.request.method == "POST"
+    assert add.calls.last.request.method == "POST"
+    assert upd.calls.last.request.method == "PUT"
 
 
 @respx.mock
 async def test_bucket_create_puts_and_move_posts():
-    create = respx.put(f"{BASE}/projects/1/views/4/buckets").mock(
+    create = respx.post(f"{BASE}/projects/1/views/4/buckets").mock(
         return_value=httpx.Response(200, json={"id": 9})
     )
-    move = respx.post(f"{BASE}/projects/1/views/4/buckets/9/tasks").mock(
+    move = respx.put(f"{BASE}/projects/1/views/4/buckets/9/tasks").mock(
         return_value=httpx.Response(200, json={})
     )
     await _fn(server.bucket_create)(project_id=1, view_id=4, title="Doing")
     await _fn(server.task_bucket_move)(project_id=1, view_id=4, bucket_id=9, task_id=42)
-    assert create.calls.last.request.method == "PUT"
-    assert move.calls.last.request.method == "POST"
+    assert create.calls.last.request.method == "POST"
+    assert move.calls.last.request.method == "PUT"
 
 
 @respx.mock
 async def test_task_relation_add_puts_on_the_wire():
-    route = respx.put(f"{BASE}/tasks/7/relations").mock(return_value=httpx.Response(200, json={}))
+    route = respx.post(f"{BASE}/tasks/7/relations").mock(return_value=httpx.Response(200, json={}))
     await _fn(server.task_relation_add)(task_id=7, other_task_id=8, relation_kind="subtask")
-    assert route.calls.last.request.method == "PUT"
+    assert route.calls.last.request.method == "POST"
 
 
 @respx.mock
 async def test_task_assignee_add_puts_and_bulk_posts():
-    add = respx.put(f"{BASE}/tasks/7/assignees").mock(return_value=httpx.Response(200, json={}))
-    bulk = respx.post(f"{BASE}/tasks/7/assignees/bulk").mock(
+    add = respx.post(f"{BASE}/tasks/7/assignees").mock(return_value=httpx.Response(200, json={}))
+    bulk = respx.put(f"{BASE}/tasks/7/assignees/bulk").mock(
         return_value=httpx.Response(200, json={})
     )
     await _fn(server.task_assignee_add)(task_id=7, user_id=3)
     await _fn(server.task_assignees_add_bulk)(task_id=7, user_ids=[3, 4])
-    assert add.calls.last.request.method == "PUT"
-    assert bulk.calls.last.request.method == "POST"
+    assert add.calls.last.request.method == "POST"
+    assert bulk.calls.last.request.method == "PUT"
 
 
 @respx.mock
-async def test_tasks_bulk_update_posts_on_the_wire():
-    route = respx.post(f"{BASE}/tasks/bulk").mock(return_value=httpx.Response(200, json={}))
+async def test_tasks_bulk_update_puts_on_the_wire():
+    route = respx.put(f"{BASE}/tasks/bulk").mock(return_value=httpx.Response(200, json={}))
     await _fn(server.tasks_bulk_update)(task_ids=[1, 2], values={"done": True})
-    assert route.calls.last.request.method == "POST"
+    assert route.calls.last.request.method == "PUT"
 
 
 @respx.mock
@@ -114,7 +114,7 @@ async def test_tasks_bulk_update_sends_fields_array():
     Pinning only the verb (the test above) is exactly why the field wipe shipped, so this
     asserts the body itself: `fields` present, and covering precisely the keys of `values`.
     """
-    route = respx.post(f"{BASE}/tasks/bulk").mock(return_value=httpx.Response(200, json={}))
+    route = respx.put(f"{BASE}/tasks/bulk").mock(return_value=httpx.Response(200, json={}))
     await _fn(server.tasks_bulk_update)(task_ids=[1, 2], values={"done": True})
     body = json.loads(route.calls.last.request.content)
     assert body["fields"] == ["done"]
@@ -125,7 +125,7 @@ async def test_tasks_bulk_update_sends_fields_array():
 @respx.mock
 async def test_tasks_bulk_update_fields_covers_every_key():
     """A multi-key write must name every column it writes, in the order given."""
-    route = respx.post(f"{BASE}/tasks/bulk").mock(return_value=httpx.Response(200, json={}))
+    route = respx.put(f"{BASE}/tasks/bulk").mock(return_value=httpx.Response(200, json={}))
     values = {"done": True, "priority": 4, "percent_done": 0.5}
     await _fn(server.tasks_bulk_update)(task_ids=[7], values=values)
     body = json.loads(route.calls.last.request.content)
@@ -136,7 +136,7 @@ async def test_tasks_bulk_update_fields_covers_every_key():
 @respx.mock
 async def test_tasks_bulk_update_empty_values_writes_nothing():
     """An empty `values` must produce an empty `fields` — never an unrestricted replace."""
-    route = respx.post(f"{BASE}/tasks/bulk").mock(return_value=httpx.Response(200, json={}))
+    route = respx.put(f"{BASE}/tasks/bulk").mock(return_value=httpx.Response(200, json={}))
     await _fn(server.tasks_bulk_update)(task_ids=[7], values={})
     body = json.loads(route.calls.last.request.content)
     assert body["fields"] == []
@@ -144,13 +144,13 @@ async def test_tasks_bulk_update_empty_values_writes_nothing():
 
 @respx.mock
 async def test_attachment_upload_puts_multipart_on_the_wire():
-    route = respx.put(f"{BASE}/tasks/7/attachments").mock(
+    route = respx.post(f"{BASE}/tasks/7/attachments").mock(
         return_value=httpx.Response(200, json={"id": 1})
     )
     await _fn(server.attachment_upload)(
         task_id=7, filename="a.txt", content_base64=base64.b64encode(b"hi").decode()
     )
     req = route.calls.last.request
-    assert req.method == "PUT"
+    assert req.method == "POST"
     assert req.headers["content-type"].startswith("multipart/form-data")
     assert b"hi" in req.content

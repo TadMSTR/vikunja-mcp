@@ -15,7 +15,7 @@ flowchart LR
     end
     VLT[(Vault<br/>secret/data/vikunja/agent-*)] -.->|approle, {agent_type}| SM
     SM -->|Authorization: Bearer token| MCP[vikunja-mcp<br/>127.0.0.1:8501]
-    MCP -->|same token, verbatim| API[(Vikunja /api/v1)]
+    MCP -->|same token, verbatim| API[(Vikunja /api/v2)]
 ```
 
 There is **one** `vikunja-mcp` process. Every agent's own scoped-mcp instance proxies to it,

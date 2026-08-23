@@ -91,7 +91,7 @@ def discover_routes(source: Path) -> list[tuple[str, str]]:
 
 def check(client: httpx.Client, base: str, method: str, path: str) -> tuple[bool, str]:
     """Probe one route. Returns (ok, detail)."""
-    url = f"{base.rstrip('/')}/api/v1/{path.lstrip('/')}"
+    url = f"{base.rstrip('/')}/api/v2/{path.lstrip('/')}"
     try:
         resp = client.request(PROBE_VERB, url)
     except httpx.RequestError as exc:

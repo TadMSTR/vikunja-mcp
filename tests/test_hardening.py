@@ -60,7 +60,7 @@ async def test_webhook_create_rejects_internal_targets(_patch_calls, url):
 
 async def test_webhook_create_allows_public_ip_literal(_patch_calls):
     await call(server.webhook_create, project_id=1, target_url="https://8.8.8.8/hook", events=["x"])
-    assert _patch_calls.call_args.args[:2] == ("PUT", "/projects/1/webhooks")
+    assert _patch_calls.call_args.args[:2] == ("POST", "/projects/1/webhooks")
 
 
 async def test_webhook_create_allows_public_ipv6_literal(_patch_calls):
@@ -71,7 +71,7 @@ async def test_webhook_create_allows_public_ipv6_literal(_patch_calls):
         target_url="https://[2606:4700::1111]/hook",
         events=["x"],
     )
-    assert _patch_calls.call_args.args[:2] == ("PUT", "/projects/1/webhooks")
+    assert _patch_calls.call_args.args[:2] == ("POST", "/projects/1/webhooks")
 
 
 def test_host_blocked_when_hostname_resolves_to_private(monkeypatch):
@@ -148,7 +148,7 @@ async def test_attachment_upload_accepts_valid_base64(_patch_calls):
         filename="a.txt",
         content_base64=base64.b64encode(b"hi").decode(),
     )
-    assert _patch_calls.call_args.args[:2] == ("PUT", "/tasks/7/attachments")
+    assert _patch_calls.call_args.args[:2] == ("POST", "/tasks/7/attachments")
 
 
 # --- F-05: share password/sharing_type coupling ---------------------------
