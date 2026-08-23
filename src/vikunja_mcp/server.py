@@ -1675,6 +1675,17 @@ async def task_link_commit(task_id: int | str, ref_type: str, ref_url: str) -> d
     # One GET, to read the description this appends to — an append needs the current text
     # and no endpoint offers that server-side. The second GET this used to cost is gone
     # with the read-merge-write path (_apply_task_update is now a single PATCH).
+    #
+    # SECURITY[accepted]: GET-then-PATCH TOCTOU window on `description` alone — a concurrent
+    # edit to that field between this read and the PATCH below is silently overwritten by the
+    # merged text. This is where the risk that `_apply_task_update` used to carry actually
+    # lives now: that function's marker was retired with its read, and this one is narrower
+    # (one field, and PATCH cannot zero any other column) but real, and it predates the v2
+    # port — the GET is native to how backlinks accumulate, not an artifact of the old
+    # full-replace path. Accepted on the same grounds as the original: forge's
+    # low-concurrency, agent-driven, per-agent-token write pattern. Closing it means
+    # If-Match/ETag compare-and-swap, which v2 supports and which was deliberately scoped
+    # out of the port. Audit: 2026-08-23/vikunja-mcp-v2-port-2026-08.
     current = await request("GET", f"/tasks/{task_id}", token)
     description = current.get("description") if isinstance(current, dict) else None
     return await _apply_task_update(
