@@ -36,6 +36,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import contextlib
 import functools
 import inspect
 import ipaddress
@@ -918,6 +919,8 @@ _PRIORITIES = (0, 1, 2, 3, 4, 5)
 # Default ceiling on label buckets. Each label costs one upstream call, so an unbounded
 # vocabulary would quietly turn a cheap tool into an expensive one.
 _MAX_LABEL_BUCKETS = 25
+_LABEL_PAGE_SIZE = 100
+_LABEL_PAGE_LIMIT = 20
 
 
 def _compose(*predicates: str) -> str:
@@ -1002,6 +1005,48 @@ async def _count_matching(filter_expr: str) -> int:
         return 0
 
 
+async def _all_labels() -> tuple[list[dict], int]:
+    """Every label the caller can see, and the number upstream says exist.
+
+    The two are returned separately on purpose, and that separation is the fix for
+    vikunja#625. ``len(labels)`` is what the fetch managed to retrieve; ``total`` is what
+    exists. The old code fetched one hardcoded page of 50 and then derived truncation
+    from the fetched list alone, so truncation *caused by the fetch* cancelled out of the
+    flag whose entire job was to report it — 15 labels went uncounted while
+    ``labels_truncated`` read ``false`` and ``notes`` was empty.
+
+    ``total`` is read from v2's list envelope rather than inferred from the row count, so
+    a short final page and a curtailed listing are distinguishable. When the page limit
+    bites, ``total`` still describes reality and the caller is told the fetch fell short.
+    """
+    labels: list[dict] = []
+    total = 0
+    for page in range(1, _LABEL_PAGE_LIMIT + 1):
+        body = await request(
+            "GET",
+            "/labels",
+            caller_token(),
+            params={"per_page": _LABEL_PAGE_SIZE, "page": page},
+            unwrap_list=False,
+        )
+        if isinstance(body, dict):
+            with contextlib.suppress(TypeError, ValueError):
+                total = max(total, int(body.get("total", 0)))
+        rows = [
+            row
+            for row in _unwrap_items(body)
+            if isinstance(row, dict) and row.get("id") is not None
+        ]
+        labels.extend(rows)
+        # An empty page ends the listing. `len(labels) >= total` ends it one round-trip
+        # earlier in the common case, and is also what stops a non-envelope response
+        # (total unreadable, so 0) from costing a second, pointless call.
+        if not rows or len(labels) >= total:
+            break
+    # A `total` smaller than what arrived is not usable as "what exists".
+    return labels, max(total, len(labels))
+
+
 def _unwrap_items(result: Any) -> list[Any]:
     """The rows from a list response, whether or not it arrived in the envelope."""
     if isinstance(result, dict) and "items" in result:
@@ -1043,6 +1088,11 @@ async def backlog_summary(
     call. When the cap bites, `labels_truncated` is true and `notes` says how many were
     dropped — a truncated summary that looked complete would be worse than no summary.
 
+    `labels_truncated` is measured against the labels that **exist**, not the ones that
+    were fetched, and `notes` names which of the two causes applies. They need different
+    responses: raising `max_label_buckets` fixes a cap that bit, and does nothing at all
+    for a listing that fell short.
+
     Staleness reuses `VIKUNJA_STALE_AFTER_DAYS` and carries the same caveat as the
     per-task `stale` field: it measures when a task was last *touched*, not whether its
     text is still true. See `task_get`.
@@ -1073,15 +1123,12 @@ async def backlog_summary(
     cutoff = datetime.now(UTC) - timedelta(days=settings.stale_after_days)
     stale_cutoff = f'"{cutoff:%Y-%m-%d}"'
 
-    labels = [
-        label
-        for label in _unwrap_items(
-            await request("GET", "/labels", caller_token(), params={"per_page": 50})
-        )
-        if isinstance(label, dict) and label.get("id") is not None
-    ]
+    labels, label_total = await _all_labels()
+    label_pages = max(1, -(-len(labels) // _LABEL_PAGE_SIZE))
     kept_labels = labels[:max_label_buckets]
-    dropped = len(labels) - len(kept_labels)
+    # Two independent causes, and they call for different actions from the caller.
+    dropped_by_cap = len(labels) - len(kept_labels)
+    never_fetched = label_total - len(labels)
 
     # Fired concurrently: they are independent one-row reads, and the bucket cap is what
     # bounds the fan-out.
@@ -1105,10 +1152,17 @@ async def backlog_summary(
     )
 
     notes: list[str] = []
-    if dropped:
+    if dropped_by_cap:
         notes.append(
-            f"{dropped} of {len(labels)} labels were not counted — max_label_buckets is "
-            f"{max_label_buckets}. Raise it, or narrow the summary with `filter`."
+            f"{dropped_by_cap} of {label_total} labels were not counted — "
+            f"max_label_buckets is {max_label_buckets}. Raise it, or narrow the summary "
+            f"with `filter`."
+        )
+    if never_fetched:
+        notes.append(
+            f"{never_fetched} of {label_total} labels were never fetched — the label "
+            f"listing stopped after {_LABEL_PAGE_LIMIT} pages. Raising max_label_buckets "
+            f"will not help; narrow the summary with `filter` instead."
         )
 
     return {
@@ -1130,8 +1184,8 @@ async def backlog_summary(
             if label.get("title")
         },
         "by_staleness": {"stale": stale, "fresh": fresh},
-        "labels_truncated": bool(dropped),
-        "calls": len(_PRIORITIES) + len(kept_labels) + 5 + 1,
+        "labels_truncated": bool(dropped_by_cap or never_fetched),
+        "calls": len(_PRIORITIES) + len(kept_labels) + 5 + label_pages,
         "notes": notes,
     }
 

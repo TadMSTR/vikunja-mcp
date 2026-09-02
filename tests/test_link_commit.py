@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from vikunja_mcp import hooks, markers, server
+from vikunja_mcp import markers, server
 
 from . import fixtures
 

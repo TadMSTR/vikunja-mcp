@@ -51,7 +51,21 @@ class Upstream:
     ):
         self.calls.append({"path": path, "params": dict(params or {}), "unwrap_list": unwrap_list})
         if path == "/labels":
-            return self.labels
+            # Paginated honestly, because vikunja#625 *was* a pagination bug: the fetch
+            # asked for one hardcoded page of 50 and the truncation flag was computed
+            # against what arrived. A fake that ignores `per_page` and returns every
+            # label cannot reproduce that, and would have let the fix ship untested.
+            per_page = int((params or {}).get("per_page", 50))
+            page = int((params or {}).get("page", 1))
+            rows = self.labels[(page - 1) * per_page : page * per_page]
+            total = len(self.labels)
+            return {
+                "items": rows,
+                "total": total,
+                "page": page,
+                "per_page": per_page,
+                "total_pages": max(1, -(-total // per_page)),
+            }
         n = self.counts.get((params or {}).get("filter"), 0)
         # The count query asks for a page past the end, so `items` is empty at every count
         # — including the ones that hold matches. That is the shape being reproduced here:
@@ -377,32 +391,20 @@ async def test_untruncated_label_buckets_report_false(upstream):
 # --- upstream shapes that must not break it -------------------------------
 
 
-async def test_paginated_label_list_is_handled(upstream, monkeypatch):
-    """`label_list` wraps in the same envelope once labels span pages."""
-    fake = Upstream({}, labels=None)
+async def test_paginated_label_list_is_followed_to_the_end(upstream, monkeypatch):
+    """A label list spanning pages is summarised in full, not from page one (vikunja#625).
 
-    async def fake_request(
-        method, path, token, *, params=None, json=None, files=None, unwrap_list=True
-    ):
-        if path == "/labels":
-            return {
-                "items": _labels("type:bug", "type:chore"),
-                "pagination": {
-                    "page": 1,
-                    "total_pages": 2,
-                    "count": 2,
-                    "total": 4,
-                    "truncated": True,
-                },
-            }
-        return await Upstream.__call__(
-            fake, method, path, token, params=params, unwrap_list=unwrap_list
-        )
-
-    monkeypatch.setattr(server, "request", fake_request)
-    monkeypatch.setattr(server, "caller_token", lambda: "TOK")
+    This test previously asserted the opposite — that reading the first page of a
+    multi-page label list and stopping was correct behaviour. It was the bug, written
+    down as an invariant: the summary reported `labels_truncated: false` over a label
+    set it had only partly seen.
+    """
+    monkeypatch.setattr(server, "_LABEL_PAGE_SIZE", 2)
+    upstream({}, labels=_labels("type:bug", "type:chore", "type:docs", "agent-filed"))
     result = await call(server.backlog_summary, project_id=7)
-    assert set(result["by_label"]) == {"type:bug", "type:chore"}
+    assert set(result["by_label"]) == {"type:bug", "type:chore", "type:docs", "agent-filed"}
+    assert result["labels_truncated"] is False
+    assert result["notes"] == []
 
 
 async def test_no_labels_at_all_still_returns_a_summary(upstream):
@@ -410,3 +412,55 @@ async def test_no_labels_at_all_still_returns_a_summary(upstream):
     result = await call(server.backlog_summary, project_id=7)
     assert result["by_label"] == {}
     assert isinstance(result["total"], int)
+
+
+# --- vikunja#625: the truncation flag counts labels that EXIST ------------
+
+
+async def test_label_fetch_is_not_capped_at_one_page(upstream, monkeypatch):
+    """Every label is counted however many pages the listing spans.
+
+    The page size is pinned small on purpose. The original defect was a hardcoded
+    `per_page=50`, and raising that number to 100 would make a test written against 51
+    labels pass without the fetch ever learning to paginate — a green test measuring a
+    constant instead of the behaviour, which is the failure mode this whole build is
+    about. Pinning it means the test fails unless the fetch actually follows pages.
+    """
+    monkeypatch.setattr(server, "_LABEL_PAGE_SIZE", 10)
+    upstream({}, labels=_labels(*[f"label-{i}" for i in range(51)]))
+    result = await call(server.backlog_summary, project_id=7, max_label_buckets=100)
+    assert len(result["by_label"]) == 51
+    assert result["labels_truncated"] is False
+    assert result["notes"] == []
+
+
+async def test_truncation_is_measured_against_the_labels_that_exist(upstream, monkeypatch):
+    """`dropped` was `len(labels) - len(labels[:cap])` — both sides post-fetch.
+
+    Truncation caused by the fetch itself therefore cancelled out of its own flag. With
+    60 labels upstream and a cap of 55, the honest answer is "5 dropped"; the old code
+    fetched 50, kept 50, and reported none.
+    """
+    monkeypatch.setattr(server, "_LABEL_PAGE_SIZE", 10)
+    upstream({}, labels=_labels(*[f"label-{i}" for i in range(60)]))
+    result = await call(server.backlog_summary, project_id=7, max_label_buckets=55)
+    assert result["labels_truncated"] is True
+    assert len(result["by_label"]) == 55
+    assert "5 of 60" in " ".join(result["notes"])
+
+
+async def test_fetch_truncation_is_reported_separately_from_cap_truncation(upstream, monkeypatch):
+    """A caller who raises the cap and still sees truncation must learn why.
+
+    The two causes need different actions: raising `max_label_buckets` fixes one and
+    does nothing at all for the other. One undifferentiated note sends the caller to
+    the parameter that cannot help them.
+    """
+    monkeypatch.setattr(server, "_LABEL_PAGE_SIZE", 10)
+    monkeypatch.setattr(server, "_LABEL_PAGE_LIMIT", 1)
+    upstream({}, labels=_labels(*[f"label-{i}" for i in range(25)]))
+    result = await call(server.backlog_summary, project_id=7, max_label_buckets=100)
+    assert result["labels_truncated"] is True
+    note = " ".join(result["notes"])
+    assert "15 of 25" in note
+    assert "max_label_buckets" in note and "will not help" in note

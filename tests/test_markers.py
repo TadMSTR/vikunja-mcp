@@ -223,7 +223,7 @@ def test_lookup_fragment_matches_what_is_written():
 
 from unittest.mock import AsyncMock  # noqa: E402
 
-from vikunja_mcp import hooks, server  # noqa: E402
+from vikunja_mcp import server  # noqa: E402
 
 from . import fixtures  # noqa: E402
 
