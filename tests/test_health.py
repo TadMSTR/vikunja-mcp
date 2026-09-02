@@ -58,12 +58,32 @@ async def test_health_body_echoes_no_config():
 async def test_mcp_endpoint_is_not_open():
     """`/health` being open must not mean the app is open.
 
-    Measured, not assumed: an unadorned `GET /mcp` returns **406**, because the transport
-    rejects on content negotiation before it ever looks at credentials. Asserting a
-    specific 401 here would encode a failure mode this server does not have; what matters
-    is that the MCP surface does not serve a bare GET.
+    Asserts the *property* rather than the status code. The code is a transport detail and
+    has already moved once: fastmcp 3 refused a bare GET at content negotiation (406,
+    "Client must accept text/event-stream"), fastmcp 4 falls through to session validation
+    (400, "Missing session ID"). This test pinned `== 406` and so went red on the
+    fastmcp 3 -> 4 bump for a reason with nothing to do with the server being open — while
+    its own docstring argued against pinning a specific code. Measured under both majors.
+
+    The `tools/list` probe is the load-bearing half. A bare GET could plausibly be refused
+    by a transport that would still answer a well-formed unauthenticated call, so refusing
+    the GET alone does not establish that the surface is closed.
     """
     async with http_client() as client:
-        resp = await client.get("/mcp")
-    assert resp.status_code != 200
-    assert resp.status_code == 406
+        bare_get = await client.get("/mcp")
+        unauthenticated_call = await client.post(
+            "/mcp",
+            json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+            headers={"Accept": "application/json, text/event-stream"},
+        )
+
+    for label, resp in (
+        ("bare GET", bare_get),
+        ("unauthenticated tools/list", unauthenticated_call),
+    ):
+        assert 400 <= resp.status_code < 500, (
+            f"{label} got {resp.status_code}; expected a 4xx refusal. A 2xx means the MCP "
+            "surface is open, a 5xx means it broke rather than refused."
+        )
+        assert '"result"' not in resp.text, f"{label} returned a JSON-RPC result"
+        assert "backlog_summary" not in resp.text, f"{label} leaked the tool list"
