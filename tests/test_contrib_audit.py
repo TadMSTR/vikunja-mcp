@@ -19,8 +19,11 @@ class _CaptureLogger:
 
 @pytest.fixture(autouse=True)
 def _clean():
-    hooks.clear_hooks()
-    yield
+    """These tests register the audit hook explicitly, so they start from an empty registry.
+
+    Setup only. Restoring the built-ins is `conftest._hook_registry`'s job — doing it
+    here too is what let the wipe escape the module in the first place (vikunja#473).
+    """
     hooks.clear_hooks()
 
 

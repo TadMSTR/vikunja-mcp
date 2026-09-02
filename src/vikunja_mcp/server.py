@@ -36,6 +36,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import contextlib
 import functools
 import inspect
 import ipaddress
@@ -917,7 +918,17 @@ _PRIORITIES = (0, 1, 2, 3, 4, 5)
 
 # Default ceiling on label buckets. Each label costs one upstream call, so an unbounded
 # vocabulary would quietly turn a cheap tool into an expensive one.
-_MAX_LABEL_BUCKETS = 25
+# A safety ceiling, not a default. `max_label_buckets` defaults to "every label in
+# scope"; this bounds the fan-out for a caller that omits a scope entirely. Any fixed
+# *default* is a rot clock — forge's tracker went 41 -> 67 labels in two days, and every
+# caller that did not happen to know the current label count got a partial answer.
+_LABEL_BUCKET_CEILING = 200
+# Bounds concurrent bucket counts. httpx's default pool is 100 connections and the client
+# is built with a scalar timeout, so an unbounded fan-out at the ceiling would queue past
+# the pool timeout and surface as a network error rather than as a count.
+_BUCKET_CONCURRENCY = 16
+_LABEL_PAGE_SIZE = 100
+_LABEL_PAGE_LIMIT = 20
 
 
 def _compose(*predicates: str) -> str:
@@ -994,12 +1005,62 @@ async def _count_matching(filter_expr: str) -> int:
         params={"filter": filter_expr or None, "per_page": 1, "page": _COUNT_PAGE},
         unwrap_list=False,
     )
-    if not isinstance(result, dict):
-        return 0
-    try:
-        return int(result.get("total", 0))
-    except (TypeError, ValueError):
-        return 0
+    if isinstance(result, dict):
+        try:
+            return int(result["total"])
+        except (KeyError, TypeError, ValueError):
+            pass
+    # Falling back to 0 here is what made an uncounted bucket indistinguishable from an
+    # empty one (vikunja#624). Two shipped skills use "every `repo:*` bucket reads 0" as a
+    # negative control; a fabricated zero passes that control vacuously, which is the
+    # definition of a check that cannot fail.
+    raise VikunjaAPIError(
+        0,
+        f"could not read a count from Vikunja's response for filter {filter_expr!r}: "
+        "the body carried no readable `total`",
+    )
+
+
+async def _all_labels() -> tuple[list[dict], int]:
+    """Every label the caller can see, and the number upstream says exist.
+
+    The two are returned separately on purpose, and that separation is the fix for
+    vikunja#625. ``len(labels)`` is what the fetch managed to retrieve; ``total`` is what
+    exists. The old code fetched one hardcoded page of 50 and then derived truncation
+    from the fetched list alone, so truncation *caused by the fetch* cancelled out of the
+    flag whose entire job was to report it — 15 labels went uncounted while
+    ``labels_truncated`` read ``false`` and ``notes`` was empty.
+
+    ``total`` is read from v2's list envelope rather than inferred from the row count, so
+    a short final page and a curtailed listing are distinguishable. When the page limit
+    bites, ``total`` still describes reality and the caller is told the fetch fell short.
+    """
+    labels: list[dict] = []
+    total = 0
+    for page in range(1, _LABEL_PAGE_LIMIT + 1):
+        body = await request(
+            "GET",
+            "/labels",
+            caller_token(),
+            params={"per_page": _LABEL_PAGE_SIZE, "page": page},
+            unwrap_list=False,
+        )
+        if isinstance(body, dict):
+            with contextlib.suppress(TypeError, ValueError):
+                total = max(total, int(body.get("total", 0)))
+        rows = [
+            row
+            for row in _unwrap_items(body)
+            if isinstance(row, dict) and row.get("id") is not None
+        ]
+        labels.extend(rows)
+        # An empty page ends the listing. `len(labels) >= total` ends it one round-trip
+        # earlier in the common case, and is also what stops a non-envelope response
+        # (total unreadable, so 0) from costing a second, pointless call.
+        if not rows or len(labels) >= total:
+            break
+    # A `total` smaller than what arrived is not usable as "what exists".
+    return labels, max(total, len(labels))
 
 
 def _unwrap_items(result: Any) -> list[Any]:
@@ -1014,38 +1075,52 @@ async def backlog_summary(
     project_id: int | None = None,
     filter: str = "",
     include_done: bool = False,
-    max_label_buckets: int = _MAX_LABEL_BUCKETS,
+    max_label_buckets: int | None = None,
 ) -> dict:
     """Counts describing the shape of a backlog, without paginating through it.
 
-    Answers "what is in here and what needs attention" in one small response: totals,
-    done vs open, a breakdown by priority, by label, and by staleness. Returns **counts
-    only — no task rows**. When you know which bucket you care about, follow up with
-    `task_list` using the same filter.
+        Answers "what is in here and what needs attention" in one small response: totals,
+        done vs open, a breakdown by priority, by label, and by staleness. Returns **counts
+        only — no task rows**. When you know which bucket you care about, follow up with
+        `task_list` using the same filter.
 
-    This is cheap by construction. Each bucket is one request that asks for a single row
-    and reads the match count off the response envelope's `total`, so a summary of a
-    500-task tracker moves a few hundred bytes rather than several megabytes. The `calls`
-    field in the response reports exactly how many upstream requests it cost, so the price
-    is visible to whoever is paying it.
+        This is cheap by construction. Each bucket is one request that asks for a single row
+        and reads the match count off the response envelope's `total`, so a summary of a
+        500-task tracker moves a few hundred bytes rather than several megabytes. The `calls`
+        field in the response reports exactly how many upstream requests it cost, so the price
+        is visible to whoever is paying it.
 
-    `project_id` scopes the summary to one project; omit it to summarise everything you
-    can see. `filter` is any additional Vikunja filter expression and is composed into
-    *every* bucket, so `filter="priority >= 3"` gives the shape of the urgent work alone.
-    `scope.filter` in the response is the exact expression the buckets were counted over —
-    read it rather than inferring what was included.
+        `project_id` scopes the summary to one project; omit it to summarise everything you
+        can see. `filter` is any additional Vikunja filter expression and is composed into
+        *every* bucket, so `filter="priority >= 3"` gives the shape of the urgent work alone.
+        `scope.filter` in the response is the exact expression the buckets were counted over —
+        read it rather than inferring what was included.
 
-    By default the buckets cover **open** tasks only, since "backlog" usually means work
-    outstanding; `total`, `done` and `not_done` always describe the full scope regardless.
-    Pass `include_done=true` to bucket everything.
+        By default the buckets cover **open** tasks only, since "backlog" usually means work
+        outstanding; `total`, `done` and `not_done` always describe the full scope regardless.
+        Pass `include_done=true` to bucket everything.
 
-    Label buckets are capped at `max_label_buckets` (default 25) because each one costs a
-    call. When the cap bites, `labels_truncated` is true and `notes` says how many were
-    dropped — a truncated summary that looked complete would be worse than no summary.
+    By default **every label in scope** gets a bucket. Each bucket costs one call, so
+        `max_label_buckets` is there to buy the summary back down — but truncation is now
+        something you opt into rather than something you have to know the current label count
+        to avoid. A hard ceiling of 200 buckets bounds the fan-out and says so when it bites.
 
-    Staleness reuses `VIKUNJA_STALE_AFTER_DAYS` and carries the same caveat as the
-    per-task `stale` field: it measures when a task was last *touched*, not whether its
-    text is still true. See `task_get`.
+        `labels_truncated` is measured against the labels that **exist**, not the ones that
+        were fetched, and `notes` names which cause applies. They need different responses:
+        raising `max_label_buckets` fixes a cap that bit and does nothing at all for a
+        listing that fell short.
+
+        A bucket that was not counted is **absent** from `by_label` and named in
+        `labels_not_counted`. It is never reported as `0` — a zero that means "not measured"
+        is indistinguishable from one that means "nothing here", and consumers use the latter
+        as a negative control.
+
+        `by_label` is keyed by label *title*, and titles are not unique. Every label sharing a
+        title forms one bucket, counted over all of their ids together.
+
+        Staleness reuses `VIKUNJA_STALE_AFTER_DAYS` and carries the same caveat as the
+        per-task `stale` field: it measures when a task was last *touched*, not whether its
+        text is still true. See `task_get`.
     """
     settings = get_settings()
     excluded = settings.excluded_task_ids
@@ -1073,42 +1148,130 @@ async def backlog_summary(
     cutoff = datetime.now(UTC) - timedelta(days=settings.stale_after_days)
     stale_cutoff = f'"{cutoff:%Y-%m-%d}"'
 
-    labels = [
-        label
-        for label in _unwrap_items(
-            await request("GET", "/labels", caller_token(), params={"per_page": 50})
-        )
-        if isinstance(label, dict) and label.get("id") is not None
-    ]
-    kept_labels = labels[:max_label_buckets]
-    dropped = len(labels) - len(kept_labels)
+    labels, label_total = await _all_labels()
+    label_pages = max(1, -(-len(labels) // _LABEL_PAGE_SIZE))
+
+    # One bucket per distinct *title*, counted over every id carrying it. `by_label` is
+    # keyed by title and titles are not unique — forge's tracker carries `source:github`
+    # as id 1 and again as id 38, created by two different agents five days apart. A
+    # bucket per id therefore collided in the output dict and the surviving number was
+    # whichever id the cap happened to include last: 0 at cap 25, 9 at cap 45, same
+    # backlog (vikunja#624).
+    ids_by_title: dict[str, list[int]] = {}
+    unbucketable = 0
+    for label in labels:
+        title = label.get("title")
+        # The id is coerced to int *before* it is used as a key's value, not while being
+        # appended: these ids come off an upstream response and are interpolated straight
+        # into a filter expression, which is the one place in this tool where an external
+        # value that is not the caller's own `filter` reaches a query. See `_compose`,
+        # whose grouping exists for the same reason.
+        try:
+            label_id: int | None = int(label["id"])
+        except (KeyError, TypeError, ValueError):
+            label_id = None
+        # A title with no usable id must not become a bucket. Coercing during `append`
+        # would leave `setdefault` having already created an empty list, and an empty id
+        # list renders as `labels in ` — a malformed filter whose count comes back 0,
+        # which is a fabricated zero wearing the same clothes as vikunja#624.
+        if not title or label_id is None:
+            unbucketable += 1
+            log.warning("vikunja_label_unbucketable", title=title, value=label.get("id"))
+            continue
+        ids_by_title.setdefault(title, []).append(label_id)
+
+    titles = list(ids_by_title)
+    requested = _LABEL_BUCKET_CEILING if max_label_buckets is None else max_label_buckets
+    cap = max(0, min(requested, _LABEL_BUCKET_CEILING))
+    kept_titles = titles[:cap]
+    # Two independent causes, and they call for different actions from the caller.
+    dropped_by_cap = titles[cap:]
+    never_fetched = label_total - len(labels)
+    gate = asyncio.Semaphore(_BUCKET_CONCURRENCY)
+
+    async def _count_bucket(filter_expr: str) -> int:
+        async with gate:
+            return await _count_matching(filter_expr)
 
     # Fired concurrently: they are independent one-row reads, and the bucket cap is what
     # bounds the fan-out.
     priority_counts, label_counts, (total, done, not_done, stale, fresh) = await asyncio.gather(
         asyncio.gather(
-            *(_count_matching(_compose(*bucket_predicates, f"priority = {p}")) for p in _PRIORITIES)
+            *(_count_bucket(_compose(*bucket_predicates, f"priority = {p}")) for p in _PRIORITIES)
         ),
+        # `return_exceptions` so one unreadable bucket costs that bucket rather than the
+        # whole summary. It is reported as absent-and-named, never as a zero.
         asyncio.gather(
             *(
-                _count_matching(_compose(*bucket_predicates, f"labels in {label['id']}"))
-                for label in kept_labels
-            )
+                _count_bucket(
+                    _compose(
+                        *bucket_predicates,
+                        f"labels in {', '.join(str(i) for i in ids_by_title[title])}",
+                    )
+                )
+                for title in kept_titles
+            ),
+            return_exceptions=True,
         ),
+        # No `return_exceptions` here, and the asymmetry with the label buckets above is
+        # deliberate rather than an oversight (raised as a Low in the 2026-09-02 audit,
+        # which asked for the choice to be made explicitly instead of by omission).
+        #
+        # A label bucket is one row of an answer: losing it costs that row, and the loss is
+        # reported by name in `labels_not_counted`, so the summary stays useful and honest.
+        # `total`, `done` and `not_done` *are* the answer. A summary that quietly reports
+        # the wrong total is worse than one that fails — that was the pre-#624 behaviour,
+        # where an unreadable response became a fabricated 0 indistinguishable from a real
+        # one. Failing the call is the loud version of the same event, and the exception
+        # carries only the filter expression (see `VikunjaAPIError`), never a credential.
         asyncio.gather(
-            _count_matching(base),
-            _count_matching(_compose(*base_predicates, "done = true")),
-            _count_matching(_compose(*base_predicates, "done = false")),
-            _count_matching(_compose(*bucket_predicates, f"updated < {stale_cutoff}")),
-            _count_matching(_compose(*bucket_predicates, f"updated >= {stale_cutoff}")),
+            _count_bucket(base),
+            _count_bucket(_compose(*base_predicates, "done = true")),
+            _count_bucket(_compose(*base_predicates, "done = false")),
+            _count_bucket(_compose(*bucket_predicates, f"updated < {stale_cutoff}")),
+            _count_bucket(_compose(*bucket_predicates, f"updated >= {stale_cutoff}")),
         ),
     )
 
+    by_label: dict[str, int] = {}
+    failed_titles: list[str] = []
+    for title, count in zip(kept_titles, label_counts, strict=True):
+        if isinstance(count, BaseException):
+            failed_titles.append(title)
+            log.warning("vikunja_label_bucket_uncounted", label=title, error=str(count))
+        else:
+            by_label[title] = count
+
+    skipped = set(dropped_by_cap) | set(failed_titles)
+    labels_not_counted = [title for title in titles if title in skipped]
+
     notes: list[str] = []
-    if dropped:
+    if dropped_by_cap:
         notes.append(
-            f"{dropped} of {len(labels)} labels were not counted — max_label_buckets is "
-            f"{max_label_buckets}. Raise it, or narrow the summary with `filter`."
+            f"{len(dropped_by_cap)} of {len(titles)} label buckets were not counted — "
+            f"max_label_buckets is {requested}. Raise it, or narrow the summary with "
+            f"`filter`. They are named in `labels_not_counted`."
+        )
+    if requested > _LABEL_BUCKET_CEILING:
+        notes.append(
+            f"max_label_buckets was {requested}, clamped to the {_LABEL_BUCKET_CEILING}"
+            "-bucket ceiling. Narrow the summary with `filter` instead."
+        )
+    if failed_titles:
+        notes.append(
+            f"{len(failed_titles)} label bucket(s) could not be counted and are omitted "
+            f"rather than reported as 0: {', '.join(failed_titles)}."
+        )
+    if unbucketable:
+        notes.append(
+            f"{unbucketable} label(s) could not be bucketed — `by_label` is keyed by title "
+            "and counted by numeric id, and these carried no usable title or id."
+        )
+    if never_fetched:
+        notes.append(
+            f"{never_fetched} of {label_total} labels were never fetched — the label "
+            f"listing stopped after {_LABEL_PAGE_LIMIT} pages. Raising max_label_buckets "
+            f"will not help; narrow the summary with `filter` instead."
         )
 
     return {
@@ -1124,14 +1287,11 @@ async def backlog_summary(
         "done": done,
         "not_done": not_done,
         "by_priority": {str(p): c for p, c in zip(_PRIORITIES, priority_counts, strict=True)},
-        "by_label": {
-            label["title"]: count
-            for label, count in zip(kept_labels, label_counts, strict=True)
-            if label.get("title")
-        },
+        "by_label": by_label,
+        "labels_not_counted": labels_not_counted,
         "by_staleness": {"stale": stale, "fresh": fresh},
-        "labels_truncated": bool(dropped),
-        "calls": len(_PRIORITIES) + len(kept_labels) + 5 + 1,
+        "labels_truncated": bool(labels_not_counted or never_fetched or unbucketable),
+        "calls": len(_PRIORITIES) + len(kept_titles) + 5 + label_pages,
         "notes": notes,
     }
 

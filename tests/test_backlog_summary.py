@@ -20,6 +20,7 @@ from __future__ import annotations
 import pytest
 
 from vikunja_mcp import config, server
+from vikunja_mcp.exceptions import VikunjaAPIError
 
 
 def _fn(tool):
@@ -51,7 +52,21 @@ class Upstream:
     ):
         self.calls.append({"path": path, "params": dict(params or {}), "unwrap_list": unwrap_list})
         if path == "/labels":
-            return self.labels
+            # Paginated honestly, because vikunja#625 *was* a pagination bug: the fetch
+            # asked for one hardcoded page of 50 and the truncation flag was computed
+            # against what arrived. A fake that ignores `per_page` and returns every
+            # label cannot reproduce that, and would have let the fix ship untested.
+            per_page = int((params or {}).get("per_page", 50))
+            page = int((params or {}).get("page", 1))
+            rows = self.labels[(page - 1) * per_page : page * per_page]
+            total = len(self.labels)
+            return {
+                "items": rows,
+                "total": total,
+                "page": page,
+                "per_page": per_page,
+                "total_pages": max(1, -(-total // per_page)),
+            }
         n = self.counts.get((params or {}).get("filter"), 0)
         # The count query asks for a page past the end, so `items` is empty at every count
         # — including the ones that hold matches. That is the shape being reproduced here:
@@ -126,15 +141,28 @@ async def test_count_reads_total_not_total_pages(monkeypatch):
     assert await server._count_matching("project = 7") == 206
 
 
-async def test_count_degrades_to_zero_on_an_unusable_total(monkeypatch):
-    """A malformed count must not take the whole summary down with it."""
+async def test_count_refuses_an_unusable_total_rather_than_calling_it_zero(monkeypatch):
+    """This test used to assert the opposite, and the opposite was vikunja#624.
+
+    Its rationale — "a malformed count must not take the whole summary down with it" —
+    is still right, and is still honoured: a label bucket that cannot be counted is
+    omitted and named rather than failing the summary (see the #624 tests below). What
+    changed is *where* that tolerance lives. Degrading to `0` inside the counting
+    primitive bought resilience by fabricating a number, and the fabricated number was
+    indistinguishable from a real zero at every call site — including the two shipped
+    skills that use "this bucket reads 0" as a negative control.
+
+    The headline counts (`total`, `done`, `not_done`) deliberately do *not* get that
+    tolerance. A summary whose totals are wrong is worse than one that says it failed.
+    """
 
     async def fake(method, path, token, *, params=None, json=None, files=None, unwrap_list=True):
         return {"items": [], "total": "many"}
 
     monkeypatch.setattr(server, "request", fake)
     monkeypatch.setattr(server, "caller_token", lambda: "TOK")
-    assert await server._count_matching("project = 7") == 0
+    with pytest.raises(VikunjaAPIError, match="could not read a count"):
+        await server._count_matching("project = 7")
 
 
 # --- it counts rather than fetching ---------------------------------------
@@ -377,32 +405,20 @@ async def test_untruncated_label_buckets_report_false(upstream):
 # --- upstream shapes that must not break it -------------------------------
 
 
-async def test_paginated_label_list_is_handled(upstream, monkeypatch):
-    """`label_list` wraps in the same envelope once labels span pages."""
-    fake = Upstream({}, labels=None)
+async def test_paginated_label_list_is_followed_to_the_end(upstream, monkeypatch):
+    """A label list spanning pages is summarised in full, not from page one (vikunja#625).
 
-    async def fake_request(
-        method, path, token, *, params=None, json=None, files=None, unwrap_list=True
-    ):
-        if path == "/labels":
-            return {
-                "items": _labels("type:bug", "type:chore"),
-                "pagination": {
-                    "page": 1,
-                    "total_pages": 2,
-                    "count": 2,
-                    "total": 4,
-                    "truncated": True,
-                },
-            }
-        return await Upstream.__call__(
-            fake, method, path, token, params=params, unwrap_list=unwrap_list
-        )
-
-    monkeypatch.setattr(server, "request", fake_request)
-    monkeypatch.setattr(server, "caller_token", lambda: "TOK")
+    This test previously asserted the opposite — that reading the first page of a
+    multi-page label list and stopping was correct behaviour. It was the bug, written
+    down as an invariant: the summary reported `labels_truncated: false` over a label
+    set it had only partly seen.
+    """
+    monkeypatch.setattr(server, "_LABEL_PAGE_SIZE", 2)
+    upstream({}, labels=_labels("type:bug", "type:chore", "type:docs", "agent-filed"))
     result = await call(server.backlog_summary, project_id=7)
-    assert set(result["by_label"]) == {"type:bug", "type:chore"}
+    assert set(result["by_label"]) == {"type:bug", "type:chore", "type:docs", "agent-filed"}
+    assert result["labels_truncated"] is False
+    assert result["notes"] == []
 
 
 async def test_no_labels_at_all_still_returns_a_summary(upstream):
@@ -410,3 +426,186 @@ async def test_no_labels_at_all_still_returns_a_summary(upstream):
     result = await call(server.backlog_summary, project_id=7)
     assert result["by_label"] == {}
     assert isinstance(result["total"], int)
+
+
+# --- vikunja#625: the truncation flag counts labels that EXIST ------------
+
+
+async def test_label_fetch_is_not_capped_at_one_page(upstream, monkeypatch):
+    """Every label is counted however many pages the listing spans.
+
+    The page size is pinned small on purpose. The original defect was a hardcoded
+    `per_page=50`, and raising that number to 100 would make a test written against 51
+    labels pass without the fetch ever learning to paginate — a green test measuring a
+    constant instead of the behaviour, which is the failure mode this whole build is
+    about. Pinning it means the test fails unless the fetch actually follows pages.
+    """
+    monkeypatch.setattr(server, "_LABEL_PAGE_SIZE", 10)
+    upstream({}, labels=_labels(*[f"label-{i}" for i in range(51)]))
+    result = await call(server.backlog_summary, project_id=7, max_label_buckets=100)
+    assert len(result["by_label"]) == 51
+    assert result["labels_truncated"] is False
+    assert result["notes"] == []
+
+
+async def test_truncation_is_measured_against_the_labels_that_exist(upstream, monkeypatch):
+    """`dropped` was `len(labels) - len(labels[:cap])` — both sides post-fetch.
+
+    Truncation caused by the fetch itself therefore cancelled out of its own flag. With
+    60 labels upstream and a cap of 55, the honest answer is "5 dropped"; the old code
+    fetched 50, kept 50, and reported none.
+    """
+    monkeypatch.setattr(server, "_LABEL_PAGE_SIZE", 10)
+    upstream({}, labels=_labels(*[f"label-{i}" for i in range(60)]))
+    result = await call(server.backlog_summary, project_id=7, max_label_buckets=55)
+    assert result["labels_truncated"] is True
+    assert len(result["by_label"]) == 55
+    assert "5 of 60" in " ".join(result["notes"])
+
+
+async def test_fetch_truncation_is_reported_separately_from_cap_truncation(upstream, monkeypatch):
+    """A caller who raises the cap and still sees truncation must learn why.
+
+    The two causes need different actions: raising `max_label_buckets` fixes one and
+    does nothing at all for the other. One undifferentiated note sends the caller to
+    the parameter that cannot help them.
+    """
+    monkeypatch.setattr(server, "_LABEL_PAGE_SIZE", 10)
+    monkeypatch.setattr(server, "_LABEL_PAGE_LIMIT", 1)
+    upstream({}, labels=_labels(*[f"label-{i}" for i in range(25)]))
+    result = await call(server.backlog_summary, project_id=7, max_label_buckets=100)
+    assert result["labels_truncated"] is True
+    note = " ".join(result["notes"])
+    assert "15 of 25" in note
+    assert "max_label_buckets" in note and "will not help" in note
+
+
+# --- vikunja#624: a bucket that was not counted must not read as a zero ---
+
+
+async def test_labels_sharing_a_title_are_one_bucket_over_every_id(upstream):
+    """Two labels, one title, one bucket — counted over both ids.
+
+    `by_label` is keyed by title, and titles are not unique: forge's tracker carries
+    `source:github` as id 1 *and* id 38, created by different agents five days apart.
+    The dict comprehension silently kept whichever came last, so the reported number was
+    a function of the bucket cap rather than of the backlog.
+    """
+    fake = upstream(
+        {"(project = 7) && (done = false) && (labels in 30, 31)": 9},
+        labels=[{"id": 30, "title": "source:github"}, {"id": 31, "title": "source:github"}],
+    )
+    result = await call(server.backlog_summary, project_id=7)
+    assert result["by_label"] == {"source:github": 9}
+    assert sum("labels in" in c["params"]["filter"] for c in fake.task_calls) == 1
+
+
+@pytest.mark.parametrize("cap", [1, 2, 4])
+async def test_a_shadowed_duplicate_reads_the_same_at_every_cap(upstream, cap):
+    """The measured #624 symptom: `source:github` read 0 at cap 25 and 9 at cap 45.
+
+    Same label, same filter, same backlog — only the cap differed. A count that moves
+    with a display parameter is not a count.
+    """
+    upstream(
+        {"(project = 7) && (done = false) && (labels in 30, 33)": 9},
+        labels=[
+            {"id": 30, "title": "source:github"},
+            {"id": 31, "title": "filler-a"},
+            {"id": 32, "title": "filler-b"},
+            {"id": 33, "title": "source:github"},
+        ],
+    )
+    result = await call(server.backlog_summary, project_id=7, max_label_buckets=cap)
+    assert result["by_label"]["source:github"] == 9
+
+
+async def test_every_label_in_scope_is_counted_by_default(upstream):
+    """No cap argument means every label, not the first 25.
+
+    A fixed default is a rot clock: the tracker went 41 -> 67 labels in two days, and
+    every caller that did not happen to know the current label count got a silently
+    partial answer. Truncation is now something a caller opts into.
+    """
+    upstream({}, labels=_labels(*[f"label-{i}" for i in range(40)]))
+    result = await call(server.backlog_summary, project_id=7)
+    assert len(result["by_label"]) == 40
+    assert result["labels_truncated"] is False
+    assert result["labels_not_counted"] == []
+
+
+async def test_uncounted_labels_are_named_not_merely_counted(upstream):
+    """ "How many were dropped" does not tell a caller whether the one they care about was.
+
+    A consumer using "every `repo:*` bucket reads 0" as a negative control needs to know
+    *which* labels went uncounted, not just that some did — otherwise an absent bucket and
+    a genuinely empty one are still indistinguishable at the point the control is read.
+    """
+    upstream({}, labels=_labels("a", "b", "c", "d", "e"))
+    result = await call(server.backlog_summary, project_id=7, max_label_buckets=2)
+    assert set(result["by_label"]) == {"a", "b"}
+    assert result["labels_not_counted"] == ["c", "d", "e"]
+    assert result["labels_truncated"] is True
+
+
+async def test_an_unreadable_count_is_not_reported_as_zero(monkeypatch):
+    """`_count_matching` returned 0 for any body it could not read a `total` off.
+
+    A real zero and an unreadable response were the same value, so a bucket whose count
+    never happened certified "nothing here" — which is exactly what #624 says a control
+    that cannot fail does.
+    """
+
+    async def unreadable(
+        method, path, token, *, params=None, json=None, files=None, unwrap_list=True
+    ):
+        return {"ok": True}
+
+    monkeypatch.setattr(server, "request", unreadable)
+    monkeypatch.setattr(server, "caller_token", lambda: "TOK")
+    with pytest.raises(Exception, match="count"):
+        await server._count_matching("project = 7")
+
+
+async def test_a_bucket_that_cannot_be_counted_is_omitted_and_named(upstream, monkeypatch):
+    """One unreadable bucket must not silently become a zero in an otherwise fine summary."""
+    fake = upstream(
+        {"(project = 7) && (done = false) && (labels in 31)": 4},
+        labels=[{"id": 30, "title": "broken"}, {"id": 31, "title": "fine"}],
+    )
+    inner = fake.__call__
+
+    async def flaky(method, path, token, *, params=None, json=None, files=None, unwrap_list=True):
+        if "labels in 30" in ((params or {}).get("filter") or ""):
+            return {"ok": True}
+        return await inner(
+            method, path, token, params=params, json=json, files=files, unwrap_list=unwrap_list
+        )
+
+    monkeypatch.setattr(server, "request", flaky)
+    result = await call(server.backlog_summary, project_id=7)
+    assert result["by_label"] == {"fine": 4}
+    assert result["labels_not_counted"] == ["broken"]
+    assert result["labels_truncated"] is True
+
+
+async def test_a_non_numeric_label_id_never_reaches_the_filter(upstream):
+    """Label ids are interpolated into a filter expression, so they are coerced first.
+
+    `_compose` groups each predicate because one of them is caller-supplied and Vikunja
+    parses left to right; a label id is the other external value that reaches a query, and
+    it arrives from an upstream response rather than from the caller. Coercing to int is
+    what keeps it from being a second injection point.
+    """
+    fake = upstream(
+        {"(project = 7) && (done = false) && (labels in 31)": 3},
+        labels=[
+            {"id": "1 || done = true", "title": "hostile"},
+            {"id": 31, "title": "fine"},
+        ],
+    )
+    result = await call(server.backlog_summary, project_id=7)
+    assert result["by_label"] == {"fine": 3}
+    # Narrow on purpose: the summary always issues a legitimate `done = true` totals
+    # bucket, so asserting on that substring alone would fail on the success path.
+    assert all("1 || done = true" not in c["params"]["filter"] for c in fake.task_calls)

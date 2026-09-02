@@ -16,20 +16,12 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from vikunja_mcp import hooks, markers, server
+from vikunja_mcp import markers, server
 
 from . import fixtures
 
 PR_URL = "https://github.com/TadMSTR/vikunja-mcp/pull/14"
 COMMIT_URL = "https://github.com/TadMSTR/vikunja-mcp/commit/23cea98"
-
-
-@pytest.fixture(autouse=True)
-def _builtins():
-    hooks.clear_hooks()
-    server.register_builtin_hooks()
-    yield
-    hooks.clear_hooks()
 
 
 @pytest.fixture

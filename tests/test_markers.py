@@ -223,27 +223,12 @@ def test_lookup_fragment_matches_what_is_written():
 
 from unittest.mock import AsyncMock  # noqa: E402
 
-from vikunja_mcp import hooks, server  # noqa: E402
+from vikunja_mcp import server  # noqa: E402
 
 from . import fixtures  # noqa: E402
 
 MARKED_BODY = "<p>real ticket content</p>\n<hr>\n<p>vikunja-mcp: idem=abc123</p>"
 WEB_EDITED_BODY = "<p>real ticket content</p><hr><p>vikunja-mcp: idem=abc123</p>"
-
-
-@pytest.fixture(autouse=True)
-def _builtins():
-    """Exercise the shipped guardrails, not a bare tool — that is the thing under test.
-
-    Also required for isolation: `test_hooks.py` and `test_contrib_audit.py` clear the
-    hook registry on teardown without restoring it, so a module that merely *assumes* the
-    import-time registration passes alone and fails in the full suite. Matches the
-    `_builtins` fixture in `test_task_refs.py`.
-    """
-    hooks.clear_hooks()
-    server.register_builtin_hooks()
-    yield
-    hooks.clear_hooks()
 
 
 @pytest.fixture

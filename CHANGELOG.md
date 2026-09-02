@@ -6,6 +6,65 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.10.0] — 2026-09-02
+
+Four defects with one root cause: a signal that reported success whether or not the thing it
+measured had happened. Each was found by a check that had already passed.
+
+### Fixed
+- **`labels_truncated` now means what its name says** (vikunja#625). `dropped` was
+  `len(labels) - len(labels[:cap])`, where `labels` came from a hardcoded `per_page=50` fetch
+  of page one — both sides post-fetch, so truncation caused by the fetch cancelled out of the
+  flag whose only job was to report it. Measured on a 67-label tracker: 50 buckets at
+  `max_label_buckets=70` *and* at 200, with `labels_truncated: false` and `notes: []`. No
+  caller-side parameter fixed it. The label listing is now followed to the end, truncation is
+  measured against the labels that exist, and the two causes (a cap that bit, a listing that
+  fell short) are reported separately because they call for different actions.
+- **A bucket that was not counted no longer reads as `0`** (vikunja#624). `by_label` is keyed
+  by label title, and titles are not unique — one tracker carried `source:github` as id 1 and
+  again as id 38 — so one bucket per id collided in the output dict and the surviving number
+  depended on where the cap fell: 0 at cap 25, 9 at cap 45, same backlog. Labels sharing a
+  title are now a single bucket counted over all of their ids. `_count_matching` no longer
+  returns 0 for a response it cannot read a `total` off; label buckets tolerate that per
+  bucket, reporting it as absent-and-named rather than as a number nobody measured.
+- **The CI filter canary can now detect what it exists to detect** (vikunja#515). It
+  authenticated with a login JWT, which carries the user's whole permission set where
+  production forwards a scoped API token, so a route unreachable by every real caller read
+  healthy — with a green weekly run to say so. The workflow now mints a scoped API token
+  that deliberately excludes `projects.tasks_by_index`, and the by-index assertion is `401`
+  outright rather than "200 or 401". Measured on v2.6.0, same instance and moment: JWT 200,
+  scoped token 401.
+- **The test suite no longer leaks a wiped hook registry between modules** (vikunja#473).
+  Two modules cleared the registry on teardown without restoring the built-ins, so the next
+  module added passed alone and failed in the suite, with a failure that read as a bug in the
+  code under test. Clear-and-restore now lives in one autouse fixture in `tests/conftest.py`;
+  five per-module workarounds are gone.
+
+### Security
+- **The CI filter canary's API token is narrowed to a measured minimum.** Following the
+  2026-09-02 audit, each candidate permission set was minted against a throwaway v2.6.0 and
+  the whole canary run against it: `projects.read_all`, `projects.read_one`,
+  `labels.read_all` and `tasks.read_one` are unnecessary and are dropped. `projects.delete`
+  and `labels.delete` are kept despite stripping them also passing — the fixture teardown
+  calls both without `raise_for_status()`, so a 401 there is discarded and the run stays
+  green while cleanup silently does nothing. That green is the absence of a check, not
+  evidence the calls are unused.
+- **Label ids are coerced to `int` before reaching a filter expression.** They arrive from an
+  upstream response and were interpolated directly. `_compose`'s per-predicate grouping
+  already contained any `||`, so this is defence in depth rather than a fix for a scope
+  escape — but coercing *before* insertion also closes a fabricated zero: coercing during
+  `append` leaves `setdefault`'s empty list behind, and an empty id list renders as
+  `labels in `, whose count comes back 0.
+
+### Changed — BREAKING
+- **`backlog_summary` gained `labels_not_counted`**, listing by name the buckets that were
+  skipped. "How many were dropped" does not tell a consumer whether the label it cares about
+  was one of them, which is what a "this bucket reads 0" negative control needs to know.
+- **`max_label_buckets` now defaults to every label in scope**, rather than 25, with a
+  200-bucket ceiling that reports itself when it bites. A fixed default of 25 was already
+  wrong against 67 labels; any fixed default is a rot clock. Truncation is now opted into.
+  Callers passing an explicit value are unaffected.
+
 ## [0.9.0] — 2026-08-23
 
 Ported from Vikunja's `/api/v1` to `/api/v2`. v1 is frozen upstream at 2.4.0 — every route

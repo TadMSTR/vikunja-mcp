@@ -25,16 +25,6 @@ from vikunja_mcp.exceptions import VikunjaAPIError
 from . import fixtures
 
 
-@pytest.fixture(autouse=True)
-def _builtins():
-    """Exercise the shipped guardrails, not a bare tool — that is the thing under test."""
-    hooks.clear_hooks()
-    server.register_builtin_hooks()
-    yield
-    hooks.clear_hooks()
-    server.register_builtin_hooks()
-
-
 @pytest.fixture
 def _upstream(monkeypatch):
     mock = AsyncMock(return_value=fixtures.task())

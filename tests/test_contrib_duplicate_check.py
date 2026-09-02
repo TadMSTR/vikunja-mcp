@@ -23,15 +23,6 @@ from vikunja_mcp import hooks, server
 from vikunja_mcp.contrib import duplicate_check as dc
 
 
-@pytest.fixture(autouse=True)
-def _clean_hooks():
-    hooks.clear_hooks()
-    server.register_builtin_hooks()
-    yield
-    hooks.clear_hooks()
-    server.register_builtin_hooks()
-
-
 def _fn(tool):
     return tool if callable(tool) and not hasattr(tool, "fn") else tool.fn
 

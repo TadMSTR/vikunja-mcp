@@ -74,7 +74,7 @@ jobs:
         run: |
           echo "Vikunja version: $(curl -s http://127.0.0.1:3456/api/v2/info | python -c 'import json,sys; print(json.load(sys.stdin)["version"])')"
 
-      - name: Create a user and mint a token
+      - name: Create a user and mint a scoped API token
         id: token
         run: |
           set -euo pipefail
@@ -84,24 +84,55 @@ jobs:
           curl -sf -X POST http://127.0.0.1:3456/api/v1/register \
             -H 'Content-Type: application/json' \
             -d '{"username":"canary","password":"canarypassword123","email":"canary@example.invalid"}' >/dev/null
-          # Vikunja accepts the login JWT as a bearer token on the API, so no separate API
-          # token has to be provisioned. Throwaway instance, throwaway credential.
-          #
-          # NOTE: a JWT carries the user's full permissions, where production forwards a
-          # scoped API token. The canary therefore cannot catch a token-permission
-          # regression — see vikunja#515, and the by-index case in the canary itself, which
-          # is written to accept either outcome for exactly this reason.
+          # The JWT is a means of minting the real credential, not the credential under
+          # test. This job used to hand the JWT straight to the canary, and that is
+          # vikunja#515: a JWT carries the *user's* whole permission set where production
+          # forwards a scoped API token, so a route unreachable by every real caller read
+          # healthy here — indefinitely, and with a green run every week to say so.
+          # Measured on v2.6.0, same instance and same moment: by-index answers 200 to the
+          # JWT and 401 to the scoped token, while every other route answers 200 to both.
           JWT=$(curl -sf -X POST http://127.0.0.1:3456/api/v2/login \
             -H 'Content-Type: application/json' \
             -d '{"username":"canary","password":"canarypassword123"}' \
             | python -c 'import json,sys; print(json.load(sys.stdin)["token"])')
           echo "::add-mask::$JWT"
-          echo "jwt=$JWT" >> "$GITHUB_OUTPUT"
+          # Exactly the permissions the canary's own fixtures and assertions need, and
+          # deliberately NOT `projects.tasks_by_index`. Requesting every permission would
+          # reintroduce the blind spot in a different costume — an all-permissions token
+          # passes every assertion in this file and detects nothing. That is a security
+          # property of this job, not a convenience. The group and permission names are
+          # Vikunja's own, read from GET /api/v2/routes on v2.6.0.
+          #
+          # This set is measured, not reasoned. Against a throwaway v2.6.0, minting a
+          # token per candidate set and running the whole file:
+          #
+          #   tasks.read_all      required — 25 of 26 fail without it
+          #   tasks_labels.create required —  2 of 26 fail without it
+          #   projects.create     required — 26 errors without it (no fixture)
+          #   projects.read_all   NOT required     projects.read_one  NOT required
+          #   labels.read_all     NOT required     tasks.read_one     NOT required
+          #
+          # `projects.delete` and `labels.delete` are kept even though stripping them
+          # still passes. The fixture teardown does call both, but it calls them without
+          # `raise_for_status()`, so a 401 there is discarded and the run stays green
+          # while cleanup silently does nothing. Do not "tighten" these away on the
+          # strength of a green run — that green is the absence of a check, not evidence
+          # the calls are unused.
+          TOKEN=$(curl -sf -X POST http://127.0.0.1:3456/api/v2/tokens \
+            -H "Authorization: Bearer $JWT" \
+            -H 'Content-Type: application/json' \
+            -d '{"title":"filter-canary","expires_at":"2035-01-01T00:00:00Z","permissions":{"projects":["create","delete"],"labels":["create","delete"],"tasks":["create","read_all"],"tasks_labels":["create"]}}' \
+            | python -c 'import json,sys; print(json.load(sys.stdin)["token"])')
+          echo "::add-mask::$TOKEN"
+          # An empty bearer would turn every assertion in the canary into an auth error,
+          # which reads as "upstream moved" rather than "this step failed".
+          test -n "$TOKEN"
+          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
 
       - name: Run the canary
         env:
           VIKUNJA_CANARY_URL: http://127.0.0.1:3456
-          VIKUNJA_CANARY_TOKEN: ${{ steps.token.outputs.jwt }}
+          VIKUNJA_CANARY_TOKEN: ${{ steps.token.outputs.token }}
         # -p no:cacheprovider keeps the runner from writing a cache dir it does not need.
         run: pytest tests/test_filter_canary.py -v -p no:cacheprovider
 
