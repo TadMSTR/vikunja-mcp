@@ -6,6 +6,34 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.10.1] — 2026-09-02
+
+### Changed
+- **Every declared dependency now carries an upper bound** (vikunja#627). Unbounded
+  specifiers let **fastmcp 3.4.7 -> 4.0.1** and **mcp 1.29.0 -> 2.1.1** land in CI
+  unobserved for ten days; CI runs only on `push` and `pull_request`, so nothing ran
+  between the v0.9.0 merge and the next unrelated push. The Dockerfile installs from
+  `pyproject.toml`, so the same unbounded resolution shipped in the image — bounding here
+  covers CI and the image together, with no lockfile toolchain.
+
+  Caps are the next major, or the next *minor* for 0.x, where the minor is the breaking
+  axis. Floors are raised to versions actually exercised rather than the oldest that might
+  work: `fastmcp>=2.0` claimed support for two majors this has never been run against, and
+  `starlette>=0.37` / `pytest-asyncio>=0.23` were both resolving across a major boundary
+  (to 1.6.0 and 1.4.0) without anyone noticing.
+
+  Resolution is **unchanged** by this — the bounds describe what already shipped. Verified
+  by resolving a clean venv before and after and diffing the versions, and the suite passes
+  under it (533 passed, 27 skipped).
+
+  `mcp` is deliberately not declared. It drove the behaviour change that exposed this, but
+  it is a fastmcp transitive and is not imported in `src/`; constraining fastmcp keeps one
+  owner for that edge.
+
+  Not addressed here: this repo has no `renovate.json` or `dependabot.yml`, so nothing will
+  propose bumps automatically. Upgrades are now deliberate, which is the intent, but nothing
+  prompts them.
+
 ## [0.10.0] — 2026-09-02
 
 Four defects with one root cause: a signal that reported success whether or not the thing it
