@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "vikunja-mcp"
-version = "0.10.0"
+version = "0.10.1"
 description = "FastMCP server exposing the Vikunja REST API as scoped, per-agent MCP tools"
 readme = "README.md"
 license = { text = "MIT" }
@@ -19,33 +19,59 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
     "Topic :: Software Development :: Bug Tracking",
 ]
+# Every dependency carries an upper bound. Unbounded specifiers let fastmcp 3 -> 4 and
+# mcp 1 -> 2 land in CI unobserved for ten days (vikunja#627), surfacing only because
+# somebody happened to push; the Dockerfile installs from this file, so the same
+# resolution ships in the image. Bounding here fixes CI and the image together and needs
+# no lockfile toolchain.
+#
+# The cap is the next major, or the next *minor* for 0.x — for a pre-1.0 package the
+# minor is the breaking axis. Floors are the versions actually exercised, not the oldest
+# that might work: `fastmcp>=2.0` claimed support for two majors nobody has ever run this
+# against, which is the same kind of unverified claim the caps exist to prevent.
+#
+# `mcp` is deliberately NOT declared. It drove the behaviour change that exposed this,
+# but it is a fastmcp transitive and is not imported anywhere in src/ — constraining
+# fastmcp and letting it resolve mcp keeps one owner for that edge.
+#
+# Note there is no renovate.json or dependabot.yml in this repo, so nothing will propose
+# bumps automatically. Raising these is a deliberate act, which is the intent.
 dependencies = [
-    "fastmcp>=2.0",
-    "httpx>=0.27",
-    "pydantic>=2.0",
-    "pydantic-settings>=2.0",
-    "structlog>=24.0",
-    "markdown>=3.8.1",
-    "nh3>=0.2",
+    "fastmcp>=4.0.1,<5",
+    "httpx>=0.28,<0.29",
+    "pydantic>=2.13,<3",
+    "pydantic-settings>=2.15,<3",
+    "structlog>=26.1,<27",
+    "markdown>=3.10,<4",
+    "nh3>=0.3,<0.4",
     # Direct import (Request/JSONResponse for the /health custom route), not just a
     # fastmcp transitive — declared so a future fastmcp that vendors or drops it fails
-    # at resolve time rather than at import time.
-    "starlette>=0.37",
+    # at resolve time rather than at import time. The old floor said >=0.37 while the
+    # resolved version was 1.6.0: a major boundary had already been crossed silently.
+    "starlette>=1.6,<2",
 ]
 
 [project.optional-dependencies]
 telemetry = [
-    "opentelemetry-sdk>=1.20",
-    "opentelemetry-exporter-otlp-proto-grpc>=1.20",
+    "opentelemetry-sdk>=1.44,<2",
+    "opentelemetry-exporter-otlp-proto-grpc>=1.44,<2",
     # forge runs influxdb:3-core — the v3 write API (imports as influxdb_client_3).
-    "influxdb3-python>=0.9",
-    "nats-py>=2.6",
+    # Pre-1.0 and moving fast: capped at the next minor, so an upgrade is a visible bump
+    # rather than something that arrives with an unrelated rebuild. This extra IS
+    # installed into the runtime image (Dockerfile: pip install '.[telemetry]'), even
+    # though telemetry itself is off unless the env vars are set.
+    "influxdb3-python>=0.21,<0.22",
+    "nats-py>=2.15,<3",
 ]
 dev = [
-    "pytest>=8.0",
-    "pytest-asyncio>=0.23",
-    "pytest-cov>=5.0",
-    "respx>=0.21",
+    # `pytest-asyncio>=0.23` was resolving to 1.4.0 — another major crossed unnoticed.
+    "pytest>=9.1,<10",
+    "pytest-asyncio>=1.4,<2",
+    "pytest-cov>=7.1,<8",
+    "respx>=0.23,<0.24",
+    # Already exact, and the reason lint never drifted while everything else did. The
+    # bounds above generalise this, they do not replace it: a formatter must be exact
+    # because two patch versions can disagree about whitespace and fail `--check`.
     "ruff==0.16.0",
 ]
 
