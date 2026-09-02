@@ -1158,14 +1158,28 @@ async def backlog_summary(
     # whichever id the cap happened to include last: 0 at cap 25, 9 at cap 45, same
     # backlog (vikunja#624).
     ids_by_title: dict[str, list[int]] = {}
+    unbucketable = 0
     for label in labels:
         title = label.get("title")
-        if title:
-            ids_by_title.setdefault(title, []).append(label["id"])
+        # The id is coerced to int *before* it is used as a key's value, not while being
+        # appended: these ids come off an upstream response and are interpolated straight
+        # into a filter expression, which is the one place in this tool where an external
+        # value that is not the caller's own `filter` reaches a query. See `_compose`,
+        # whose grouping exists for the same reason.
+        try:
+            label_id: int | None = int(label["id"])
+        except (KeyError, TypeError, ValueError):
+            label_id = None
+        # A title with no usable id must not become a bucket. Coercing during `append`
+        # would leave `setdefault` having already created an empty list, and an empty id
+        # list renders as `labels in ` — a malformed filter whose count comes back 0,
+        # which is a fabricated zero wearing the same clothes as vikunja#624.
+        if not title or label_id is None:
+            unbucketable += 1
+            log.warning("vikunja_label_unbucketable", title=title, value=label.get("id"))
+            continue
+        ids_by_title.setdefault(title, []).append(label_id)
 
-    # A label with no title cannot be a bucket key. Dropping it silently would be the
-    # same defect one size smaller, so it is counted and reported.
-    untitled = sum(1 for label in labels if not label.get("title"))
     titles = list(ids_by_title)
     requested = _LABEL_BUCKET_CEILING if max_label_buckets is None else max_label_buckets
     cap = max(0, min(requested, _LABEL_BUCKET_CEILING))
@@ -1237,10 +1251,10 @@ async def backlog_summary(
             f"{len(failed_titles)} label bucket(s) could not be counted and are omitted "
             f"rather than reported as 0: {', '.join(failed_titles)}."
         )
-    if untitled:
+    if unbucketable:
         notes.append(
-            f"{untitled} label(s) have no title and could not be bucketed. `by_label` is "
-            "keyed by title."
+            f"{unbucketable} label(s) could not be bucketed — `by_label` is keyed by title "
+            "and counted by numeric id, and these carried no usable title or id."
         )
     if never_fetched:
         notes.append(
@@ -1265,7 +1279,7 @@ async def backlog_summary(
         "by_label": by_label,
         "labels_not_counted": labels_not_counted,
         "by_staleness": {"stale": stale, "fresh": fresh},
-        "labels_truncated": bool(labels_not_counted or never_fetched or untitled),
+        "labels_truncated": bool(labels_not_counted or never_fetched or unbucketable),
         "calls": len(_PRIORITIES) + len(kept_titles) + 5 + label_pages,
         "notes": notes,
     }

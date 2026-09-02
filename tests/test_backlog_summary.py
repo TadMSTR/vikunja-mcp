@@ -587,3 +587,25 @@ async def test_a_bucket_that_cannot_be_counted_is_omitted_and_named(upstream, mo
     assert result["by_label"] == {"fine": 4}
     assert result["labels_not_counted"] == ["broken"]
     assert result["labels_truncated"] is True
+
+
+async def test_a_non_numeric_label_id_never_reaches_the_filter(upstream):
+    """Label ids are interpolated into a filter expression, so they are coerced first.
+
+    `_compose` groups each predicate because one of them is caller-supplied and Vikunja
+    parses left to right; a label id is the other external value that reaches a query, and
+    it arrives from an upstream response rather than from the caller. Coercing to int is
+    what keeps it from being a second injection point.
+    """
+    fake = upstream(
+        {"(project = 7) && (done = false) && (labels in 31)": 3},
+        labels=[
+            {"id": "1 || done = true", "title": "hostile"},
+            {"id": 31, "title": "fine"},
+        ],
+    )
+    result = await call(server.backlog_summary, project_id=7)
+    assert result["by_label"] == {"fine": 3}
+    # Narrow on purpose: the summary always issues a legitimate `done = true` totals
+    # bucket, so asserting on that substring alone would fail on the success path.
+    assert all("1 || done = true" not in c["params"]["filter"] for c in fake.task_calls)
