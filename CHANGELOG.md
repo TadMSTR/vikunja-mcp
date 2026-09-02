@@ -40,6 +40,22 @@ measured had happened. Each was found by a check that had already passed.
   code under test. Clear-and-restore now lives in one autouse fixture in `tests/conftest.py`;
   five per-module workarounds are gone.
 
+### Security
+- **The CI filter canary's API token is narrowed to a measured minimum.** Following the
+  2026-09-02 audit, each candidate permission set was minted against a throwaway v2.6.0 and
+  the whole canary run against it: `projects.read_all`, `projects.read_one`,
+  `labels.read_all` and `tasks.read_one` are unnecessary and are dropped. `projects.delete`
+  and `labels.delete` are kept despite stripping them also passing — the fixture teardown
+  calls both without `raise_for_status()`, so a 401 there is discarded and the run stays
+  green while cleanup silently does nothing. That green is the absence of a check, not
+  evidence the calls are unused.
+- **Label ids are coerced to `int` before reaching a filter expression.** They arrive from an
+  upstream response and were interpolated directly. `_compose`'s per-predicate grouping
+  already contained any `||`, so this is defence in depth rather than a fix for a scope
+  escape — but coercing *before* insertion also closes a fabricated zero: coercing during
+  `append` leaves `setdefault`'s empty list behind, and an empty id list renders as
+  `labels in `, whose count comes back 0.
+
 ### Changed — BREAKING
 - **`backlog_summary` gained `labels_not_counted`**, listing by name the buckets that were
   skipped. "How many were dropped" does not tell a consumer whether the label it cares about
