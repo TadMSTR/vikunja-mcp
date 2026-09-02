@@ -20,6 +20,7 @@ from __future__ import annotations
 import pytest
 
 from vikunja_mcp import config, server
+from vikunja_mcp.exceptions import VikunjaAPIError
 
 
 def _fn(tool):
@@ -140,15 +141,28 @@ async def test_count_reads_total_not_total_pages(monkeypatch):
     assert await server._count_matching("project = 7") == 206
 
 
-async def test_count_degrades_to_zero_on_an_unusable_total(monkeypatch):
-    """A malformed count must not take the whole summary down with it."""
+async def test_count_refuses_an_unusable_total_rather_than_calling_it_zero(monkeypatch):
+    """This test used to assert the opposite, and the opposite was vikunja#624.
+
+    Its rationale — "a malformed count must not take the whole summary down with it" —
+    is still right, and is still honoured: a label bucket that cannot be counted is
+    omitted and named rather than failing the summary (see the #624 tests below). What
+    changed is *where* that tolerance lives. Degrading to `0` inside the counting
+    primitive bought resilience by fabricating a number, and the fabricated number was
+    indistinguishable from a real zero at every call site — including the two shipped
+    skills that use "this bucket reads 0" as a negative control.
+
+    The headline counts (`total`, `done`, `not_done`) deliberately do *not* get that
+    tolerance. A summary whose totals are wrong is worse than one that says it failed.
+    """
 
     async def fake(method, path, token, *, params=None, json=None, files=None, unwrap_list=True):
         return {"items": [], "total": "many"}
 
     monkeypatch.setattr(server, "request", fake)
     monkeypatch.setattr(server, "caller_token", lambda: "TOK")
-    assert await server._count_matching("project = 7") == 0
+    with pytest.raises(VikunjaAPIError, match="could not read a count"):
+        await server._count_matching("project = 7")
 
 
 # --- it counts rather than fetching ---------------------------------------
@@ -464,3 +478,112 @@ async def test_fetch_truncation_is_reported_separately_from_cap_truncation(upstr
     note = " ".join(result["notes"])
     assert "15 of 25" in note
     assert "max_label_buckets" in note and "will not help" in note
+
+
+# --- vikunja#624: a bucket that was not counted must not read as a zero ---
+
+
+async def test_labels_sharing_a_title_are_one_bucket_over_every_id(upstream):
+    """Two labels, one title, one bucket — counted over both ids.
+
+    `by_label` is keyed by title, and titles are not unique: forge's tracker carries
+    `source:github` as id 1 *and* id 38, created by different agents five days apart.
+    The dict comprehension silently kept whichever came last, so the reported number was
+    a function of the bucket cap rather than of the backlog.
+    """
+    fake = upstream(
+        {"(project = 7) && (done = false) && (labels in 30, 31)": 9},
+        labels=[{"id": 30, "title": "source:github"}, {"id": 31, "title": "source:github"}],
+    )
+    result = await call(server.backlog_summary, project_id=7)
+    assert result["by_label"] == {"source:github": 9}
+    assert sum("labels in" in c["params"]["filter"] for c in fake.task_calls) == 1
+
+
+@pytest.mark.parametrize("cap", [1, 2, 4])
+async def test_a_shadowed_duplicate_reads_the_same_at_every_cap(upstream, cap):
+    """The measured #624 symptom: `source:github` read 0 at cap 25 and 9 at cap 45.
+
+    Same label, same filter, same backlog — only the cap differed. A count that moves
+    with a display parameter is not a count.
+    """
+    upstream(
+        {"(project = 7) && (done = false) && (labels in 30, 33)": 9},
+        labels=[
+            {"id": 30, "title": "source:github"},
+            {"id": 31, "title": "filler-a"},
+            {"id": 32, "title": "filler-b"},
+            {"id": 33, "title": "source:github"},
+        ],
+    )
+    result = await call(server.backlog_summary, project_id=7, max_label_buckets=cap)
+    assert result["by_label"]["source:github"] == 9
+
+
+async def test_every_label_in_scope_is_counted_by_default(upstream):
+    """No cap argument means every label, not the first 25.
+
+    A fixed default is a rot clock: the tracker went 41 -> 67 labels in two days, and
+    every caller that did not happen to know the current label count got a silently
+    partial answer. Truncation is now something a caller opts into.
+    """
+    upstream({}, labels=_labels(*[f"label-{i}" for i in range(40)]))
+    result = await call(server.backlog_summary, project_id=7)
+    assert len(result["by_label"]) == 40
+    assert result["labels_truncated"] is False
+    assert result["labels_not_counted"] == []
+
+
+async def test_uncounted_labels_are_named_not_merely_counted(upstream):
+    """ "How many were dropped" does not tell a caller whether the one they care about was.
+
+    A consumer using "every `repo:*` bucket reads 0" as a negative control needs to know
+    *which* labels went uncounted, not just that some did — otherwise an absent bucket and
+    a genuinely empty one are still indistinguishable at the point the control is read.
+    """
+    upstream({}, labels=_labels("a", "b", "c", "d", "e"))
+    result = await call(server.backlog_summary, project_id=7, max_label_buckets=2)
+    assert set(result["by_label"]) == {"a", "b"}
+    assert result["labels_not_counted"] == ["c", "d", "e"]
+    assert result["labels_truncated"] is True
+
+
+async def test_an_unreadable_count_is_not_reported_as_zero(monkeypatch):
+    """`_count_matching` returned 0 for any body it could not read a `total` off.
+
+    A real zero and an unreadable response were the same value, so a bucket whose count
+    never happened certified "nothing here" — which is exactly what #624 says a control
+    that cannot fail does.
+    """
+
+    async def unreadable(
+        method, path, token, *, params=None, json=None, files=None, unwrap_list=True
+    ):
+        return {"ok": True}
+
+    monkeypatch.setattr(server, "request", unreadable)
+    monkeypatch.setattr(server, "caller_token", lambda: "TOK")
+    with pytest.raises(Exception, match="count"):
+        await server._count_matching("project = 7")
+
+
+async def test_a_bucket_that_cannot_be_counted_is_omitted_and_named(upstream, monkeypatch):
+    """One unreadable bucket must not silently become a zero in an otherwise fine summary."""
+    fake = upstream(
+        {"(project = 7) && (done = false) && (labels in 31)": 4},
+        labels=[{"id": 30, "title": "broken"}, {"id": 31, "title": "fine"}],
+    )
+    inner = fake.__call__
+
+    async def flaky(method, path, token, *, params=None, json=None, files=None, unwrap_list=True):
+        if "labels in 30" in ((params or {}).get("filter") or ""):
+            return {"ok": True}
+        return await inner(
+            method, path, token, params=params, json=json, files=files, unwrap_list=unwrap_list
+        )
+
+    monkeypatch.setattr(server, "request", flaky)
+    result = await call(server.backlog_summary, project_id=7)
+    assert result["by_label"] == {"fine": 4}
+    assert result["labels_not_counted"] == ["broken"]
+    assert result["labels_truncated"] is True
