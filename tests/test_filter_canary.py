@@ -380,26 +380,39 @@ def test_index_is_filterable(canary):
     assert api.count(f"{fx['scope']} && index = {index}") == 1
 
 
-def test_by_index_route_is_still_unauthorised_for_this_token(canary):
+def test_by_index_route_is_unauthorised_for_a_production_shaped_token(canary):
     """Records *why* the filter above is still in use, rather than v2's documented route.
 
     `GET /projects/{project}/tasks/by-index/{index}` does the same lookup and is
     documented, but it is collected for API-token permissions as group `projects`,
-    permission `tasks_by_index` — which no token minted before v2 carries. Measured on
+    permission `tasks_by_index`, which forge's agent tokens do not carry. Measured on
     v2.5.0: 401 for every forge agent token, while every other route the server uses
     returns 200.
 
-    A **200 here is the informative outcome**: it means the token running this canary holds
-    the permission, and vikunja#514 (switch `_resolve_index` to the route) is unblocked for
-    that deployment. Anything other than those two is a change neither the code nor this
-    file anticipates.
+    **This assertion used to accept 200 or 401, and that is vikunja#515.** The canary
+    authenticated with a login JWT, which carries the user's whole permission set rather
+    than a token's, so this route answered 200 in CI and 401 in production — and the test
+    was written to tolerate both, because with a JWT there was no other honest option. A
+    route unreachable by every real caller therefore read healthy, indefinitely: "Filter
+    canary — success" twice in the ten days before this was fixed.
+
+    The workflow now mints a scoped API token deliberately *without*
+    `projects.tasks_by_index`, so the credential has production's shape and 401 is the
+    only correct answer. Measured on v2.6.0, same instance and same moment: JWT 200,
+    scoped token 401, every other route 200 for both.
+
+    A failure here is informative, not noise: it means upstream stopped gating by-index
+    behind that permission, and vikunja#514 (switch `_resolve_index` to the route) is
+    worth revisiting.
     """
     api, fx = canary
     index = fx["tasks"][0]["index"]
     status = api.get(f"/projects/{fx['project_id']}/tasks/by-index/{index}").status_code
-    assert status in (200, 401), (
-        f"by-index returned {status}; expected 401 (token lacks projects.tasks_by_index) "
-        "or 200 (it holds it — see vikunja#514)."
+    assert status == 401, (
+        f"by-index returned {status}, expected 401. If this is 200, either the canary "
+        "token was minted with projects.tasks_by_index (check the workflow — a token "
+        "holding it detects nothing, which is vikunja#515) or upstream no longer gates "
+        "the route behind it, which unblocks vikunja#514."
     )
 
 
