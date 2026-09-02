@@ -1213,6 +1213,17 @@ async def backlog_summary(
             ),
             return_exceptions=True,
         ),
+        # No `return_exceptions` here, and the asymmetry with the label buckets above is
+        # deliberate rather than an oversight (raised as a Low in the 2026-09-02 audit,
+        # which asked for the choice to be made explicitly instead of by omission).
+        #
+        # A label bucket is one row of an answer: losing it costs that row, and the loss is
+        # reported by name in `labels_not_counted`, so the summary stays useful and honest.
+        # `total`, `done` and `not_done` *are* the answer. A summary that quietly reports
+        # the wrong total is worse than one that fails — that was the pre-#624 behaviour,
+        # where an unreadable response became a fabricated 0 indistinguishable from a real
+        # one. Failing the call is the loud version of the same event, and the exception
+        # carries only the filter expression (see `VikunjaAPIError`), never a credential.
         asyncio.gather(
             _count_bucket(base),
             _count_bucket(_compose(*base_predicates, "done = true")),

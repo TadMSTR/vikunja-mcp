@@ -102,10 +102,26 @@ jobs:
           # passes every assertion in this file and detects nothing. That is a security
           # property of this job, not a convenience. The group and permission names are
           # Vikunja's own, read from GET /api/v2/routes on v2.6.0.
+          #
+          # This set is measured, not reasoned. Against a throwaway v2.6.0, minting a
+          # token per candidate set and running the whole file:
+          #
+          #   tasks.read_all      required — 25 of 26 fail without it
+          #   tasks_labels.create required —  2 of 26 fail without it
+          #   projects.create     required — 26 errors without it (no fixture)
+          #   projects.read_all   NOT required     projects.read_one  NOT required
+          #   labels.read_all     NOT required     tasks.read_one     NOT required
+          #
+          # `projects.delete` and `labels.delete` are kept even though stripping them
+          # still passes. The fixture teardown does call both, but it calls them without
+          # `raise_for_status()`, so a 401 there is discarded and the run stays green
+          # while cleanup silently does nothing. Do not "tighten" these away on the
+          # strength of a green run — that green is the absence of a check, not evidence
+          # the calls are unused.
           TOKEN=$(curl -sf -X POST http://127.0.0.1:3456/api/v2/tokens \
             -H "Authorization: Bearer $JWT" \
             -H 'Content-Type: application/json' \
-            -d '{"title":"filter-canary","expires_at":"2035-01-01T00:00:00Z","permissions":{"projects":["create","delete","read_all","read_one"],"labels":["create","delete","read_all"],"tasks":["create","read_all","read_one"],"tasks_labels":["create"]}}' \
+            -d '{"title":"filter-canary","expires_at":"2035-01-01T00:00:00Z","permissions":{"projects":["create","delete"],"labels":["create","delete"],"tasks":["create","read_all"],"tasks_labels":["create"]}}' \
             | python -c 'import json,sys; print(json.load(sys.stdin)["token"])')
           echo "::add-mask::$TOKEN"
           # An empty bearer would turn every assertion in the canary into an auth error,
