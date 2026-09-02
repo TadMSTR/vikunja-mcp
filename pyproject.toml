@@ -74,6 +74,9 @@ markers = [
     # Live-instance canary over undocumented Vikunja filter behaviour. Skipped unless
     # VIKUNJA_CANARY_URL and VIKUNJA_CANARY_TOKEN are set, so the default run stays offline.
     "canary: requires a live Vikunja instance (see tests/test_filter_canary.py)",
+    # Spawns a nested pytest run. Only tests/test_hook_isolation.py carries it; that
+    # check cannot be made in-process without becoming a control that cannot fail.
+    "slow: spawns a subprocess and costs more than an ordinary unit test",
 ]
 
 [tool.coverage.run]

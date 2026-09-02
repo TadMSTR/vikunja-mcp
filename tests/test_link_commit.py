@@ -24,14 +24,6 @@ PR_URL = "https://github.com/TadMSTR/vikunja-mcp/pull/14"
 COMMIT_URL = "https://github.com/TadMSTR/vikunja-mcp/commit/23cea98"
 
 
-@pytest.fixture(autouse=True)
-def _builtins():
-    hooks.clear_hooks()
-    server.register_builtin_hooks()
-    yield
-    hooks.clear_hooks()
-
-
 @pytest.fixture
 def wire(monkeypatch):
     """Serve a task on GET and snapshot the body each POST actually sent.

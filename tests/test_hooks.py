@@ -11,8 +11,11 @@ from vikunja_mcp import hooks, server
 
 @pytest.fixture(autouse=True)
 def _clean():
-    hooks.clear_hooks()
-    yield
+    """These tests exercise the registry itself, so they start from an empty one.
+
+    Setup only. Restoring the built-ins is `conftest._hook_registry`'s job — doing it
+    here too is what let the wipe escape the module in the first place (vikunja#473).
+    """
     hooks.clear_hooks()
 
 

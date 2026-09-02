@@ -21,14 +21,6 @@ from vikunja_mcp import hooks, markers, server
 from . import fixtures
 
 
-@pytest.fixture(autouse=True)
-def _builtins():
-    hooks.clear_hooks()
-    server.register_builtin_hooks()
-    yield
-    hooks.clear_hooks()
-
-
 @pytest.fixture
 def wire(monkeypatch):
     """Route GET (the lookup) and PUT (the create) to separate canned bodies.
