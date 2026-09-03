@@ -231,14 +231,45 @@ every timestamp was. Set `VIKUNJA_STALE_AFTER_DAYS` accordingly after an import.
 Counts, not rows — totals, done/open, and breakdowns by priority, label and staleness.
 Each bucket is one request that reads the match count off the response envelope's `total`
 and asks for a page holding no rows at all, so orienting in a backlog stops costing a
-pagination sweep. Re-measured on v2 against a 514-task tracker: **37 requests, ~125 ms,
-15.5 KB of upstream traffic, 1.2 KB of tool response** — and 10.7 KB of that upstream
-figure is the single label listing, not the counts. The `calls` field reports what it
-cost, so the price is visible to whoever pays it.
+pagination sweep. The `calls` field reports what it cost, so the price is visible to
+whoever pays it.
+
+**As of v0.10.0, `max_label_buckets` defaults to every label in scope**, not a fixed 25.
+Re-measured against forge's 514-task, 67-label tracker: **78 requests** at the new default,
+against 37 at the old fixed cap. A fixed default was already wrong at 67 labels — any fixed
+default is a rot clock as a tracker's label vocabulary grows — so truncation is now something
+you opt into with `max_label_buckets`, not something you have to know the current label count
+to avoid. A hard ceiling of 200 buckets bounds the fan-out regardless, and reports itself in
+`notes` when it bites. The label listing itself also now **paginates to completion**
+(`_LABEL_PAGE_SIZE = 100`, up to `_LABEL_PAGE_LIMIT = 20` pages) rather than reading page one
+and stopping, so a tracker past 50 labels no longer undercounts before `max_label_buckets` is
+even applied.
+
+Two response fields distinguish *why* a bucket is missing — a caller checking a count needs to
+know which case it is:
+
+- **`labels_truncated`** is measured against the labels that **exist**, not the ones that were
+  fetched, and `notes` names which cause applies. They call for different fixes: raising
+  `max_label_buckets` fixes a cap that bit and does nothing for a listing that fell short.
+- **`labels_not_counted`** (new in v0.10.0) names, by title, every bucket that was skipped. A
+  skipped bucket is **absent** from `by_label` — never reported as `0`. Reading an absent key
+  as `0` via `.get(name, 0)` silently turns "not measured" into "nothing here"; check
+  `labels_not_counted` before trusting a zero.
+
+`by_label` is keyed by label **title**, and titles are not unique — every label sharing a title
+is one bucket, counted over all of their ids together. Forge's tracker carries `source:github`
+as both id 1 and id 38; before v0.10.0 the reported count for that title silently depended on
+where the cap happened to fall.
 
 If your tracker has an "anchor" task carrying every label deliberately, name it in
 `VIKUNJA_SUMMARY_EXCLUDE_IDS` — otherwise it lands in every label bucket and inflates each
 count by exactly one, which is worse than an obviously broken number.
+
+> **Breaking in v0.10.0:** `max_label_buckets`'s default changed from a fixed `25` to every
+> label in scope, and `labels_not_counted` was added to the response. Callers passing an
+> explicit `max_label_buckets` are unaffected. The two consumer skills that call this tool
+> (`ticket-batch-select`, `ticket-triage-sweep`) are already updated for it, in
+> `agent-platform-skills@2e6c122`.
 
 ### Idempotency keys
 
