@@ -13,6 +13,11 @@ on:
     # 04:15 UTC daily — after forge's own maintenance windows.
     - cron: "15 4 * * *"
 
+# Least privilege at the top level. This job checks out the tree and runs a read-only HTTP
+# sweep; it writes nothing back. See ci.yml for the Token-Permissions rationale.
+permissions:
+  contents: read
+
 jobs:
   verify-routes:
     name: Live router verb sweep
