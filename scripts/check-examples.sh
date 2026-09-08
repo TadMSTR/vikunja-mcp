@@ -67,7 +67,7 @@ for dir in "$WORKDIR"/compose/*/; do
   port=$(free_port)
   echo "  --- $name (host port $port)"
   (
-    cd "$dir"
+    cd "$dir" || exit 1
     export COMPOSE_PROJECT_NAME="vkmcp-ci-$name"
     export VIKUNJA_URL=https://vikunja.invalid
     export VIKUNJA_DEFAULT_PROJECT_ID=

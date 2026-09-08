@@ -16,6 +16,10 @@ services:
     # tag once you have one working, so a rebuild cannot silently move under you. Every
     # release publishes both, and provenance is attested:
     #   gh attestation verify oci://ghcr.io/tadmstr/vikunja-mcp:v0.10.1 --owner TadMSTR
+    # SECURITY[accepted]: DC-01. A reference template pinned to a version is stale the day
+    # after the next release, so these examples track :latest and tell you to pin. Same
+    # disposition as the root docker-compose.yml. Revisit if either file ever stops being a
+    # template someone copies and edits.
     image: ghcr.io/tadmstr/vikunja-mcp:latest
 
     # Deliberately NO `container_name:`. It is host-global, so a fixed name here would

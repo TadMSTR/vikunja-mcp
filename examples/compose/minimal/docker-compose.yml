@@ -12,6 +12,10 @@
 # precisely because nothing runs them — this one cannot rot silently.
 services:
   vikunja-mcp:
+    # SECURITY[accepted]: DC-01. A reference template pinned to a version is stale the day
+    # after the next release, so these examples track :latest and tell you to pin. Same
+    # disposition as the root docker-compose.yml. Revisit if either file ever stops being a
+    # template someone copies and edits.
     image: ghcr.io/tadmstr/vikunja-mcp:latest
 
     # Deliberately NO `container_name:`. It is host-global, so a fixed name here would
@@ -37,8 +41,20 @@ services:
       # refused at startup — it would make every caller reach Vikunja as one identity.
       # Tokens travel per-request in the Authorization header.
 
+    # "Minimal" means the fewest DECISIONS, not the fewest protections. Everything below is
+    # here because an example people copy into a real deployment should be safe to copy;
+    # stripping it would teach a worse default than it saves lines.
+    #
+    # `user:` is redundant with the image, which already sets USER 1000:1000 — stated so the
+    # guarantee is visible in the file you actually read, and so it survives a swap to a
+    # locally built image that forgot it.
+    user: "1000:1000"
     read_only: true
     tmpfs: [/tmp]
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
+    # A stateless HTTP shim over an API does not need much, and a bounded container cannot
+    # starve its host if a pathological response arrives.
+    mem_limit: 1g
+    cpus: 1.0
     restart: unless-stopped

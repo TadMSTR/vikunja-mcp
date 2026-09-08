@@ -724,3 +724,45 @@ async def test_a_bare_string_task_ids_is_refused_not_iterated(_upstream):
     """
     with pytest.raises(ValueError, match="task_ids must be a list"):
         await call(server.tasks_bulk_update, task_ids="#454", values={"done": True})
+
+
+@pytest.mark.parametrize(
+    "hostile",
+    [
+        "../../admin",
+        "1/../../projects/1",
+        "%2e%2e%2f",
+        "..%2f..%2fadmin",
+        "1 OR 1=1",
+        "#454; DROP",
+        "473 473",
+        True,
+        1.5,
+        None,
+        [1],
+        {"id": 1},
+    ],
+)
+async def test_widened_far_end_refuses_hostile_input(_upstream, hostile):
+    """IV-01 regression. `other_task_id` reaches a URL PATH, and it used to be `int`-only.
+
+    Widening it to `int | str` (vikunja#458) removed pydantic's guarantee that only an
+    integer could ever get there, so the resolver is now the only thing standing between a
+    caller-supplied string and `f"/tasks/{task_id}/relations/{kind}/{other_task_id}"`.
+
+    `_resolve_task_ref` is an ALLOWLIST — plain ASCII digits, `#N`, or a reference that
+    names exactly one embedded id — not a blocklist of bad characters. That is why this
+    passes for inputs nobody enumerated in advance. The test exists so a future refactor
+    toward "strip the bad characters" is caught: that shape has to keep pace with an
+    attacker, and this one does not.
+
+    `relation_kind` is separately percent-encoded at the call site (IV-01, prior audit).
+    """
+    with pytest.raises(ValueError, match="other_task_id must be"):
+        await call(
+            server.task_relation_remove,
+            task_id=100,
+            relation_kind="related",
+            other_task_id=hostile,
+        )
+    assert _upstream.await_count == 0, "a hostile ref reached the upstream call"
