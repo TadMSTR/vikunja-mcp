@@ -72,7 +72,7 @@ dev = [
     # Already exact, and the reason lint never drifted while everything else did. The
     # bounds above generalise this, they do not replace it: a formatter must be exact
     # because two patch versions can disagree about whitespace and fail `--check`.
-    "ruff==0.16.0",
+    "ruff==0.16.6",
 ]
 
 [project.urls]
