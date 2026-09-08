@@ -109,5 +109,23 @@ markers = [
 source = ["vikunja_mcp"]
 
 [tool.coverage.report]
-fail_under = 80
+# MEASURED 93.60% on 2026-09-08 (545 passed, 27 skipped) — identical on Python 3.11, 3.12 and
+# 3.13, so this floor needs no per-version slack.
+#
+# The floor was 80 carrying no recorded number and no date, which silently permitted a
+# 13.6-point regression at any moment. That is vikunja#680: searxng-mcp's floor sat unchanged
+# for ten releases while real coverage climbed twelve points, so the gate could not have caught
+# the loss of a tenth of the suite. A floor nobody has re-measured is a number, not a gate.
+#
+# 93 rather than 93.6: at 1265 statements one newly-uncovered line moves the total by ~0.08
+# points, so 0.6 points of headroom absorbs roughly seven lines of ordinary churn without a
+# false red, while still failing on any real loss of coverage. RATCHET THIS UP when coverage
+# rises — and re-measure and re-date it when you do. Do NOT lower it to make a red build green;
+# a red here means coverage was lost, which is the thing worth knowing.
+#
+# Known soft spot, deliberately recorded rather than hidden behind the floor: telemetry.py sits
+# at 53% because CI installs `.[dev]` without the `[telemetry]` extra, so the OTLP/InfluxDB/NATS
+# exporters are import-skipped. The runtime IMAGE does install that extra (Dockerfile:
+# `pip install '.[telemetry]'`), making it the one shipped path this suite does not exercise.
+fail_under = 93
 show_missing = true
