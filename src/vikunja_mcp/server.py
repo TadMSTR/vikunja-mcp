@@ -1497,8 +1497,15 @@ async def _resolve_index(index: int, token: str) -> int:
     return int(matches[0]["id"])
 
 
-async def _resolve_task_ref(ref: int | str, token: str | None = None) -> int:
+async def _resolve_task_ref(
+    ref: int | str, token: str | None = None, field: str = "task_id"
+) -> int:
     """Turn whatever a caller passed as ``task_id`` into a global task id.
+
+    ``field`` only names the parameter in error messages. It matters because this now
+    resolves ``other_task_id`` and ``task_ids[i]`` as well, and an error saying "task_id
+    must be…" while the caller's mistake was in ``other_task_id`` sends them to the wrong
+    argument.
 
     Accepted, in the order they are tried:
 
@@ -1525,11 +1532,11 @@ async def _resolve_task_ref(ref: int | str, token: str | None = None) -> int:
     """
     # bool is an int subclass, and `task_id=True` reaching /tasks/1 is never intended.
     if isinstance(ref, bool):
-        raise ValueError(f"task_id must be {_REF_FORMS}; got the boolean {ref!r}")
+        raise ValueError(f"{field} must be {_REF_FORMS}; got the boolean {ref!r}")
     if isinstance(ref, int):
         return ref
     if not isinstance(ref, str):
-        raise ValueError(f"task_id must be {_REF_FORMS}; got {type(ref).__name__} {ref!r}")
+        raise ValueError(f"{field} must be {_REF_FORMS}; got {type(ref).__name__} {ref!r}")
 
     text = ref.strip()
 
@@ -1551,24 +1558,53 @@ async def _resolve_task_ref(ref: int | str, token: str | None = None) -> int:
             return int(ids.pop())
         if len(ids) > 1:
             raise ValueError(
-                f"task_id {ref!r} names {len(ids)} different task ids "
+                f"{field} {ref!r} names {len(ids)} different task ids "
                 f"({', '.join(sorted(ids, key=int))}). Pass the one you mean — picking the "
                 "first would be a guess, and guessing which task an ambiguous reference "
                 "points at is the whole failure this accepts references to prevent."
             )
 
-    raise ValueError(f"task_id must be {_REF_FORMS}; got {ref!r}")
+    raise ValueError(f"{field} must be {_REF_FORMS}; got {ref!r}")
 
 
 async def _resolve_task_ref_kwarg(kwargs: dict[str, Any]) -> dict[str, Any]:
-    """Before-hook: rewrite ``task_id`` in place to a global id.
+    """Before-hook: rewrite every task reference in ``kwargs`` to a global id.
 
-    Registered on every tool that takes a ``task_id``, so ``"#454"`` works uniformly rather
-    than on whichever tools someone remembered. A tool call with no ``task_id`` passes
-    through untouched.
+    Registered on every tool that takes a task reference, so ``"#454"`` works uniformly
+    rather than on whichever tools someone remembered. A tool call carrying none of these
+    keys passes through untouched.
+
+    Three parameters, resolved by the same function so they cannot diverge in what they
+    accept:
+
+    ``task_id``         every tool in ``_TASK_REF_TOOLS``
+    ``other_task_id``   the far end of a relation (vikunja#458)
+    ``task_ids``        the list ``tasks_bulk_update`` mutates (vikunja#459)
+
+    ``other_task_id`` and ``task_ids`` were previously ``int``-only, so a ``"#452"`` was
+    refused at schema validation — loud and safe, but inconsistent: the *near* end of a
+    relation accepted a ticket reference while the far end did not, which is a distinction
+    no caller can predict. The asymmetry that matters is preserved either way, by
+    ``_resolve_task_ref`` itself: **a bare number is always a global id, never a ticket
+    number.**
     """
     if "task_id" in kwargs:
         kwargs["task_id"] = await _resolve_task_ref(kwargs["task_id"])
+    if "other_task_id" in kwargs:
+        kwargs["other_task_id"] = await _resolve_task_ref(
+            kwargs["other_task_id"], field="other_task_id"
+        )
+    if "task_ids" in kwargs:
+        refs = kwargs["task_ids"]
+        # A bare string is a sequence, so `for r in refs` over "#454" would iterate its
+        # characters and resolve four nonsense refs. Refuse rather than guess.
+        if isinstance(refs, str) or not isinstance(refs, list):
+            raise ValueError(
+                f"task_ids must be a list of task references; got {type(refs).__name__} {refs!r}"
+            )
+        kwargs["task_ids"] = [
+            await _resolve_task_ref(r, field=f"task_ids[{i}]") for i, r in enumerate(refs)
+        ]
     return kwargs
 
 
@@ -1579,13 +1615,13 @@ async def _resolve_task_ref_kwarg(kwargs: dict[str, Any]) -> dict[str, Any]:
 # new task_id-taking tool that is not added here silently rejects "#454" while its
 # neighbours accept it, and "works on some tools" is worse than "works on none".
 #
-# Deliberately NOT resolved:
-#   - `tasks_bulk_update.task_ids` — a list, mutating N tasks per call, and the tool behind
-#     vikunja#333. Widening it deserves its own review (plan Phase 3 step 15).
-#   - `task_relation_add`/`task_relation_remove`'s `other_task_id` — still `int`, so a
-#     "#452" there is refused at schema validation. Loud and safe, but inconsistent;
-#     tracked separately rather than half-widened here.
+# `other_task_id` (both relation tools) and `tasks_bulk_update.task_ids` are resolved by the
+# same hook — see `_resolve_task_ref_kwarg`. They were `int`-only until vikunja#458/#459, so
+# the NEAR end of a relation accepted "#454" while the FAR end refused it at schema
+# validation. Safe, but a distinction no caller can predict, and the resolver was already
+# sitting right there.
 _TASK_REF_TOOLS = (
+    "tasks_bulk_update",
     "task_get",
     "task_update",
     "task_delete",
@@ -1863,7 +1899,7 @@ async def task_delete(task_id: int | str) -> dict:
 
 
 @tool
-async def tasks_bulk_update(task_ids: list[int], values: dict) -> dict:
+async def tasks_bulk_update(task_ids: list[int | str], values: dict) -> dict:
     """Apply the same field changes to many tasks in one call (migration throughput).
 
     `values` is a partial task object, e.g. `{"done": true}` or `{"priority": 4}`; it is
@@ -2030,14 +2066,18 @@ async def task_assignee_remove(task_id: int | str, user_id: int) -> dict:
 
 
 @tool
-async def task_relation_add(task_id: int | str, other_task_id: int, relation_kind: str) -> dict:
+async def task_relation_add(
+    task_id: int | str, other_task_id: int | str, relation_kind: str
+) -> dict:
     """Relate two tasks. `relation_kind` is e.g. `subtask`, `related`, `blocking`, `precedes`."""
     body = {"other_task_id": other_task_id, "relation_kind": relation_kind}
     return await request("POST", f"/tasks/{task_id}/relations", caller_token(), json=body)
 
 
 @tool
-async def task_relation_remove(task_id: int | str, relation_kind: str, other_task_id: int) -> dict:
+async def task_relation_remove(
+    task_id: int | str, relation_kind: str, other_task_id: int | str
+) -> dict:
     """Remove a relation between two tasks. `relation_kind` must match the existing relation."""
     # relation_kind is a free-text path segment — percent-encode it so a value like
     # "../.." cannot traverse to a different API path (IV-01).

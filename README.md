@@ -175,8 +175,13 @@ taking the first — position is not evidence.
 > token was re-issued. If your token does carry that permission, the switch is a one-line
 > change tracked upstream in the repo's issue for it.
 
-Not resolved: `tasks_bulk_update`'s `task_ids`, and `other_task_id` on the relation tools.
-Both still take plain ints, so a `"#454"` there is refused at schema validation.
+Resolution covers **three** parameters, not just `task_id`: `other_task_id` (the far end of
+a relation) and `task_ids` (the list `tasks_bulk_update` mutates) accept ticket references
+too. They were `int`-only until v0.11.0, which meant the *near* end of a relation accepted
+`"#454"` while the *far* end refused it at schema validation — a split no caller could
+predict. All three route through the same resolver so they cannot drift apart in what they
+accept, and the rule above holds for every one of them: **a bare number is always a global
+id.**
 
 ## Response size — compact by default
 

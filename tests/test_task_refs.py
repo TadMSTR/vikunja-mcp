@@ -271,7 +271,10 @@ def _task_id_tools():
             continue
         if fn.__module__ != server.__name__:
             continue  # imported helper (client.request), not a tool defined here
-        if "task_id" in inspect.signature(fn).parameters:
+        params = inspect.signature(fn).parameters
+        # `task_ids` counts too since vikunja#459 — the tuple's meaning is "takes a task
+        # REFERENCE", not "takes a parameter literally spelled task_id".
+        if "task_id" in params or "task_ids" in params:
             found.append(name)
     return sorted(found)
 
@@ -286,8 +289,11 @@ def test_every_task_id_tool_is_registered_for_ref_resolution():
     assert _task_id_tools() == sorted(server._TASK_REF_TOOLS)
 
 
+_REF_UNION = {"anyOf": [{"type": "integer"}, {"type": "string"}]}
+
+
 @pytest.mark.parametrize("name", sorted(server._TASK_REF_TOOLS))
-async def test_published_schema_accepts_a_string_task_id(name):
+async def test_published_schema_accepts_a_string_task_ref(name):
     """Asserted against the schema FastMCP actually publishes, not against the source.
 
     The annotation is load-bearing, not cosmetic: FastMCP derives the tool schema from
@@ -297,10 +303,28 @@ async def test_published_schema_accepts_a_string_task_id(name):
     `from __future__ import annotations`, reading the annotation off the signature would
     only prove the *string* `"int | str"` is present, not that pydantic resolved it into a
     union the transport honours.
+
+    `tasks_bulk_update` takes the list form, so its element type is what must be the union.
     """
     tool = await server.mcp.get_tool(name)
-    schema = tool.parameters["properties"]["task_id"]
-    assert schema == {"anyOf": [{"type": "integer"}, {"type": "string"}]}, name
+    props = tool.parameters["properties"]
+    if "task_ids" in props:
+        assert props["task_ids"]["type"] == "array", name
+        assert props["task_ids"]["items"] == _REF_UNION, name
+    else:
+        assert props["task_id"] == _REF_UNION, name
+
+
+@pytest.mark.parametrize("name", ["task_relation_add", "task_relation_remove"])
+async def test_published_schema_accepts_a_string_other_task_id(name):
+    """vikunja#458 — the FAR end of a relation, which no test covered before.
+
+    This is the assertion that actually proves #458 is fixed at the transport boundary. The
+    before-hook cannot rescue an `other_task_id: int`, because pydantic rejects `"#454"`
+    first.
+    """
+    tool = await server.mcp.get_tool(name)
+    assert tool.parameters["properties"]["other_task_id"] == _REF_UNION, name
 
 
 def test_ref_hook_is_registered_once_per_tool_after_repeated_calls():
@@ -586,3 +610,117 @@ async def test_live_index_filter_still_resolves(monkeypatch):
             "Ticket-reference resolution is broken until this is addressed."
         )
     assert resolved == expected_id
+
+
+# ===========================================================================
+# other_task_id and task_ids — vikunja#458 and #459
+#
+# Both were `int`-only, so the NEAR end of a relation accepted "#454" while the FAR end was
+# refused at schema validation. Safe, but a distinction no caller can predict. Widening them
+# routes through the same `_resolve_task_ref`, so the two ends cannot diverge in what they
+# accept — and the asymmetry that actually matters survives unchanged: a BARE number is
+# always a global id, never a ticket number.
+# ===========================================================================
+
+
+async def test_relation_add_resolves_a_ticket_ref_on_the_far_end(monkeypatch):
+    """`other_task_id="#454"` resolves to a global id before the relation is written."""
+    mock = AsyncMock(side_effect=[[fixtures.task(id=473)], {"ok": True}])
+    monkeypatch.setattr(server, "request", mock)
+    monkeypatch.setattr(server, "caller_token", lambda: "TOK")
+
+    await call(server.task_relation_add, task_id=100, other_task_id="#454", relation_kind="related")
+
+    method, path = mock.call_args.args[:2]
+    assert (method, path) == ("POST", "/tasks/100/relations")
+    assert mock.call_args.kwargs["json"]["other_task_id"] == 473
+
+
+async def test_relation_remove_resolves_a_ticket_ref_on_the_far_end(monkeypatch):
+    mock = AsyncMock(side_effect=[[fixtures.task(id=473)], {"ok": True}])
+    monkeypatch.setattr(server, "request", mock)
+    monkeypatch.setattr(server, "caller_token", lambda: "TOK")
+
+    await call(
+        server.task_relation_remove,
+        task_id=100,
+        relation_kind="related",
+        other_task_id="#454",
+    )
+
+    assert mock.call_args.args[:2] == ("DELETE", "/tasks/100/relations/related/473")
+
+
+async def test_a_bare_number_on_the_far_end_is_still_a_global_id(_upstream):
+    """The whole safety property, on the newly widened parameter.
+
+    473 must mean task 473, never ticket #473. If this ever resolves, the widening has
+    reintroduced exactly the guess that silently mutated three unrelated tickets.
+    """
+    await call(server.task_relation_add, task_id=100, other_task_id=473, relation_kind="related")
+    assert _upstream.await_count == 1  # no lookup happened
+    assert _upstream.call_args.kwargs["json"]["other_task_id"] == 473
+
+
+async def test_a_bare_numeric_string_on_the_far_end_is_still_a_global_id(_upstream):
+    await call(server.task_relation_add, task_id=100, other_task_id="473", relation_kind="related")
+    assert _upstream.await_count == 1
+    assert _upstream.call_args.kwargs["json"]["other_task_id"] == 473
+
+
+async def test_a_bad_far_end_ref_names_other_task_id_not_task_id(_upstream):
+    """The error must point at the argument the caller actually got wrong.
+
+    Before `field` was threaded through, every message said "task_id must be ...", which
+    sends someone debugging a relation call to the wrong parameter.
+    """
+    with pytest.raises(ValueError, match="other_task_id must be"):
+        await call(
+            server.task_relation_add,
+            task_id=100,
+            other_task_id="not-a-ref",
+            relation_kind="related",
+        )
+
+
+async def test_bulk_update_resolves_ticket_refs_elementwise(monkeypatch):
+    """vikunja#459 — decided YES, for consistency with #458.
+
+    Declining would have left `tasks_bulk_update` the one task-reference-taking tool that
+    refuses "#454", which is the same unpredictable split #458 just closed.
+    """
+    mock = AsyncMock(side_effect=[[fixtures.task(id=473)], [fixtures.task(id=474)], {"ok": True}])
+    monkeypatch.setattr(server, "request", mock)
+    monkeypatch.setattr(server, "caller_token", lambda: "TOK")
+
+    await call(server.tasks_bulk_update, task_ids=["#454", "#455"], values={"done": True})
+
+    assert mock.call_args.kwargs["json"]["task_ids"] == [473, 474]
+
+
+async def test_bulk_update_mixes_bare_ids_and_ticket_refs(monkeypatch):
+    """A bare id in the list stays itself and costs no lookup; only the "#" form resolves."""
+    mock = AsyncMock(side_effect=[[fixtures.task(id=473)], {"ok": True}])
+    monkeypatch.setattr(server, "request", mock)
+    monkeypatch.setattr(server, "caller_token", lambda: "TOK")
+
+    await call(server.tasks_bulk_update, task_ids=[999, "#454"], values={"done": True})
+
+    assert mock.call_args.kwargs["json"]["task_ids"] == [999, 473]
+    assert mock.await_count == 2  # one resolve + the bulk call
+
+
+async def test_bulk_update_names_the_offending_index(_upstream):
+    """`task_ids[1]`, not a bare "task_id", so a long list is debuggable."""
+    with pytest.raises(ValueError, match=r"task_ids\[1\] must be"):
+        await call(server.tasks_bulk_update, task_ids=[1, "nope"], values={"done": True})
+
+
+async def test_a_bare_string_task_ids_is_refused_not_iterated(_upstream):
+    """A string is a sequence, so "#454" would iterate to '#','4','5','4'.
+
+    Four nonsense refs, and the first would raise something unrelated to the real mistake.
+    Refuse the type outright instead.
+    """
+    with pytest.raises(ValueError, match="task_ids must be a list"):
+        await call(server.tasks_bulk_update, task_ids="#454", values={"done": True})

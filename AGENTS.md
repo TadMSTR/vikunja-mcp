@@ -87,7 +87,12 @@ logic, no caching, no persistence.
    agent passed `index` to `task_label_add` and silently mutated three unrelated tickets.
 
    `_resolve_task_ref` is the inverse: it accepts `"#454"` on every tool in
-   `server._TASK_REF_TOOLS`. Three rules that are load-bearing, not stylistic:
+   `server._TASK_REF_TOOLS`, and on **three** parameters, not one — `task_id`,
+   `other_task_id` (the far end of a relation) and `task_ids` (the list
+   `tasks_bulk_update` mutates). The latter two were `int`-only until vikunja#458/#459, so
+   the near end of a relation accepted a ticket reference while the far end refused it at
+   schema validation. All three route through the same resolver so they cannot diverge in
+   what they accept. Three rules that are load-bearing, not stylistic:
 
    - **A bare number is always a global id.** `"454"` without a `#` is never a ticket
      number. The `#` is the only thing that distinguishes the two, so guessing without it

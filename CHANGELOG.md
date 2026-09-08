@@ -6,6 +6,101 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.11.0] — 2026-09-08
+
+Promotion from `baseline` to `flagship` under the repo standard. The conformance checker,
+run against an index declaring `flagship`, moves **19 pass / 15 fail -> 34 pass / 0 fail**.
+
+### Added
+- **`vikunja-mcp --check`** — validates configuration and exits non-zero on a bad
+  combination, without starting the server or contacting Vikunja. The config surface fails
+  closed in three ways that are all easy to hit on first setup (no `VIKUNJA_URL`, `stdio`
+  without `VIKUNJA_TOKEN`, `VIKUNJA_TOKEN` on a network transport), and before this the
+  only way to find out which one you had hit was to start the server and read a traceback.
+  It never prints the token, and a green result means the configuration is coherent — not
+  that the instance is reachable or the credential valid, which it says explicitly.
+- **`docs/clients.md`** — copy-paste client configuration for Claude Code, Claude Desktop
+  and raw `.mcp.json`, both transports, with a troubleshooting table keyed on the actual
+  error strings. This closes the repo's biggest adoption gap: it had zero occurrences of
+  `mcpServers`, `.mcp.json`, `claude mcp add` or `claude_desktop_config` anywhere, so it
+  documented how the *server* runs and never how a *client* connects. A README quickstart
+  now gets you from landing on the repo to a working client in one command.
+- **`ARCHITECTURE.md`**, **`CONTRIBUTING.md`**, **`docs/index.md`**, **`CODE_OF_CONDUCT.md`**,
+  issue templates and a PR template.
+- **`examples/`** — two compose files (minimal and full) and three agent skills, all
+  exercised by CI on every PR. The compose examples are stood up against the image built
+  from the commit under review and probed; the skills are checked for frontmatter, links,
+  and — the part with real value — that **every tool name they reference still exists**,
+  read from a live `tools/list`.
+- **`uv.lock`** and **`.github/dependabot.yml`** covering `uv`, `docker` and
+  `github-actions`. Landed together deliberately: a committed lockfile with nothing
+  maintaining it is a freeze, not an improvement (vikunja#670).
+- **CodeQL** (`python` *and* `actions`) and **OSSF Scorecard** workflows, `.github/CODEOWNERS`,
+  and a CI badge.
+- **Build provenance attestation** on the published image. Verify with
+  `gh attestation verify oci://ghcr.io/tadmstr/vikunja-mcp:<tag> --owner TadMSTR`. Note the
+  registry's OCI referrers endpoint returns `404 MANIFEST_UNKNOWN` even on success — GHCR
+  does not implement it (vikunja#699).
+- **`scripts/smoke-image.sh`** and **`scripts/check-examples.sh`**, both run by CI *and* by
+  the release path. One definition, two call sites: the PR path and the publish path must
+  not be able to drift, and the one that matters is the one nobody watches.
+
+### Changed
+- **Ticket references now resolve on three parameters, not one** (vikunja#458, #459).
+  `other_task_id` on both relation tools and `task_ids` on `tasks_bulk_update` were
+  `int`-only, so the *near* end of a relation accepted `"#454"` while the *far* end refused
+  it at schema validation — a split no caller could predict. All three now route through
+  the same `_resolve_task_ref`, so they cannot diverge in what they accept.
+
+  The safety property is unchanged and is asserted on each newly widened parameter: **a
+  bare number is always a global id, never a ticket number.** Guessing between the two is
+  what vikunja#331 did, silently mutating three unrelated tickets. Errors now name the
+  parameter that was wrong (`other_task_id`, `task_ids[1]`) rather than always saying
+  `task_id`.
+- **`release.yml` publishes in the right order.** It was build -> push with no smoke test at
+  all; it is now build -> smoke test -> push -> attest. A test that runs after the push
+  tells you what you have already shipped.
+- **The dependency audit is three gates, not one** — runtime, dev, and the container image
+  — and every one reads a pinned set rather than re-resolving. `pip-audit -r` re-resolves
+  regardless of `--no-deps`, so the intuitive "freeze the deps, audit the freeze" rebuilds
+  the exact defect the gate exists to prevent (vikunja#633). The image gate audits *every*
+  `site-packages` tree in the artefact, including the base image's own, which a venv-only
+  audit never looks at.
+- **The coverage floor is now measured and dated**: `fail_under = 93`, against a measured
+  **93.60%** identical on Python 3.11, 3.12 and 3.13. It was 80 with no number and no date,
+  silently permitting a 13.6-point regression (vikunja#680).
+- **`ci.yml` and `verify-routes.yml` gained a top-level `permissions: contents: read`.**
+- The image smoke test now asserts the **service contract**, not merely that the port
+  answers: a tool call with no `Authorization` header fails closed with the passthrough
+  `AuthError`, and a call *with* a bearer reaches upstream instead — two distinguishable
+  failures. The second is the control the first needs; without it a server that failed
+  every call for any reason would pass. Note there is deliberately no 401 assertion: this
+  server has no transport-level auth, and `POST /mcp` answers 200 without a credential.
+
+### Fixed
+- **`VIKUNJA_DEFAULT_PROJECT_ID=""` no longer crashes the server at startup.** An empty
+  assignment is the normal way an optional variable appears in a compose file —
+  `${VIKUNJA_DEFAULT_PROJECT_ID:-}` renders as an empty string, not an absent variable —
+  and pydantic rejected it for `int | None`. `VIKUNJA_TOKEN` already had exactly this
+  treatment for exactly this reason; the inconsistency was invisible until CI stood up this
+  repo's own `examples/compose/full`, which could not boot.
+
+### Removed
+- **`docs/forge.md`** (219 lines of private deployment topology in a public repo), replaced
+  by a generic `docs/deployment.md` covering the same ground — proxy layer, per-agent token
+  wiring, the grant model (vikunja#475, #519). Topology was also removed from seven other
+  sites the original review had not identified, two of which were **user-facing error
+  strings** describing one specific private deployment to every user of the public image.
+
+### Security
+- Baseline OSSF Scorecard score recorded on first publication: **5.9**. Recorded as a
+  measurement, not a target — several checks assess things this project deliberately does
+  not do.
+- vikunja#460 re-measured against the lockfile and closed by measurement: cryptography is
+  **50.0.1**, past the fix version the ticket named, and the six `pip` advisories it listed
+  were pip-audit auditing its own venv toolchain. `pip` is absent from the locked set;
+  **0** advisories across 95 runtime and all dev packages.
+
 ## [0.10.1] — 2026-09-02
 
 ### Changed
