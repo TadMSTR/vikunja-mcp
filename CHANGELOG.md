@@ -70,6 +70,12 @@ run against an index declaring `flagship`, moves **19 pass / 15 fail -> 34 pass 
   **93.60%** identical on Python 3.11, 3.12 and 3.13. It was 80 with no number and no date,
   silently permitting a 13.6-point regression (vikunja#680).
 - **`ci.yml` and `verify-routes.yml` gained a top-level `permissions: contents: read`.**
+- **The lint job installs ruff from the project's own dev extra** rather than a version
+  hardcoded in the workflow. It was `pip install ruff==0.16.0` while `pyproject.toml`
+  separately pinned `ruff==0.16.0` — two rosters of one fact, only one of them maintained.
+  Dependabot's `uv` ecosystem cannot see a version baked into a `run:` step, so the first
+  ruff bump would have left the lint gate testing a version nothing else used. Ruff is now
+  0.16.6, verified clean against this tree before taking it.
 - The image smoke test now asserts the **service contract**, not merely that the port
   answers: a tool call with no `Authorization` header fails closed with the passthrough
   `AuthError`, and a call *with* a bearer reaches upstream instead — two distinguishable
