@@ -99,6 +99,11 @@ run against an index declaring `flagship`, moves **19 pass / 15 fail -> 34 pass 
   strings** describing one specific private deployment to every user of the public image.
 
 ### Security
+- **Security audit: clean.** 0 findings at Low or above; 7 informational items, all of
+  them risks this build self-disclosed and asked to have verified independently. The
+  ticket-reference widening was the one that mattered — the auditor traced the hook chain
+  and confirmed it structurally unbypassable, agreeing with the build's own 12-input
+  hostile probe. Recorded in [docs/security-audit.md](docs/security-audit.md).
 - Baseline OSSF Scorecard score recorded on first publication: **5.9**. Recorded as a
   measurement, not a target — several checks assess things this project deliberately does
   not do.

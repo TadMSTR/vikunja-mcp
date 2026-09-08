@@ -1,5 +1,9 @@
 # Security
 
+> Every release is audited before merge by a reviewer independent of the agent that wrote
+> it. See [docs/security-audit.md](docs/security-audit.md) for what those audits found —
+> one High finding in the project's history, fixed before it shipped.
+
 ## Model: token passthrough, no stored credentials
 
 On every network transport, `vikunja-mcp` holds no Vikunja API tokens. Each request must

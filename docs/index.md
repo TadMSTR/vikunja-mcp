@@ -25,6 +25,7 @@ Start with the [README](../README.md) quickstart if you just want a working clie
 |---|---|
 | [../ARCHITECTURE.md](../ARCHITECTURE.md) | Module boundaries, the request lifecycle, and the six invariants a change should not break |
 | [../SECURITY.md](../SECURITY.md) | The credential rules, the SSRF guard, and how to report a vulnerability |
+| [security-audit.md](security-audit.md) | What every audit of this project found, and what happened next. One High ever, fixed before it shipped |
 | [../AGENTS.md](../AGENTS.md) | Working on this repo with a coding agent — module boundaries and the traps that have caused real bugs |
 | [../CONTRIBUTING.md](../CONTRIBUTING.md) | Opening a PR: setup, what CI checks, house style |
 
