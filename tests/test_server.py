@@ -325,7 +325,7 @@ def test_main_http_transport(monkeypatch):
     run = MagicMock()
     monkeypatch.setattr(server.mcp, "run", run)
     monkeypatch.setattr(config, "get_settings", config.get_settings)
-    server.main()
+    server.main([])
     assert run.call_args.kwargs["transport"] == "http"
     assert run.call_args.kwargs["port"] == 8501
 
@@ -350,7 +350,7 @@ async def test_main_stdio_transport(monkeypatch, _patch_calls):
 
     run = MagicMock()
     monkeypatch.setattr(server.mcp, "run", run)
-    server.main()
+    server.main([])
     assert run.call_args == (("stdio",), {}) or run.call_args.kwargs.get("transport") == "stdio"
 
     # Restore the real caller_token: the autouse fixture pins it to a constant, which

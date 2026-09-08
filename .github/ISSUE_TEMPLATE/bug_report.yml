@@ -1,0 +1,87 @@
+name: Bug report
+description: Something behaves differently from how it is documented
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. **Before filing**, please run the config validator and paste
+        its output below — it catches the three most common setup failures without needing
+        any back-and-forth:
+
+        ```bash
+        docker run --rm --entrypoint vikunja-mcp ghcr.io/tadmstr/vikunja-mcp:latest --check
+        ```
+
+        It does not contact Vikunja and does not print your token.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did you expect, and what happened instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Start the server with ...
+        2. Call tool ...
+        3. Observe ...
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: vikunja-mcp version
+      description: From `/health`, or the image tag you are running.
+      placeholder: "0.10.1"
+    validations:
+      required: true
+
+  - type: input
+    id: vikunja-version
+    attributes:
+      label: Vikunja version
+      description: Requires 2.4.0 or newer — this server targets /api/v2.
+      placeholder: "2.5.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: transport
+    attributes:
+      label: Transport
+      options:
+        - stdio (single user, VIKUNJA_TOKEN set)
+        - http (shared, token per request)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: how-run
+    attributes:
+      label: How are you running it?
+      options:
+        - Container (ghcr.io/tadmstr/vikunja-mcp)
+        - Installed from a git checkout
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: check-output
+    attributes:
+      label: Output of `--check`
+      render: text
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log output
+      description: Logs are structured JSON. **Redact any bearer tokens before pasting.**
+      render: shell

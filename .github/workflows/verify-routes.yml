@@ -4,13 +4,14 @@ name: Verify routes
 # off pull_request means a fork PR can never trigger it, and a job that is only meaningful
 # against a configured host does not sit in the required-checks path pretending otherwise.
 #
-# runs-on: ubuntu-latest is correct — vikunja.helmforge.me is genuinely public (no Authentik
-# forward-auth on its SWAG vhost, so Bearer-token API calls work), so a GitHub-hosted runner
-# can reach it. No self-hosted runner is needed.
+# runs-on: ubuntu-latest works only if the configured VIKUNJA_URL is reachable from a
+# GitHub-hosted runner — i.e. genuinely public, with no forward-auth in front of /api. An
+# instance behind an SSO proxy or on a private network needs a self-hosted runner instead;
+# a Bearer-token API call cannot get past an interactive auth layer.
 on:
   workflow_dispatch:
   schedule:
-    # 04:15 UTC daily — after forge's own maintenance windows.
+    # 04:15 UTC daily. Offset from codeql.yml (04:17) so the two do not contend.
     - cron: "15 4 * * *"
 
 # Least privilege at the top level. This job checks out the tree and runs a read-only HTTP

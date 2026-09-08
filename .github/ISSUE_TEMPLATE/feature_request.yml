@@ -1,0 +1,37 @@
+name: Feature request
+description: Suggest a capability or a change in behaviour
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        A few things are deliberate design decisions rather than gaps, and a request to
+        change one needs to argue against the reasoning rather than around it — see
+        [ARCHITECTURE.md](../../ARCHITECTURE.md):
+
+        - **No credential store, service account, or ambient token fallback.** The
+          token-passthrough model is what keeps the blast radius to one in-flight request
+          and gives per-agent attribution for free.
+        - **No config on `/health`.** It is the one unauthenticated route.
+        - **No PyPI package.** The name is squatted by an unrelated project.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      description: The situation, not the solution — it often has a shorter path than the one you had in mind.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would you like it to do?
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What have you tried or considered?
+      description: Including anything that nearly worked, and why it did not.

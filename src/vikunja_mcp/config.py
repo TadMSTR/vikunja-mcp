@@ -142,6 +142,24 @@ class Settings(BaseSettings):
             )
         return v
 
+    @field_validator("default_project_id", mode="before")
+    @classmethod
+    def _blank_project_id_is_unset(cls, v: object) -> object:
+        """Treat ``VIKUNJA_DEFAULT_PROJECT_ID=""`` (or whitespace) as unset, not as an error.
+
+        Same reasoning as ``_blank_token_is_unset`` below, and the same trigger: an empty
+        assignment is the normal way an optional variable appears in a compose file or a
+        ``.env`` — ``VIKUNJA_DEFAULT_PROJECT_ID: ${VIKUNJA_DEFAULT_PROJECT_ID:-}`` renders as
+        an empty string, not as an absent variable. Without this, that idiom crashes the
+        server at startup with a pydantic ``int_parsing`` error for a variable the operator
+        deliberately left blank.
+
+        Found by CI standing up this repo's own ``examples/compose/full``, which did exactly
+        that and failed to boot. The token field already had this treatment; this one did not,
+        and the inconsistency was invisible until something ran the example.
+        """
+        return None if isinstance(v, str) and not v.strip() else v
+
     @field_validator("token", mode="after")
     @classmethod
     def _blank_token_is_unset(cls, v: str | None) -> str | None:

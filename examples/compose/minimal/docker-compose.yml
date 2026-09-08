@@ -1,0 +1,60 @@
+# Smallest thing that runs.
+#
+# Two decisions and nothing else: where Vikunja is, and who can reach this port.
+#
+#   VIKUNJA_URL=https://vikunja.example.com docker compose up -d
+#   curl -fsS http://127.0.0.1:8501/health
+#
+# For every other knob see ../full/docker-compose.yml, which is the same service with the
+# options written out and explained.
+#
+# CI stands this file up on every PR and asserts /health answers. Compose examples rot
+# precisely because nothing runs them — this one cannot rot silently.
+services:
+  vikunja-mcp:
+    # SECURITY[accepted]: DC-01. A reference template pinned to a version is stale the day
+    # after the next release, so these examples track :latest and tell you to pin. Same
+    # disposition as the root docker-compose.yml. Revisit if either file ever stops being a
+    # template someone copies and edits.
+    image: ghcr.io/tadmstr/vikunja-mcp:latest
+
+    # Deliberately NO `container_name:`. It is host-global, so a fixed name here would
+    # collide with any other container of that name on the same machine — including a
+    # production one. Letting compose derive `<project>-vikunja-mcp` keeps an example
+    # someone copy-pastes from colliding with the thing it is an example of.
+
+    ports:
+      # Loopback only. THIS line is the exposure decision, not the bind address inside the
+      # container — that has to be 0.0.0.0 to be reachable from outside its own namespace
+      # at all. Widen to "8501:8501" only if you have decided the port should be reachable
+      # from your network.
+      - "127.0.0.1:8501:8501"
+
+    environment:
+      # Required — the server refuses to start without it rather than guessing. No
+      # `${VIKUNJA_URL:?}` guard on purpose: compose interpolates on EVERY subcommand, so a
+      # required-variable guard breaks `down` and `logs` too. The server's own startup
+      # check is the real guard and it is unmissable.
+      VIKUNJA_URL: ${VIKUNJA_URL}
+
+      # Do NOT set VIKUNJA_TOKEN here. This is the HTTP transport, where a static token is
+      # refused at startup — it would make every caller reach Vikunja as one identity.
+      # Tokens travel per-request in the Authorization header.
+
+    # "Minimal" means the fewest DECISIONS, not the fewest protections. Everything below is
+    # here because an example people copy into a real deployment should be safe to copy;
+    # stripping it would teach a worse default than it saves lines.
+    #
+    # `user:` is redundant with the image, which already sets USER 1000:1000 — stated so the
+    # guarantee is visible in the file you actually read, and so it survives a swap to a
+    # locally built image that forgot it.
+    user: "1000:1000"
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    # A stateless HTTP shim over an API does not need much, and a bounded container cannot
+    # starve its host if a pathological response arrives.
+    mem_limit: 1g
+    cpus: 1.0
+    restart: unless-stopped

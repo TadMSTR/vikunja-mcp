@@ -1,5 +1,9 @@
 # Security
 
+> Every release is audited before merge by a reviewer independent of the agent that wrote
+> it. See [docs/security-audit.md](docs/security-audit.md) for what those audits found —
+> one High finding in the project's history, fixed before it shipped.
+
 ## Model: token passthrough, no stored credentials
 
 On every network transport, `vikunja-mcp` holds no Vikunja API tokens. Each request must
@@ -57,29 +61,27 @@ to collapse.
   an internal suffix (`.local`, `.internal`, `.lan`, `.home`, `.corp`); hostnames are
   resolved and every returned address is checked.
 
-  This guard is load-bearing rather than defence in depth. Vikunja has its own
-  outgoing-request SSRF filter, but forge **disables** it — the Vikunja container sets
-  `VIKUNJA_OUTGOINGREQUESTS_ALLOWNONROUTABLEIPS=true` (verified 2026-08-04). In this
-  deployment the MCP-side check is the only thing standing between a webhook registration
-  and an internal address, so do not weaken it on the assumption that upstream will catch
-  it.
+  This guard can be load-bearing rather than defence in depth, depending on how Vikunja is
+  configured. Vikunja has its own outgoing-request SSRF filter, but it can be switched off
+  with `VIKUNJA_OUTGOINGREQUESTS_ALLOWNONROUTABLEIPS=true` — and a deployment that has done
+  so leaves the MCP-side check as the only thing standing between a webhook registration
+  and an internal address. Check your own instance before assuming upstream will catch it,
+  and do not weaken this check on that assumption.
 
-  **On forge specifically, a SWAG hostname is not a valid target.** Split-horizon DNS
-  resolves every `*.helmforge.me` hostname to its LAN address, so the guard classifies
-  SWAG-fronted vhosts as internal and refuses them — including
-  `vikunja-webhook-listener`'s own vhost, which is the obvious candidate target. A valid
-  `target_url` must be genuinely external to forge. As of this writing no such target is in
-  use: `vikunja-webhook-listener` binds the Docker bridge gateway
-  (`172.20.1.1:8502`, container-reachable only), has no SWAG proxy-conf, and no agent is
-  granted `webhook_create`. Do not weaken this guard to work around that — fix the target,
-  not the check.
+  **A public-looking hostname is not automatically a valid target.** The guard judges the
+  address a name RESOLVES to, not how the name looks. Under split-horizon DNS — common
+  wherever a reverse proxy fronts internal services on a public domain — a hostname that
+  looks external resolves to a private address, and the guard refuses it. This bites most
+  often on the obvious candidate: the webhook receiver you just deployed behind your own
+  reverse proxy. A valid `target_url` must resolve to a genuinely external address. Fix
+  the target, not the check.
 
   **The guard fails closed.** A host that cannot be resolved is refused rather than waved
-  through. Until 2026-08-04 it was allowed, on the reasoning that Vikunja re-resolves at
-  delivery — but that reasoning does not hold in this deployment, because the upstream
-  filter is off and so the delivery-time resolution is unguarded. The practical cost is
-  that registering a webhook against a host forge cannot currently resolve will be
-  rejected; that is the cheaper failure for a rare, deliberate operation.
+  through. It was once allowed, on the reasoning that Vikunja re-resolves at delivery — but
+  that reasoning is void wherever the upstream filter is disabled, because then the
+  delivery-time resolution is itself unguarded. The practical cost is that registering a
+  webhook against a host this server cannot currently resolve will be rejected; that is the
+  cheaper failure for a rare, deliberate operation.
 
   Residual limit: validation happens at registration, and Vikunja performs the actual
   delivery in its own process. A name that resolves to a public address when registered and

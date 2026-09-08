@@ -45,8 +45,10 @@ jobs:
     name: Publish image to GHCR
     runs-on: ubuntu-latest
     permissions:
-      contents: read   # checkout
-      packages: write  # push to ghcr.io
+      contents: read    # checkout
+      packages: write   # push to ghcr.io
+      id-token: write   # OIDC, for build provenance attestation
+      attestations: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
@@ -55,6 +57,38 @@ jobs:
       # below rather than carrying the flakiness into the release job.
       - uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a # v4.3.0
       - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      # Needed by the image dependency audit inside smoke-image.sh.
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+
+      # BUILD -> SMOKE TEST -> PUSH, IN THAT ORDER, AND THE ORDER IS THE POINT.
+      #
+      # This job used to be build-and-push with no smoke test at all. A test that runs after
+      # the push tells you what you have already shipped; by then the tag is public and
+      # anything pulling `latest` has it. All four of searxng-mcp's publish jobs are named
+      # "Build, smoke test, publish" for the same reason.
+      #
+      # A multi-platform build cannot be `load`ed into the local docker daemon, so the
+      # native-arch image is built and loaded first for testing. The push below rebuilds from
+      # the same layer cache, so this costs cache lookups rather than a second real build.
+      #
+      # HONEST LIMITATION: only linux/amd64 is smoke tested. The arm64 image is emulated and
+      # exercising it here would multiply job time for a platform whose failure mode is a
+      # missing wheel — which the build itself already surfaces. Recorded rather than left
+      # for a reader to discover.
+      - name: Build (amd64) for testing
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          push: false
+          load: true
+          platforms: linux/amd64
+          tags: vikunja-mcp:release-candidate
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Same script ci.yml runs on every PR. One definition, two call sites.
+      - name: Smoke test the release candidate
+        run: scripts/smoke-image.sh vikunja-mcp:release-candidate
 
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
@@ -66,6 +100,7 @@ jobs:
       # Hardcoded rather than derived so the failure mode is a wrong-looking string in a
       # diff, not a broken push at tag time.
       - name: Build and push
+        id: push
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
@@ -76,3 +111,19 @@ jobs:
             ghcr.io/tadmstr/vikunja-mcp:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # Build provenance attestation — a signed statement of which workflow, at which commit,
+      # produced this digest, verifiable with `gh attestation verify`.
+      #
+      # DO NOT DELETE THIS STEP ON THE STRENGTH OF A 404.
+      # GHCR does not implement the OCI referrers endpoint
+      # (GET /v2/<name>/referrers/<digest>) and returns 404 MANIFEST_UNKNOWN even when the
+      # attestation succeeded. vikunja#699 is open specifically to stop this being "fixed"
+      # again. Verify with `gh attestation verify oci://ghcr.io/tadmstr/vikunja-mcp:<tag>
+      # --owner TadMSTR`, which reads GitHub's attestation API, not the registry's referrers.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
+        with:
+          subject-name: ghcr.io/tadmstr/vikunja-mcp
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true

@@ -83,11 +83,16 @@ logic, no caching, no persistence.
    response listed in `server._INDEX_STRIPPED_TOOLS`, at any nesting depth — including the
    tasks Vikunja inlines under `related_tasks`, which carry their own. Keep `identifier`:
    it is a string, so it cannot be passed where an int id is expected without an obvious
-   type error, and five forge consumers render it. This is vikunja#331 (id 342), where an
+   type error, and downstream consumers render it. This is vikunja#331 (id 342), where an
    agent passed `index` to `task_label_add` and silently mutated three unrelated tickets.
 
    `_resolve_task_ref` is the inverse: it accepts `"#454"` on every tool in
-   `server._TASK_REF_TOOLS`. Three rules that are load-bearing, not stylistic:
+   `server._TASK_REF_TOOLS`, and on **three** parameters, not one — `task_id`,
+   `other_task_id` (the far end of a relation) and `task_ids` (the list
+   `tasks_bulk_update` mutates). The latter two were `int`-only until vikunja#458/#459, so
+   the near end of a relation accepted a ticket reference while the far end refused it at
+   schema validation. All three route through the same resolver so they cannot diverge in
+   what they accept. Three rules that are load-bearing, not stylistic:
 
    - **A bare number is always a global id.** `"454"` without a `#` is never a ticket
      number. The `#` is the only thing that distinguishes the two, so guessing without it
@@ -145,11 +150,13 @@ logic, no caching, no persistence.
 - `test_server.py` asserts verb + path + body for each tool without touching the network;
   add a case there when you add a tool.
 
-## scoped-mcp manifest (forge)
+## Behind a proxy
 
-Fronted by scoped-mcp on port 8501 via the `mcp_proxy` module. The per-agent Vikunja token
-is injected as the `Authorization` header by the manifest's `headers` block (resolved from
-Vault). See `docs/forge.md` for the full manifest and grant matrix.
+Typically fronted on port 8501 by a proxy layer such as
+[scoped-mcp](https://github.com/TadMSTR/scoped-mcp). The per-agent Vikunja token is injected
+as the `Authorization` header by that layer, resolved from whatever secret store it uses —
+this server never holds one. See `docs/deployment.md` for the token wiring and the
+per-agent grant model.
 
 <!-- SECURITY[control]: This server intentionally has no internal credential store. Auth is
 the caller-supplied Vikunja token, validated upstream by Vikunja itself. Tool-level access is

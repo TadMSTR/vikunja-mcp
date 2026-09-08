@@ -1,0 +1,123 @@
+# Every option written out, with the reasoning.
+#
+# Start from ../minimal/ if you just want it running. This file is the one to read when you
+# are deciding what to turn on.
+#
+#   cp .env.example .env && $EDITOR .env
+#   docker compose up -d
+#   curl -fsS http://127.0.0.1:8501/health
+#
+# CI stands this file up on every PR — including the audit-log volume — and asserts /health
+# answers and the log directory is actually writable by the container's uid. Compose
+# examples rot precisely because nothing runs them.
+services:
+  vikunja-mcp:
+    # `:latest` is fine for a first run and wrong for anything you rely on. Pin a version
+    # tag once you have one working, so a rebuild cannot silently move under you. Every
+    # release publishes both, and provenance is attested:
+    #   gh attestation verify oci://ghcr.io/tadmstr/vikunja-mcp:v0.10.1 --owner TadMSTR
+    # SECURITY[accepted]: DC-01. A reference template pinned to a version is stale the day
+    # after the next release, so these examples track :latest and tell you to pin. Same
+    # disposition as the root docker-compose.yml. Revisit if either file ever stops being a
+    # template someone copies and edits.
+    image: ghcr.io/tadmstr/vikunja-mcp:latest
+
+    # Deliberately NO `container_name:`. It is host-global, so a fixed name here would
+    # collide with any other container of that name on the same machine — including a
+    # production one, which is a way to silently remove a running service by testing an
+    # example. Compose derives `<project>-vikunja-mcp` instead.
+
+    # Redundant with the image, which already sets USER 1000:1000 — stated anyway so the
+    # guarantee is visible in the file you actually read, and so it survives a swap to a
+    # locally built image that forgot it.
+    user: "1000:1000"
+
+    ports:
+      # THIS is the exposure decision. See ../minimal/ for why the in-container bind
+      # address is not.
+      #
+      # Note what is on this port: every tool call carries the caller's own Vikunja token,
+      # and a request without one is rejected. So the port grants nothing a caller could
+      # not already do by talking to Vikunja directly with the same token. Still worth
+      # keeping narrow.
+      - "127.0.0.1:8501:8501"
+
+    environment:
+      # --- required ---------------------------------------------------------------------
+      # Base URL, without the /api/v2 suffix — the client appends it. A URL that includes
+      # it produces a 404 on every call.
+      #
+      # Container-to-container is fine here; this is not subject to the webhook SSRF guard,
+      # so a compose service name works:  VIKUNJA_URL: http://vikunja:3456
+      VIKUNJA_URL: ${VIKUNJA_URL}
+
+      # --- credentials ------------------------------------------------------------------
+      # Do NOT set VIKUNJA_TOKEN. On a network transport it is refused at startup: a static
+      # token on a shared port makes every caller reach Vikunja as one identity and
+      # silently destroys per-agent attribution. It exists only for stdio, which has no
+      # request to carry a header. See ../../../SECURITY.md.
+
+      # --- behaviour --------------------------------------------------------------------
+      # Scopes what a bare "#12" ticket reference resolves against. Leave unset and an
+      # ambiguous reference RAISES instead of guessing — ticket numbers are unique per
+      # project, not globally, and guessing here has silently mutated unrelated tickets.
+      VIKUNJA_DEFAULT_PROJECT_ID: ${VIKUNJA_DEFAULT_PROJECT_ID:-}
+
+      # Duplicate warnings on task_create are ON by default and cost one extra upstream
+      # search per create. Set "0" to turn them off.
+      VIKUNJA_DUPLICATE_CHECK: "1"
+
+      # Age at which a task reads `stale: true`. Lower it after a bulk import, which
+      # rewrites `updated` on everything and makes the whole tracker look fresh. Must be
+      # >= 1; zero would mark the entire backlog stale and is refused at startup.
+      VIKUNJA_STALE_AFTER_DAYS: "90"
+
+      # Task ids excluded from every backlog_summary bucket — for a "vocabulary anchor"
+      # task carrying every label deliberately, which would otherwise inflate each label
+      # count by exactly one. There is no sensible default; leave empty if you have none.
+      VIKUNJA_SUMMARY_EXCLUDE_IDS: ${VIKUNJA_SUMMARY_EXCLUDE_IDS:-}
+
+      # Upstream timeout, seconds.
+      VIKUNJA_REQUEST_TIMEOUT: "30"
+
+      # --- observability ----------------------------------------------------------------
+      LOG_LEVEL: INFO
+
+      # Audit log for mutating tools. Requires the volume below, because the container
+      # filesystem is read-only. Both variables or neither — the server refuses to start
+      # with the flag on and no directory rather than falling back to stdout.
+      VIKUNJA_AUDIT_LOG: "1"
+      VIKUNJA_AUDIT_LOG_DIR: /var/log/vikunja-mcp
+
+      # Tracing. The image already ships the [telemetry] extra, so the endpoint is all you
+      # need here. 4317 is gRPC, not the 4318 HTTP port.
+      #
+      # THE ACCEPTANCE CHECK IS THE LOG LINE, NOT THE ENV VAR: setting this without the
+      # extra installed does not fail, it logs `otlp_import_failed` once and then exports
+      # nothing forever. Confirm with:
+      #   docker compose logs vikunja-mcp | grep -E 'otlp_enabled|otlp_import_failed'
+      # OTEL_EXPORTER_OTLP_ENDPOINT: http://collector:4317
+
+    volumes:
+      # uid/gid 1000 inside the container — chown the host directory to match, or the
+      # server fails closed on its first write. This is the ONLY path it writes to.
+      - ./audit-log:/var/log/vikunja-mcp
+
+    # --- hardening ----------------------------------------------------------------------
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    # Safe by default: the audit log is off unless you turn it on, and it is the only path
+    # this server writes to. If something turns out to need a writable root, find out what
+    # rather than dropping this flag.
+    read_only: true
+    tmpfs: [/tmp]
+    # A stateless HTTP shim over an API — it does not need much, and a bounded container
+    # cannot starve its host if a pathological response arrives.
+    mem_limit: 1g
+    cpus: 1.0
+    ulimits:
+      core: 0
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+    restart: unless-stopped

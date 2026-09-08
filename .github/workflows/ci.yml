@@ -25,7 +25,19 @@ jobs:
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.11"
-      - run: pip install ruff==0.16.0
+      # Ruff comes from the project's own dev extra, NOT a version hardcoded here.
+      #
+      # It was `pip install ruff==0.16.0` while pyproject.toml separately pinned
+      # `ruff==0.16.0` — two rosters of one fact, and only one of them maintained.
+      # Dependabot's `uv` ecosystem updates pyproject.toml and uv.lock; it cannot see a
+      # version baked into a `run:` step. So the first ruff bump would have left this job
+      # linting with 0.16.0 while the project declared 0.16.6, and the lint gate would have
+      # been testing a version nothing else used — silently, and in the direction that
+      # produces a false green.
+      #
+      # Installing the package is slower than installing ruff alone. That is the cost of
+      # having one source of truth, and it is worth it.
+      - run: pip install -e ".[dev]"
       - run: ruff check src/ tests/ scripts/
       - run: ruff format --check src/ tests/ scripts/
 
@@ -45,12 +57,82 @@ jobs:
       - name: Run tests with coverage
         run: pytest tests/ -v --cov=vikunja_mcp --cov-report=term-missing
 
+  # DEPENDENCY AUDIT — three gates, not one.
+  #
+  # They fail for different reasons and want different responses. A RUNTIME advisory affects
+  # every deployment that pulls the image; a DEV advisory affects only this repository's CI;
+  # a CONTAINER advisory is what is actually shipping right now, which is not necessarily what
+  # the lockfile says. Collapsing them into a single red makes the urgent case
+  # indistinguishable from the routine one.
+  #
+  # EVERY GATE READS A PINNED SET. None of them re-resolves. `pip-audit -r` resolves
+  # regardless of `--no-deps` (verified against pip-audit 2.10.1), so the intuitive
+  # "freeze the deps, audit the freeze" rebuilds the exact defect this job exists to prevent.
+  # vikunja#633 is the incident: an audit that re-resolved read green while the deployed
+  # container ran four HIGH advisories. An audit that re-resolves reports on a tree that ships
+  # nowhere.
+  #
+  # Two gotchas established on webhook-doorman and scoped-mcp, both of which apply here:
+  #   - `--locked` does NOT read uv.lock. It wants a PEP 751 pylock.toml, which is what
+  #     `uv export --format pylock.toml` produces.
+  #   - `--strict` trips on the project's own entry, which uv emits as a `directory = {...}`
+  #     with no version. `--no-emit-project` leaves it out.
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.13"
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+
+      # A committed lockfile with nothing checking its currency is not a pinned dependency
+      # set, it is a stale file that looks like one. F5 tests only that uv.lock EXISTS; this
+      # step is what makes that presence mean something. scoped-mcp measured the failure this
+      # catches: a lock last touched two and a half months before pyproject.toml, missing a
+      # declared dependency entirely — every check downstream would have audited an incomplete
+      # set, and passed.
+      - name: Lockfile is in sync with pyproject.toml
+        run: uv lock --check
+
+      # --all-extras --no-extra dev is exactly what the image installs: the Dockerfile runs
+      # `pip install '.[telemetry]'`, so telemetry ships and must be audited as runtime.
+      - name: Export runtime dependency set
+        run: |
+          uv export --frozen --no-emit-project \
+            --all-extras --no-extra dev \
+            --format pylock.toml -o pylock.runtime.toml
+
+      - name: Export dev dependency set
+        run: |
+          uv export --frozen --no-emit-project \
+            --extra dev \
+            --format pylock.toml -o pylock.dev.toml
+
+      # pip-audit's --locked wants a file named exactly pylock.toml in the directory it is
+      # given, so each gate gets its own directory containing only that file. Auditing from the
+      # repo root would let pip-audit see pyproject.toml and fall back to RESOLVING — the exact
+      # behaviour this job exists to stop.
+      - name: Audit runtime dependencies
+        run: |
+          mkdir -p .audit-runtime && cp pylock.runtime.toml .audit-runtime/pylock.toml
+          uv tool run pip-audit --strict --locked .audit-runtime
+
+      - name: Audit dev dependencies
+        run: |
+          mkdir -p .audit-dev && cp pylock.dev.toml .audit-dev/pylock.toml
+          uv tool run pip-audit --strict --locked .audit-dev
+
   docker-build:
     name: Docker build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      # Needed by the image dependency audit inside smoke-image.sh (`uv tool run pip-audit`).
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
       - name: Build image
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
@@ -60,44 +142,42 @@ jobs:
           tags: vikunja-mcp:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
-      # Building proves the image assembles; it does not prove it runs. These two are the
-      # cheapest checks that would have caught a broken entry point or a missing runtime
-      # dependency, neither of which a successful build surfaces.
-      - name: Smoke test — refuses to start with no VIKUNJA_URL
-        run: |
-          set +e
-          out=$(docker run --rm vikunja-mcp:ci 2>&1)
-          status=$?
-          echo "$out"
-          if [ $status -eq 0 ]; then
-            echo "::error::server started without VIKUNJA_URL — the fail-closed default is gone"
-            exit 1
-          fi
-          echo "$out" | grep -q "VIKUNJA_URL is not set" || {
-            echo "::error::exited non-zero but not for the expected reason"; exit 1; }
-      - name: Smoke test — /health serves unauthenticated, container reports healthy
-        run: |
-          docker run -d --name vikunja-mcp-ci -e VIKUNJA_URL=https://vikunja.invalid \
-            -p 127.0.0.1:8501:8501 vikunja-mcp:ci
-          for i in $(seq 1 30); do
-            [ "$(docker inspect --format '{{.State.Health.Status}}' vikunja-mcp-ci)" = "healthy" ] && break
-            sleep 2
-          done
-          docker inspect --format '{{.State.Health.Status}}' vikunja-mcp-ci | grep -qx healthy || {
-            echo "::error::container never became healthy"; docker logs vikunja-mcp-ci; exit 1; }
-          # No Authorization header, and the body must stay free of config.
-          body=$(curl -fsS http://127.0.0.1:8501/health)
-          echo "$body"
-          echo "$body" | grep -q '"status":"ok"'
-          # `if grep` rather than `grep && exit 1`: the latter returns non-zero from the
-          # compound when grep finds nothing, failing the step on the success path.
-          if echo "$body" | grep -qi "vikunja.invalid\|token"; then
-            echo "::error::/health echoed config — it is unauthenticated by design"
-            exit 1
-          fi
-          docker rm -f vikunja-mcp-ci
-      - name: Verify the image runs as non-root
-        run: |
-          uid=$(docker run --rm --entrypoint id vikunja-mcp:ci -u)
-          [ "$uid" != "0" ] || { echo "::error::image runs as root"; exit 1; }
-          echo "runs as uid $uid"
+
+      # ONE DEFINITION, TWO CALL SITES. release.yml runs this same script against the same
+      # image before it pushes. The PR path and the publish path must not be able to drift
+      # apart, because the one that matters is the one nobody watches — and release.yml used
+      # to push with no smoke test at all.
+      #
+      # What it asserts, and why each is not a broader proxy:
+      #   1 fail-closed startup without VIKUNJA_URL
+      #   2 uid != 0
+      #   3 shipped filesystem carries no source, tests, config or secrets — read off the
+      #     exported layer, NOT inferred from .dockerignore, which is the thing that regresses
+      #   4 pip-audit over EVERY site-packages tree in the image, with a population assertion,
+      #     because --path on an empty dir exits 0 saying "No known vulnerabilities found"
+      #   5 /health unauthenticated and echoing no config
+      #   6 the tool-call contract: fails closed with no bearer, engages passthrough with one
+      #
+      # Verified two-sided before it landed, by sabotaging the source and rebuilding:
+      #   auth fails open                  -> red at [6] first assertion
+      #   passthrough never engages        -> red at [6] SECOND assertion, while the first
+      #                                       still passed — which is why the control exists
+      #   .dockerignore regression + COPY  -> red at [3]
+      #   unmodified image                 -> green, all six
+      - name: Smoke test the image
+        run: scripts/smoke-image.sh vikunja-mcp:ci
+
+      # Flagship requires examples be runnable and EXERCISED BY CI. The reason is specific
+      # rather than aspirational: compose examples rot precisely because nothing runs them,
+      # so they stay syntactically present and functionally wrong.
+      #
+      # This gate has already paid for itself twice on its first runs — it found that
+      # examples/compose/full could not boot at all (an empty VIKUNJA_DEFAULT_PROJECT_ID
+      # crashed pydantic), and that its own first implementation was probing an unrelated
+      # container that happened to hold port 8501.
+      #
+      # It also checks that every tool name the example skills reference still EXISTS,
+      # read from a live tools/list against this image. A skill pointing at a renamed tool
+      # is broken in a way no markdown linting detects.
+      - name: Check the examples
+        run: scripts/check-examples.sh vikunja-mcp:ci
