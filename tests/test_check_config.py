@@ -168,3 +168,47 @@ def test_check_does_not_contact_vikunja(monkeypatch, capsys):
 
     assert server.check_config() == 0
     assert called == []
+
+
+# ---------------------------------------------------------------------------------------
+# 4. Optional integer settings tolerate an empty assignment
+# ---------------------------------------------------------------------------------------
+
+
+def test_blank_default_project_id_is_treated_as_unset(monkeypatch, capsys):
+    """`VIKUNJA_DEFAULT_PROJECT_ID=""` must mean unset, not crash.
+
+    An empty assignment is the normal way an optional variable appears in a compose file:
+    `VIKUNJA_DEFAULT_PROJECT_ID: ${VIKUNJA_DEFAULT_PROJECT_ID:-}` renders as an empty
+    string, not an absent variable. Before the validator this raised a pydantic
+    int_parsing error and the server never started — found by CI standing up this repo's
+    own examples/compose/full.
+    """
+    monkeypatch.setenv("VIKUNJA_URL", "https://vikunja.example.com")
+    monkeypatch.setenv("VIKUNJA_DEFAULT_PROJECT_ID", "")
+
+    assert server.check_config() == 0
+    out = capsys.readouterr().out
+    assert "config: ok" in out
+    assert "default_project_id unset" in out
+
+
+def test_whitespace_default_project_id_is_treated_as_unset(monkeypatch):
+    monkeypatch.setenv("VIKUNJA_URL", "https://vikunja.example.com")
+    monkeypatch.setenv("VIKUNJA_DEFAULT_PROJECT_ID", "   ")
+    assert config.get_settings().default_project_id is None
+
+
+def test_a_real_default_project_id_still_parses(monkeypatch):
+    """Control: the validator must not swallow a genuine value."""
+    monkeypatch.setenv("VIKUNJA_URL", "https://vikunja.example.com")
+    monkeypatch.setenv("VIKUNJA_DEFAULT_PROJECT_ID", "7")
+    assert config.get_settings().default_project_id == 7
+
+
+def test_a_non_numeric_default_project_id_is_still_rejected(monkeypatch, capsys):
+    """Control: blank is unset, but garbage must still fail rather than silently unset."""
+    monkeypatch.setenv("VIKUNJA_URL", "https://vikunja.example.com")
+    monkeypatch.setenv("VIKUNJA_DEFAULT_PROJECT_ID", "not-a-number")
+    assert server.check_config() == 1
+    assert "config: INVALID" in capsys.readouterr().err

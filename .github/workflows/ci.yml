@@ -154,3 +154,18 @@ jobs:
       #   unmodified image                 -> green, all six
       - name: Smoke test the image
         run: scripts/smoke-image.sh vikunja-mcp:ci
+
+      # Flagship requires examples be runnable and EXERCISED BY CI. The reason is specific
+      # rather than aspirational: compose examples rot precisely because nothing runs them,
+      # so they stay syntactically present and functionally wrong.
+      #
+      # This gate has already paid for itself twice on its first runs — it found that
+      # examples/compose/full could not boot at all (an empty VIKUNJA_DEFAULT_PROJECT_ID
+      # crashed pydantic), and that its own first implementation was probing an unrelated
+      # container that happened to hold port 8501.
+      #
+      # It also checks that every tool name the example skills reference still EXISTS,
+      # read from a live tools/list against this image. A skill pointing at a renamed tool
+      # is broken in a way no markdown linting detects.
+      - name: Check the examples
+        run: scripts/check-examples.sh vikunja-mcp:ci

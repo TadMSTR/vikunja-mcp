@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/TadMSTR/vikunja-mcp/security/advisories/new
+    about: Please report privately, not as a public issue. See SECURITY.md.
+  - name: Setup help — connecting a client
+    url: https://github.com/TadMSTR/vikunja-mcp/blob/main/docs/clients.md
+    about: Copy-paste config for Claude Code, Claude Desktop and .mcp.json, plus a troubleshooting table.
