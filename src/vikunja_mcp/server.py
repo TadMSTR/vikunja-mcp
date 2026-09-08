@@ -344,10 +344,11 @@ def _validate_webhook_target(url: str) -> None:
         raise VikunjaAPIError(
             0,
             f"webhook target_url host {host!r} is loopback/private/link-local/internal "
-            "(or resolves there) and is refused (SSRF guard). Note: on forge, split-horizon "
-            "DNS resolves *.helmforge.me — including SWAG-fronted vhosts — to the LAN, so "
-            "those are blocked too. A valid target must be genuinely external to forge; "
-            "see SECURITY.md.",
+            "(or resolves there) and is refused (SSRF guard). This is decided by what the "
+            "name RESOLVES to, not how it looks: under split-horizon DNS a public-looking "
+            "hostname can resolve to a private address, and a reverse-proxied internal "
+            "service is the usual case. A valid target must resolve to a genuinely "
+            "external address; see SECURITY.md.",
         )
 
 
@@ -1654,7 +1655,7 @@ def _register_audit_log_if_enabled() -> None:
     ``contrib/`` is deliberately not imported by default — see AGENTS.md's module-boundary
     table. This is the one exception: an explicit opt-in via ``VIKUNJA_AUDIT_LOG=1``, chosen
     over a deployment-side entry point so the wiring is visible to this repo's own tests and
-    code review rather than living in ``/opt/appdata``.
+    code review rather than living in an operator's private deployment tree.
     """
     if os.environ.get("VIKUNJA_AUDIT_LOG", "").strip().lower() not in ("1", "true", "yes"):
         return
@@ -2513,12 +2514,13 @@ async def webhook_create(
 ) -> dict:
     """Register a webhook target on a project.
 
-    SECURITY / SSRF: `target_url` must be genuinely external to forge. This server's SSRF
-    guard resolves the hostname and refuses any address that is loopback, private,
-    link-local, reserved, multicast, or unspecified — and on forge that includes
-    `*.helmforge.me` (split-horizon DNS resolves it to the LAN), so a SWAG-fronted hostname
-    is refused just like a raw internal IP. See SECURITY.md. `secret` is the HMAC key
-    Vikunja signs deliveries with (X-Vikunja-Signature) — set it so the listener can verify
+    SECURITY / SSRF: `target_url` must resolve to a genuinely external address. This
+    server's SSRF guard resolves the hostname and refuses any address that is loopback,
+    private, link-local, reserved, multicast, or unspecified. Note the guard judges the
+    RESOLVED address, not the name: under split-horizon DNS a public-looking hostname can
+    resolve to a private address, so a reverse-proxied internal service is refused just
+    like a raw internal IP. See SECURITY.md. `secret` is the HMAC key Vikunja signs
+    deliveries with (X-Vikunja-Signature) — set it so the listener can verify
     authenticity.
     """
     _validate_webhook_target(target_url)

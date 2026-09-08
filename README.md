@@ -1,4 +1,5 @@
 [![Built with Claude Code](https://img.shields.io/badge/Built_with-Claude_Code-6B57FF?logo=claude&logoColor=white)](https://claude.ai/code)
+[![CI](https://github.com/TadMSTR/vikunja-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/TadMSTR/vikunja-mcp/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 # vikunja-mcp
@@ -10,6 +11,39 @@ saved filters, and webhooks — designed for multi-agent use behind
 
 Targets Vikunja's **`/api/v2`**, so it requires **Vikunja 2.4.0 or newer**. v1 is frozen
 upstream at 2.4.0 (new routes land on v2 only) and removed at 4.0.
+
+## Quickstart
+
+You need a Vikunja API token — **Settings → General → API Tokens** in the Vikunja web UI.
+
+```bash
+claude mcp add vikunja \
+  --env VIKUNJA_URL=https://vikunja.example.com \
+  --env VIKUNJA_TRANSPORT=stdio \
+  --env VIKUNJA_TOKEN=your-vikunja-api-token \
+  -- docker run -i --rm \
+       -e VIKUNJA_URL -e VIKUNJA_TRANSPORT -e VIKUNJA_TOKEN \
+       ghcr.io/tadmstr/vikunja-mcp:latest
+```
+
+That is the whole single-user setup. `claude mcp list` should now show `vikunja`, with 73
+tools available.
+
+Something wrong? Ask the server what it thinks its configuration is — it answers without
+starting up or contacting Vikunja:
+
+```bash
+docker run --rm --entrypoint vikunja-mcp ghcr.io/tadmstr/vikunja-mcp:latest --check
+```
+
+**Claude Desktop, a raw `.mcp.json`, or the shared multi-agent setup over HTTP:** see
+[`docs/clients.md`](docs/clients.md). Note `VIKUNJA_TOKEN` is required for `stdio` and
+*refused* for `http` — [the reason is below](#why-its-shaped-this-way--token-passthrough),
+and it is the thing most people trip over first.
+
+> There is no PyPI package. The name `vikunja-mcp` is squatted on public PyPI by an
+> unrelated project — **do not `pip install vikunja-mcp`.** Use the image, or install from
+> a git checkout.
 
 ## Why it's shaped this way — token passthrough
 
@@ -235,7 +269,7 @@ pagination sweep. The `calls` field reports what it cost, so the price is visibl
 whoever pays it.
 
 **As of v0.10.0, `max_label_buckets` defaults to every label in scope**, not a fixed 25.
-Re-measured against forge's 514-task, 67-label tracker: **78 requests** at the new default,
+Re-measured against a real 514-task, 67-label tracker: **78 requests** at the new default,
 against 37 at the old fixed cap. A fixed default was already wrong at 67 labels — any fixed
 default is a rot clock as a tracker's label vocabulary grows — so truncation is now something
 you opt into with `max_label_buckets`, not something you have to know the current label count
@@ -331,7 +365,7 @@ It **reports, never refuses** — a false positive that blocked a filing would l
 finding entirely — and it can never cost a filing: any failure of the search degrades to no
 warning, and the task is created regardless.
 
-Default-on was decided by measurement, not preference. Run over all 470 titles in forge's
+Default-on was decided by measurement, not preference. Run over all 470 titles in a real
 tracker, 19 produced a warning (4.0%) and none errored; by inspection about twelve of those
 nineteen were genuine, including three exact-title pairs and one triplicate. So 96% of
 creates see nothing. Precision depends on how your tracker writes titles — if yours looks
@@ -385,8 +419,8 @@ Then, as a caller, present a Vikunja API token as a bearer:
 curl -H "Authorization: Bearer <vikunja-token>" http://127.0.0.1:8501/mcp/...
 ```
 
-In production this header is set by scoped-mcp, not by hand — see
-[`docs/forge.md`](docs/forge.md) for the manifest wiring.
+In production this header is set by a proxy holding that caller's token, not by hand —
+see [`docs/deployment.md`](docs/deployment.md) for the wiring.
 
 ## Telemetry
 
@@ -394,20 +428,26 @@ Logging (structlog JSON) is **on by default**. Metrics and tracing are **off by 
 and enable per-backend when the relevant env var is set — install the extra with
 `pip install 'vikunja-mcp[telemetry]'`. Every tool call records call count, error count, and
 upstream latency, plus an OTLP span (`tool.<name>`). Sinks are best-effort and
-fire-and-forget: a telemetry backend being down never breaks a tool call. Forge ships
-`influxdb:3-core`, so the InfluxDB sink uses the **v3** write API. See
+fire-and-forget: a telemetry backend being down never breaks a tool call. The InfluxDB
+sink targets InfluxDB 3 and uses the **v3** write API. See
 [`docs/telemetry.md`](docs/telemetry.md) for the full backend matrix.
 
 ### Enabling it — two steps, and the env var is not the one that matters
 
-On forge this runs with OTLP on, exporting to the SigNoz collector. Enabling it takes
-**both** of the following; doing only the second is the common failure:
+Enabling OTLP takes **both** of the following. Doing only the second is the common failure:
 
 ```bash
-/opt/venvs/vikunja-mcp/bin/pip install 'vikunja-mcp[telemetry]'   # 1. the extra
-# 2. append to /opt/appdata/vikunja-mcp/env:
-#    OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
-pm2 restart vikunja-mcp
+pip install 'vikunja-mcp[telemetry]'                 # 1. the extra
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317   # 2. the endpoint
+```
+
+The container image already ships the `[telemetry]` extra, so there step 2 is all you need:
+
+```bash
+docker run -d --name vikunja-mcp \
+  -e VIKUNJA_URL=https://vikunja.example.com \
+  -e OTEL_EXPORTER_OTLP_ENDPOINT=http://collector:4317 \
+  -p 127.0.0.1:8501:8501 ghcr.io/tadmstr/vikunja-mcp:latest
 ```
 
 Port 4317 is gRPC — `telemetry.py` uses `opentelemetry-exporter-otlp-proto-grpc`, so it is
@@ -416,18 +456,17 @@ Port 4317 is gRPC — `telemetry.py` uses `opentelemetry-exporter-otlp-proto-grp
 **The acceptance check is the startup log line, never the presence of the env var:**
 
 ```bash
-pm2 logs vikunja-mcp --lines 50 --nostream | grep -E 'otlp_enabled|otlp_import_failed'
+docker logs vikunja-mcp 2>&1 | grep -E 'otlp_enabled|otlp_import_failed'
 ```
 
 `otlp_enabled` means it is working. `otlp_import_failed` means the endpoint is configured
 but the extra was never installed — the process starts fine, logs one warning, then
-silently emits nothing. Anyone reading `/opt/appdata/*/env` to see which services have
-telemetry on gets the wrong answer in that state.
+silently emits nothing.
 
-This is not hypothetical: `nextcloud-mcp` on forge has had the env var set and the extra
-missing since at least 2026-07-26, emitting nothing the whole time (tracked as vikunja id
-350 / `#336`). Confirm `otlp_enabled`, then confirm the service actually shows up in
-SigNoz.
+That failure mode is why the log line is the check and the env var is not: reading a
+deployment's environment to see which services have telemetry on gives the wrong answer
+in exactly this state, and it is a state that can persist for months without a symptom.
+Confirm `otlp_enabled`, then confirm the service actually appears in your collector.
 
 ## Development
 
@@ -472,7 +511,8 @@ For a single-user setup launched by your MCP client, see
 [Single-user stdio](#single-user-stdio) above. You need `VIKUNJA_TRANSPORT=stdio` and
 `VIKUNJA_TOKEN`.
 
-### forge
+### Multi-agent, behind a proxy
 
-Runs as a PM2 service on forge, fronted by scoped-mcp. See [`docs/forge.md`](docs/forge.md)
-for the PM2 config, the scoped-mcp manifest, and the per-agent token wiring.
+One server, several agents, each reaching Vikunja as itself. See
+[`docs/deployment.md`](docs/deployment.md) for the token wiring, the per-agent grant model,
+and the operational checks worth having.
