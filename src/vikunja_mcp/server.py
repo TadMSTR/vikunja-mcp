@@ -33,6 +33,7 @@ Permission integers used by the sharing tools follow Vikunja's ``Right``:
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import base64
 import binascii
@@ -53,6 +54,7 @@ import markdown as _markdown_lib
 import nh3
 import structlog
 from fastmcp import FastMCP
+from pydantic import ValidationError
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
@@ -2552,7 +2554,74 @@ async def health(_request: Request) -> JSONResponse:
     return JSONResponse({"status": "ok", "version": __version__})
 
 
-def main() -> None:
+def check_config() -> int:
+    """Validate configuration and report it. Return 0 if usable, 1 if not.
+
+    Backs ``vikunja-mcp --check``. This exists because the config surface here fails closed
+    in three distinct ways that are all easy to get wrong on first setup — no
+    ``VIKUNJA_URL``, ``stdio`` without ``VIKUNJA_TOKEN``, and ``VIKUNJA_TOKEN`` on a network
+    transport — and before this flag the only way to discover which one you had hit was to
+    start the server and read a traceback.
+
+    Two properties are load-bearing:
+
+    - **It never reaches Vikunja.** ``get_settings()`` is pure environment parsing, so a
+      ``--check`` that passes says the configuration is coherent, NOT that the instance is
+      reachable or the token is valid. Conflating those would make a green ``--check`` mean
+      less than it appears to, which is worse than not having one.
+    - **It never prints the token.** The value is reported as set/unset only. An operator
+      running this in a terminal, a CI log, or a paste to someone else must not thereby
+      disclose a credential — and ``/health`` is under the same rule for the same reason.
+    """
+    try:
+        cfg = get_settings()
+    except (ConfigError, ValidationError) as exc:
+        print(f"config: INVALID\n\n{exc}", file=sys.stderr)
+        return 1
+
+    # Deliberately not cfg.token — see the docstring. `url` is printed because an operator
+    # pointing at the wrong instance is the failure this is most likely to catch, and it is
+    # their own value being echoed back to their own terminal.
+    print("config: ok")
+    print(f"  version            {__version__}")
+    print(f"  url                {cfg.url}")
+    print(f"  transport          {cfg.transport}")
+    if cfg.transport != "stdio":
+        print(f"  bind               {cfg.host}:{cfg.port}")
+    print(
+        f"  token              {'set (stdio fallback)' if cfg.token else 'not set (passthrough)'}"
+    )
+    print(f"  default_project_id {cfg.default_project_id if cfg.default_project_id else 'unset'}")
+    print(f"  stale_after_days   {cfg.stale_after_days}")
+    print(f"  summary_exclude    {cfg.excluded_task_ids or 'none'}")
+    print("\nnote: configuration only — Vikunja was not contacted, so this does not")
+    print("      confirm the instance is reachable or the credential is valid.")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> None:
+    """Console-script entry point. ``argv`` defaults to ``sys.argv[1:]``.
+
+    The parameter exists so callers — tests included — can drive this without the ambient
+    process argv leaking in. Adding the parser without it broke two existing tests that call
+    ``main()`` directly: argparse read pytest's own ``tests/ -q`` and exited 2. Defaulting to
+    ``None`` keeps the installed console script behaving exactly as it did before.
+    """
+    parser = argparse.ArgumentParser(
+        prog="vikunja-mcp",
+        description="FastMCP server exposing the Vikunja REST API as scoped, per-agent MCP tools.",
+    )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="validate configuration and exit; does not start the server or contact Vikunja",
+    )
+    parser.add_argument("--version", action="version", version=f"vikunja-mcp {__version__}")
+    args = parser.parse_args(argv)
+
+    if args.check:
+        sys.exit(check_config())
+
     cfg = get_settings()
     log.info(
         "vikunja_mcp_start",

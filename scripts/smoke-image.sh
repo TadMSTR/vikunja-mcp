@@ -38,7 +38,7 @@ ok()   { echo "  ok — $*"; }
 # VIKUNJA_URL is unset and that loud failure is the point — a baked default would let a
 # misconfigured deployment silently point at someone else's Vikunja instance.
 # ---------------------------------------------------------------------------------------------
-echo "[1/6] refuses to start with no VIKUNJA_URL"
+echo "[1/7] refuses to start with no VIKUNJA_URL"
 set +e
 out=$(docker run --rm "$IMAGE" 2>&1); status=$?
 set -e
@@ -50,7 +50,7 @@ ok "exits $status with the expected message"
 # ---------------------------------------------------------------------------------------------
 # 2. Non-root
 # ---------------------------------------------------------------------------------------------
-echo "[2/6] runs as non-root"
+echo "[2/7] runs as non-root"
 uid=$(docker run --rm --entrypoint id "$IMAGE" -u)
 [ "$uid" != "0" ] || fail "image runs as root"
 ok "uid $uid"
@@ -63,7 +63,7 @@ ok "uid $uid"
 # coreutils and is excluded explicitly — a pattern loose enough to match it would go red for a
 # reason unrelated to what this check is for.
 # ---------------------------------------------------------------------------------------------
-echo "[3/6] shipped layer carries no source, tests, config or secrets"
+echo "[3/7] shipped layer carries no source, tests, config or secrets"
 cid=$(docker create "$IMAGE")
 docker export "$cid" > "$WORKDIR/img.tar"
 docker rm -f "$cid" >/dev/null
@@ -97,7 +97,7 @@ ok "$entries entries, no source tree, no build context, no test files"
 # unpublished (the name is namesquatted on PyPI — see release.yml), so --strict aborts with
 # "Dependency not found on PyPI" and would take every other distribution down with it.
 # ---------------------------------------------------------------------------------------------
-echo "[4/6] audits every site-packages tree in the image"
+echo "[4/7] audits every site-packages tree in the image"
 trees=$(docker run --rm --entrypoint find "$IMAGE" / -name site-packages -type d 2>/dev/null || true)
 [ -n "$trees" ] || fail "found no site-packages tree in the image"
 
@@ -134,7 +134,7 @@ ok "$total distributions audited across $i tree(s)"
 # ---------------------------------------------------------------------------------------------
 # 5. /health is unauthenticated and echoes no config
 # ---------------------------------------------------------------------------------------------
-echo "[5/6] /health serves unauthenticated and leaks no config"
+echo "[5/7] /health serves unauthenticated and leaks no config"
 docker run -d --name "$CONTAINER" -e VIKUNJA_URL=https://vikunja.invalid \
   -p "127.0.0.1:$PORT:8501" "$IMAGE" >/dev/null
 for _ in $(seq 1 30); do
@@ -177,7 +177,7 @@ ok "$body"
 # produced" requirement: another service holding the port can return 200, but it cannot produce
 # this specific pair.
 # ---------------------------------------------------------------------------------------------
-echo "[6/6] tool-call contract: fails closed without a token, engages passthrough with one"
+echo "[6/7] tool-call contract: fails closed without a token, engages passthrough with one"
 U="http://127.0.0.1:$PORT/mcp"
 HDRS=(-H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream')
 
@@ -208,6 +208,32 @@ fi
 echo "$withauth" | grep -q "request to Vikunja failed" \
   || fail "expected an upstream failure against vikunja.invalid, got: $withauth"
 ok "token present -> passthrough engaged, reaches upstream and fails there"
+
+# ---------------------------------------------------------------------------------------------
+# 7. Config-validation entry point, exercised against THE IMAGE
+#
+# The two-target clause is the part usually missed: `--check` is already covered against the
+# built package by tests/test_check_config.py, and that says nothing about whether the console
+# script is wired up correctly inside the artefact people actually pull. A packaging change,
+# a missing [project.scripts] entry or a broken PATH would leave the package tests green.
+#
+# Both directions, because a `--check` that always exits 0 is indistinguishable from one that
+# works, and a green exit is the whole signal.
+# ---------------------------------------------------------------------------------------------
+echo "[7/7] --check works inside the image, both ways"
+set +e
+# --entrypoint is required for BOTH cases: the image sets `CMD ["vikunja-mcp"]` with no
+# ENTRYPOINT, so a bare `docker run IMAGE --check` REPLACES the command with `--check` and
+# fails with "executable file not found" — a red that says nothing about the flag.
+good=$(docker run --rm -e VIKUNJA_URL=https://vikunja.invalid \
+  --entrypoint vikunja-mcp "$IMAGE" --check 2>&1); good_rc=$?
+bad=$(docker run --rm --entrypoint vikunja-mcp "$IMAGE" --check 2>&1); bad_rc=$?
+set -e
+[ $good_rc -eq 0 ] || fail "--check rejected a valid config inside the image (exit $good_rc): $good"
+echo "$good" | grep -q "config: ok" || fail "--check did not report ok: $good"
+[ $bad_rc -ne 0 ] || fail "--check accepted a config with no VIKUNJA_URL — it is not actually validating"
+echo "$bad" | grep -q "VIKUNJA_URL is not set" || fail "--check failed for the wrong reason: $bad"
+ok "valid -> exit 0, missing VIKUNJA_URL -> exit $bad_rc"
 
 echo
 echo "smoke test passed for $IMAGE"
