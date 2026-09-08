@@ -23,7 +23,7 @@ jobs:
       contents: write # gh release create
 
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
 
@@ -48,7 +48,7 @@ jobs:
       contents: read   # checkout
       packages: write  # push to ghcr.io
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # arm64 is emulated on the amd64 runner. Wheel-only install, so this is a copy, not
       # a compile — if it ever does become slow or flaky, drop linux/arm64 from platforms
