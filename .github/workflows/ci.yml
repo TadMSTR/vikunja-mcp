@@ -6,6 +6,15 @@ on:
   pull_request:
     branches: [main]
 
+# Least privilege at the top level. None of these three jobs writes anything: lint and test
+# read the tree, and docker-build loads the image locally (`push: false`) rather than pushing
+# it. release.yml is where `packages: write` lives, scoped to the one job that needs it.
+#
+# Absent, GITHUB_TOKEN defaults to the repository's permissive setting, which is what OSSF
+# Scorecard's Token-Permissions check scored searxng-mcp 0/10 for.
+permissions:
+  contents: read
+
 jobs:
   lint:
     name: Lint

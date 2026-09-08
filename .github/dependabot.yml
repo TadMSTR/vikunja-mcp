@@ -1,0 +1,64 @@
+# Dependabot configuration.
+#
+# This file is not optional scaffolding. A committed lockfile with nothing maintaining it is a
+# *freeze*, not an improvement — pinned-and-forgotten is a different failure, not the absence
+# of one. vikunja#670 says so explicitly. uv.lock arrives in the same change as this file, and
+# this file is what makes its presence mean something. Do not land one without the other.
+#
+# THREE ecosystems, and each is here for a reason that has already cost this fleet time.
+#
+# `uv`, NOT `pip`. They are separate ecosystems in Dependabot and the distinction is
+# load-bearing: `pip` would update pyproject.toml and leave uv.lock untouched, which is
+# precisely the frozen-lock failure above wearing the appearance of coverage. Verified on
+# webhook-doorman during the flagship programme — within minutes of merge, Dependabot opened a
+# `dependabot/uv/...` PR that the `pip` ecosystem would never have produced.
+#
+# `docker` — this repo HAS a Dockerfile, and its base image is digest-pinned
+# (`python:3.13-slim@sha256:...`). A digest pin never floats, which is the point, and is
+# therefore exactly the thing that goes stale in silence without something proposing bumps.
+# scoped-mcp omits this ecosystem only because it publishes a wheel and has no Dockerfile; that
+# omission is specific to that repo and must not be copied here.
+#
+# `github-actions` — every action in .github/workflows/ is SHA-pinned with a trailing version
+# comment. Dependabot understands SHA pins and bumps the SHA while updating that comment, so
+# pinning costs no update coverage.
+#
+# Majors are ignored for every ecosystem. A semver-major bump is a reading task, not a merge
+# task, and the bounded ranges in pyproject.toml already stop one arriving silently — that is
+# what vikunja#627 was: `fastmcp>=2.0` resolving to 4.0.1, two majors past anything tested,
+# unobserved for ten days. To take a major, do it by hand and read the upstream changelog.
+version: 2
+
+updates:
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    # Dev dependencies batch into one PR. They update often and none of them ship in the
+    # runtime image, so one PR per bump would drown the runtime updates that actually need
+    # reading. Note `ruff` is deliberately pinned exactly (==) in pyproject.toml: a formatter
+    # must be exact because two patch versions can disagree about whitespace and fail
+    # `ruff format --check`. Dependabot will still propose the bump; taking it is a decision.
+    groups:
+      dev-dependencies:
+        dependency-type: "development"
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
