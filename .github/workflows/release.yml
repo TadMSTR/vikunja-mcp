@@ -58,7 +58,7 @@ jobs:
       - uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a # v4.3.0
       - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
       # Needed by the image dependency audit inside smoke-image.sh.
-      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
 
       # BUILD -> SMOKE TEST -> PUSH, IN THAT ORDER, AND THE ORDER IS THE POINT.
       #
