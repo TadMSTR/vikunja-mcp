@@ -6,6 +6,18 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+### Changed
+- **Dependabot `github-actions`: explicit `open-pull-requests-limit: 11` and a narrow
+  `github/codeql-action*` group on both update channels.** The ecosystem sat at the default
+  cap of 5, where Dependabot stops raising further bumps without saying so. codeql-action's
+  `init` / `analyze` / `upload-sarif` were being bumped as separate PRs, splitting a set that
+  must move together (CodeQL aborts `neutral`, not `failure`). The group is repeated with
+  `applies-to: security-updates` because a group without `applies-to` covers version updates
+  only. Supersedes Dependabot PRs #26, #28 and #29.
+- **codeql-action v4.37.9 → v4.38.2**, all three subpaths on one SHA in one commit.
+- **`.coderabbit.yaml`: `inheritance: true`**, so the organization's review settings
+  (automatic review off) reach this repo instead of being replaced by this file.
+
 ## [0.11.0] — 2026-09-08
 
 Promotion from `baseline` to `flagship` under the repo standard. The conformance checker,
