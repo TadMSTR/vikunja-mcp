@@ -37,7 +37,7 @@ classifiers = [
 # Note there is no renovate.json or dependabot.yml in this repo, so nothing will propose
 # bumps automatically. Raising these is a deliberate act, which is the intent.
 dependencies = [
-    "fastmcp>=4.0.1,<5",
+    "fastmcp>=4.0.9,<5",
     "httpx>=0.28,<0.29",
     "pydantic>=2.13,<3",
     "pydantic-settings>=2.15,<3",
