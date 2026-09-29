@@ -53,7 +53,7 @@ dependencies = [
 
 [project.optional-dependencies]
 telemetry = [
-    "opentelemetry-sdk>=1.44,<2",
+    "opentelemetry-sdk>=1.45.0,<2",
     "opentelemetry-exporter-otlp-proto-grpc>=1.44,<2",
     # forge runs influxdb:3-core — the v3 write API (imports as influxdb_client_3).
     # Pre-1.0 and moving fast: capped at the next minor, so an upgrade is a visible bump
