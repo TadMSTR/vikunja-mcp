@@ -48,7 +48,7 @@ dependencies = [
     # fastmcp transitive — declared so a future fastmcp that vendors or drops it fails
     # at resolve time rather than at import time. The old floor said >=0.37 while the
     # resolved version was 1.6.0: a major boundary had already been crossed silently.
-    "starlette>=1.6,<2",
+    "starlette>=1.7.0,<2",
 ]
 
 [project.optional-dependencies]
