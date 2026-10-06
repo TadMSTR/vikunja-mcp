@@ -6,7 +6,21 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.11.1] — 2026-10-06
+
+Dependency release. No application code changed.
+
 ### Changed
+- **fastmcp 4.0.3 → 4.0.10** (#45). FastMCP patches have changed tool schemas before, so
+  all 73 tools' input and output schemas were dumped under both versions before the merge.
+  They are identical.
+- **starlette 1.6.0 → 1.7.0** (#38), under FastMCP's HTTP transport. Read in full before
+  merge. It needs anyio ≥4 (the lock has 4.15.1). The rest is hardening (Host-header
+  handling, multipart 400s, `BaseHTTPMiddleware` background ordering) and additive features.
+- **nats-py 2.15.0 → 2.16.0** (#33). **OpenTelemetry 1.44.0 → 1.45.0** (semantic-conventions
+  0.65b0 → 0.66b0), one group PR (#47).
+- **CI actions:** attest-build-provenance 3.2.0, setup-buildx-action 4.4.1,
+  build-push-action 7.4.0, setup-qemu-action 4.4.0, setup-uv 10.2.0. ruff 0.16.10 (dev only).
 - **Dependabot `uv`: `opentelemetry` and `dev-tools` groups.** Every per-package OTel PR
   already moved the whole family in `uv.lock`, so they were one change filed several times.
   `dev-dependencies` never caught the tools because `dev` is an optional-dependencies extra,
