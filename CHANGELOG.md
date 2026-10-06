@@ -7,6 +7,11 @@ All notable changes to this project are documented here. Format follows
 ## [Unreleased]
 
 ### Changed
+- **Dependabot `uv`: `opentelemetry` and `dev-tools` groups.** Every per-package OTel PR
+  already moved the whole family in `uv.lock`, so they were one change filed several times.
+  `dev-dependencies` never caught the tools because `dev` is an optional-dependencies extra,
+  not a `[dependency-groups]` table, so ruff arrived on its own. Both groups sit above
+  `dev-dependencies`, since a dependency joins the first group it matches (vikunja#1031).
 - **Dependabot `github-actions`: explicit `open-pull-requests-limit: 11` and a narrow
   `github/codeql-action*` group on both update channels.** The ecosystem sat at the default
   cap of 5, where Dependabot stops raising further bumps without saying so. codeql-action's
@@ -17,6 +22,11 @@ All notable changes to this project are documented here. Format follows
 - **codeql-action v4.37.9 → v4.38.2**, all three subpaths on one SHA in one commit.
 - **`.coderabbit.yaml`: `inheritance: true`**, so the organization's review settings
   (automatic review off) reach this repo instead of being replaced by this file.
+
+### Security
+- **pyjwt 2.13.0 → 2.15.1 and urllib3 2.7.0 → 2.8.0 in `uv.lock`** (17 advisories). Both are
+  transitive, so no Dependabot PR touched them, and the PR checks were green only because
+  they ran before the advisories were published (vikunja#1031).
 
 ## [0.11.0] — 2026-09-08
 
