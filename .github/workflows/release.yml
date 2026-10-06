@@ -55,7 +55,7 @@ jobs:
       # arm64 is emulated on the amd64 runner. Wheel-only install, so this is a copy, not
       # a compile — if it ever does become slow or flaky, drop linux/arm64 from platforms
       # below rather than carrying the flakiness into the release job.
-      - uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a # v4.3.0
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       # Needed by the image dependency audit inside smoke-image.sh.
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
