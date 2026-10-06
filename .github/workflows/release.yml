@@ -122,7 +122,7 @@ jobs:
       # again. Verify with `gh attestation verify oci://ghcr.io/tadmstr/vikunja-mcp:<tag>
       # --owner TadMSTR`, which reads GitHub's attestation API, not the registry's referrers.
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
+        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
         with:
           subject-name: ghcr.io/tadmstr/vikunja-mcp
           subject-digest: ${{ steps.push.outputs.digest }}
