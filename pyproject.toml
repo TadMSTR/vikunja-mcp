@@ -61,7 +61,7 @@ telemetry = [
     # installed into the runtime image (Dockerfile: pip install '.[telemetry]'), even
     # though telemetry itself is off unless the env vars are set.
     "influxdb3-python>=0.21,<0.22",
-    "nats-py>=2.15,<3",
+    "nats-py>=2.16.0,<3",
 ]
 dev = [
     # `pytest-asyncio>=0.23` was resolving to 1.4.0 — another major crossed unnoticed.
