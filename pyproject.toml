@@ -42,7 +42,7 @@ dependencies = [
     "pydantic>=2.13,<3",
     "pydantic-settings>=2.15,<3",
     "structlog>=26.1,<27",
-    "markdown>=3.10,<4",
+    "markdown>=3.11,<4",
     "nh3>=0.3,<0.4",
     # Direct import (Request/JSONResponse for the /health custom route), not just a
     # fastmcp transitive — declared so a future fastmcp that vendors or drops it fails
