@@ -6,6 +6,59 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.12.0] — 2026-10-21
+
+### Breaking
+- **`project_user_update`, `project_user_remove` and `team_member_toggle_admin` take
+  `username: str`, not `user_id: int`** (#1022 (id 1105)). Vikunja v2's `{user}` path
+  segment on all three routes is a username (`pkg/routes/api/v2/project_users.go`,
+  `team_members.go`), so every call these tools have ever made returned 404 "The user does
+  not exist". The username is percent-encoded into the path. A proxy that froze the old
+  input schema (scoped-mcp's `mcp_proxy` does, at start) must be restarted to see the new
+  one. `team_member_toggle_admin` was not in the ticket; it was found by reading every
+  user-in-path route file while fixing it. `task_assignee_remove` was checked the same way
+  and is correct: its `{user}` is a numeric id (`task_assignees.go`).
+
+### Changed
+- **A `#N (id M)` reference is verified, not trusted.** Until now the resolver took the id
+  with no API call and ignored `#N`, so a swapped pair silently named the wrong ticket —
+  #1195 (id 1278) records `#608 (id 525)` written for the ticket that is `#525 (id 608)`,
+  which 0.11.1 resolved to id 525. Now one `GET /tasks/{M}` (the documented route by id)
+  must return ticket number N, and the default project when `VIKUNJA_DEFAULT_PROJECT_ID`
+  is set. A mismatch raises and names both tickets with titles; a 404, or a body with no
+  `index`, raises too. Cost: one call per paired reference, where there was none. A bare
+  id (`473`, `"473"`) is still a global id with no call. Without
+  `VIKUNJA_DEFAULT_PROJECT_ID` only the ticket number is compared, so a same-numbered
+  ticket in another project passes.
+- **Every ticket-reference pattern is ASCII-only** (`re.ASCII`). `\d` matched Arabic-Indic
+  and fullwidth digits, and IGNORECASE folded the dotless i and the Kelvin sign onto
+  `id`/`vikunja`. The bare-id branch already took ASCII digits only; the ticket forms now
+  match it.
+
+### Added
+- **The `vikunja#` prefix** on ticket references: `vikunja#454` and
+  `vikunja#456 (id 475)`, case-insensitive. That is how plans, handoffs and task
+  descriptions cite tickets, and agents were stripping it by hand. No other prefix is
+  accepted.
+- **Task URLs** as a task reference: `<VIKUNJA_URL>/tasks/<id>`, the exact inverse of the
+  `url` field this server returns. No API call. Scheme, host, port and base path must match
+  `VIKUNJA_URL`; a query string, userinfo or another host is refused.
+
+### Security
+- **`"."`, `".."` and `""` are refused as a username or `relation_kind` path segment**
+  (IV-23, found by the pre-audit baseline). `quote(..., safe="")` leaves dots intact and
+  httpx resolves dot segments, so `project_user_remove(project_id=7, username="..")` would
+  have sent `DELETE /api/v2/projects/7` — and `team_member_remove(team_id=3, username="..")`
+  has sent `DELETE /teams/3` since it was written. One helper, `_path_segment`, now guards
+  all five call sites.
+- **certifi 2026.7.22 → 2026.10.19** (PYSEC-2026-4320), in both the runtime and dev lock
+  sets. Published after 0.11.1; CI's dependency audit failed on it for this branch and
+  would for `main`. Only certifi's lock entry changed.
+
+### Fixed
+- **`serverInfo.version` reports vikunja-mcp's version** (#754 (id 837)). It was reporting
+  FastMCP's (4.0.10), because `FastMCP(...)` was constructed without `version=`.
+
 ## [0.11.1] — 2026-10-06
 
 Dependency release. No application code changed.

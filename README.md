@@ -139,13 +139,14 @@ So, as of v0.5.0:
   instead. Being a string, it cannot be passed where an int id is expected without an
   obvious type error.
 - **Every tool that takes a `task_id` also accepts a ticket reference.** It is resolved
-  server-side with one filtered lookup:
+  server-side:
 
   | You pass | Meaning | Lookup? |
   |---|---|---|
   | `473` or `"473"` | global task id | no |
-  | `"#454"` | ticket number | one call |
-  | `"#456 (id 475)"` | ticket number with the id spelled out | no |
+  | `"https://<your VIKUNJA_URL>/tasks/473"` | task URL on this instance | no |
+  | `"#454"` or `"vikunja#454"` | ticket number | one call |
+  | `"#456 (id 475)"` or `"vikunja#456 (id 475)"` | ticket number with the id spelled out — **checked** | one call |
 
 - **Every projected read returns a `url`**, built from `id`. Constructing `/tasks/454` from
   the ticket number lands on an unrelated task; this removes the opportunity.
@@ -155,10 +156,32 @@ number. Guessing there is the whole bug. If a ticket reference is ambiguous (tic
 are only unique *within* a project) the call raises and names every candidate rather than
 picking one; set `VIKUNJA_DEFAULT_PROJECT_ID` to scope resolution and avoid it.
 
-The third form is honoured only on a string that *opens* with a ticket reference and names
+**A pair is verified, never trusted** (v0.12.0). `"#456 (id 475)"` fetches id 475 and
+checks that it really is ticket #456 — and, when `VIKUNJA_DEFAULT_PROJECT_ID` is set, that
+it is in that project. If the halves disagree, the call raises and names what each half
+actually is, with titles; it never picks one. A swapped pair such as `"#608 (id 525)"`
+written for the ticket that is `#525 (id 608)` does happen, and before v0.12.0 it silently
+edited id 525. A pair whose id does not exist raises too. Without
+`VIKUNJA_DEFAULT_PROJECT_ID` the project comparison is skipped; the ticket-number check
+still runs, **and that is all it checks**. Ticket numbers restart per project, so
+`"#5 (id 900)"` is accepted whenever id 900 is ticket #5 in *any* project — the wrong ticket
+if you meant another project's #5. Set `VIKUNJA_DEFAULT_PROJECT_ID` if a mismatch across
+projects matters to you.
+
+The pair form is honoured only on a string that *opens* with a ticket reference and names
 exactly one `id N`. Prose that merely mentions an id (`"see id 999 somewhere"`) is refused,
 and a string naming several (`"#456 (id 475) blocks #331 (id 342)"`) raises rather than
 taking the first — position is not evidence.
+
+The `vikunja#` prefix is optional and case-insensitive, and it is the **only** prefix
+accepted: `owner/repo#454` or `foo#454` name another tracker and are refused.
+
+A **task URL** is accepted only when its scheme, host and port match `VIKUNJA_URL` and its
+path is exactly `<VIKUNJA_URL path>/tasks/<id>` (a trailing `/` or `#fragment` is fine). It
+is the inverse of the `url` field this server returns, so any URL it hands out round-trips.
+A URL with a query string, credentials or a different host is refused, not cleaned up. If
+`VIKUNJA_URL` is an internal address, the public URL your browser shows will be refused —
+pass the id, or set `VIKUNJA_URL` to the address users see.
 
 > Resolution uses `filter=index = N`, which works but is **not documented** by Vikunja —
 > its published filter-field list does not include `index`. Verified against `/api/v2` on
