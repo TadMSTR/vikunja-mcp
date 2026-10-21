@@ -38,6 +38,11 @@ All notable changes to this project are documented here. Format follows
   `url` field this server returns. No API call. Scheme, host, port and base path must match
   `VIKUNJA_URL`; a query string, userinfo or another host is refused.
 
+### Security
+- **certifi 2026.7.22 → 2026.10.19** (PYSEC-2026-4320), in both the runtime and dev lock
+  sets. Published after 0.11.1; CI's dependency audit failed on it for this branch and
+  would for `main`. Only certifi's lock entry changed.
+
 ### Fixed
 - **`serverInfo.version` reports vikunja-mcp's version** (#754 (id 837)). It was reporting
   FastMCP's (4.0.10), because `FastMCP(...)` was constructed without `version=`.
