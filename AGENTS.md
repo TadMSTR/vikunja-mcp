@@ -105,6 +105,9 @@ logic, no caching, no persistence.
      `GET /tasks/475` (the documented route by id, not the `index` filter), whose `index`
      must be 456 and, with `VIKUNJA_DEFAULT_PROJECT_ID` set, whose `project_id` must match.
      A mismatch, a 404, or a body with no `index` raises; it never returns either half.
+     Unscoped (no `VIKUNJA_DEFAULT_PROJECT_ID`), only `index` is compared, so a
+     same-numbered ticket in another project passes: the check is then "id M is *a* #N",
+     not "id M is *your* #N".
      Until 0.12.0 the id was taken with no call, so the format that *looks* verified was
      the one input never checked — and swapped pairs happen: #1195 (id 1278) records
      `#608 (id 525)` written for the ticket that is `#525 (id 608)`, which 0.11.1 resolved

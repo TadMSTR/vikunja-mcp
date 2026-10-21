@@ -163,7 +163,10 @@ actually is, with titles; it never picks one. A swapped pair such as `"#608 (id 
 written for the ticket that is `#525 (id 608)` does happen, and before v0.12.0 it silently
 edited id 525. A pair whose id does not exist raises too. Without
 `VIKUNJA_DEFAULT_PROJECT_ID` the project comparison is skipped; the ticket-number check
-still runs.
+still runs, **and that is all it checks**. Ticket numbers restart per project, so
+`"#5 (id 900)"` is accepted whenever id 900 is ticket #5 in *any* project — the wrong ticket
+if you meant another project's #5. Set `VIKUNJA_DEFAULT_PROJECT_ID` if a mismatch across
+projects matters to you.
 
 The pair form is honoured only on a string that *opens* with a ticket reference and names
 exactly one `id N`. Prose that merely mentions an id (`"see id 999 somewhere"`) is refused,

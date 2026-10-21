@@ -27,7 +27,13 @@ All notable changes to this project are documented here. Format follows
   must return ticket number N, and the default project when `VIKUNJA_DEFAULT_PROJECT_ID`
   is set. A mismatch raises and names both tickets with titles; a 404, or a body with no
   `index`, raises too. Cost: one call per paired reference, where there was none. A bare
-  id (`473`, `"473"`) is still a global id with no call.
+  id (`473`, `"473"`) is still a global id with no call. Without
+  `VIKUNJA_DEFAULT_PROJECT_ID` only the ticket number is compared, so a same-numbered
+  ticket in another project passes.
+- **Every ticket-reference pattern is ASCII-only** (`re.ASCII`). `\d` matched Arabic-Indic
+  and fullwidth digits, and IGNORECASE folded the dotless i and the Kelvin sign onto
+  `id`/`vikunja`. The bare-id branch already took ASCII digits only; the ticket forms now
+  match it.
 
 ### Added
 - **The `vikunja#` prefix** on ticket references: `vikunja#454` and

@@ -1426,6 +1426,10 @@ async def _strip_task_markers(result: Any) -> Any:
 # `_resolve_index`) and an upgrade dropping it is the most likely cause.
 _VERIFIED_VIKUNJA_VERSION = "v2.5.0"
 
+# Every pattern in this block is `re.ASCII`: the bare-id branch of `_resolve_task_ref` takes
+# plain ASCII digits only. Without the flag, `\d` matches Arabic-Indic digits, and
+# IGNORECASE folds the dotless i (U+0131) to "i" and the Kelvin sign (U+212A) to "k".
+#
 # The "#456 (id 475)" form that forge tickets, CLAUDE.md files and Matrix messages are
 # written in. The id is spelled out, but it is **checked, not trusted**: one GET of that id
 # must come back carrying ticket number 456, or the reference is refused. Until 0.12.0 the
@@ -1438,22 +1442,22 @@ _VERIFIED_VIKUNJA_VERSION = "v2.5.0"
 # somewhere" and, worse, silently take the first of several — "#456 (id 475) blocks #331
 # (id 342)" would resolve to 475 on nothing but position. Every other ambiguous case in this
 # module raises and names the candidates; this one must not be the exception.
-_EMBEDDED_ID = re.compile(r"\bid\s+(\d+)\b", re.IGNORECASE)
+_EMBEDDED_ID = re.compile(r"\bid\s+(\d+)\b", re.IGNORECASE | re.ASCII)
 
 # A string that opens with a ticket reference, whatever follows it.
-_STARTS_WITH_TICKET_REF = re.compile(r"^#(\d+)\b")
+_STARTS_WITH_TICKET_REF = re.compile(r"^#(\d+)\b", re.ASCII)
 
 # A bare ticket reference: "#454", and nothing else.
-_TICKET_REF = re.compile(r"^#(\d+)$")
+_TICKET_REF = re.compile(r"^#(\d+)$", re.ASCII)
 
 # The tracker prefix agents write ("vikunja#456", "Vikunja#456 (id 475)"). Only this literal
 # word, and only immediately before the `#`: "owner/repo#456" and "foo#456" name another
 # tracker, and reading them as this one's ticket would be a guess.
-_VIKUNJA_PREFIX = re.compile(r"^vikunja(?=#)", re.IGNORECASE)
+_VIKUNJA_PREFIX = re.compile(r"^vikunja(?=#)", re.IGNORECASE | re.ASCII)
 
 # Anything that opens with a URL scheme is parsed as a URL and either accepted as a task URL
 # on the configured instance or refused — never fed to the ticket-reference rules.
-_LOOKS_LIKE_URL = re.compile(r"^[a-z][a-z0-9+.-]*://", re.IGNORECASE)
+_LOOKS_LIKE_URL = re.compile(r"^[a-z][a-z0-9+.-]*://", re.IGNORECASE | re.ASCII)
 
 _DEFAULT_PORTS = {"http": 80, "https": 443}
 
@@ -1601,7 +1605,8 @@ async def _verify_pair(index: int, task_id: int, ref: Any, token: str, field: st
     One ``GET /tasks/{task_id}`` — the documented route by id, not the undocumented
     ``index`` filter — whose ``index`` must equal ``index`` and, when
     ``VIKUNJA_DEFAULT_PROJECT_ID`` is set, whose ``project_id`` must equal it. Without that
-    setting the project comparison is skipped; the index check still runs.
+    setting the project comparison is skipped and the index check is all that runs, so a
+    same-numbered ticket in another project passes — ticket numbers restart per project.
 
     On a mismatch it raises, naming what each half actually is: the id's real ticket number
     and title, and — via one more lookup — the id ``#index`` really belongs to. **It never

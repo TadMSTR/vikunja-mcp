@@ -1043,3 +1043,26 @@ async def test_new_forms_refuse_hostile_input_on_every_ref_field(_upstream, fiel
     with pytest.raises(ValueError, match=re.escape(field)):
         await _hostile_call(field, hostile)
     assert _upstream.await_count == 0, "a hostile ref reached the upstream call"
+
+
+# F-03 (audit 2026-10-21): the ticket forms follow the bare-id branch's ASCII-only rule.
+# Without `re.ASCII`, `\d` matched Arabic-Indic and fullwidth digits, and IGNORECASE folded
+# the dotless i (U+0131) and the Kelvin sign (U+212A) onto ASCII letters. Escapes, not
+# literals, so the confusables are visible in review.
+@pytest.mark.parametrize(
+    "ref",
+    [
+        "#\u0664\u0665\u0666",
+        "#\uff14\uff15\uff16",
+        "#456 (id \u0664\u0667\u0665)",
+        "#456 (\u0131d 475)",
+        "vi\u212aunja#456",
+        "vi\u212aunja#456 (id 475)",
+        "\u212attps://vikunja.test/tasks/475",
+    ],
+)
+async def test_ticket_forms_are_ascii_only(monkeypatch, ref):
+    mock = _routed(monkeypatch, by_id={475: fixtures.task(id=475, index=456)})
+    with pytest.raises(ValueError, match="task_id must be"):
+        await server._resolve_task_ref(ref)
+    mock.assert_not_awaited()
