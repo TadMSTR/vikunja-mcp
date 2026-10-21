@@ -114,7 +114,7 @@ log = structlog.get_logger()
 # Optional telemetry (OTLP spans+metrics, InfluxDB3, NATS) — no-op unless env-configured.
 telemetry.init()
 
-mcp = FastMCP("vikunja-mcp")
+mcp = FastMCP("vikunja-mcp", version=__version__)
 
 
 def instrument(fn: Callable[..., Any]) -> Callable[..., Any]:
@@ -1406,7 +1406,11 @@ async def _strip_task_markers(result: Any) -> Any:
 _VERIFIED_VIKUNJA_VERSION = "v2.5.0"
 
 # The "#456 (id 475)" form that forge tickets, CLAUDE.md files and Matrix messages are
-# written in. When the global id is spelled out, take it and skip the API call entirely.
+# written in. The id is spelled out, but it is **checked, not trusted**: one GET of that id
+# must come back carrying ticket number 456, or the reference is refused. Until 0.12.0 the
+# id was taken with no call and the `#N` ignored, so the one format that looks verified was
+# the one input never checked — and swapped pairs do occur (#1195 (id 1278) records
+# `#608 (id 525)` written for the ticket that is `#525 (id 608)`).
 #
 # Only consulted on a string that *starts* with a ticket reference, and only when it holds
 # exactly one `id N`. A bare `findall` over arbitrary prose would accept "see id 999
@@ -1421,15 +1425,35 @@ _STARTS_WITH_TICKET_REF = re.compile(r"^#(\d+)\b")
 # A bare ticket reference: "#454", and nothing else.
 _TICKET_REF = re.compile(r"^#(\d+)$")
 
+# The tracker prefix agents write ("vikunja#456", "Vikunja#456 (id 475)"). Only this literal
+# word, and only immediately before the `#`: "owner/repo#456" and "foo#456" name another
+# tracker, and reading them as this one's ticket would be a guess.
+_VIKUNJA_PREFIX = re.compile(r"^vikunja(?=#)", re.IGNORECASE)
+
+# Anything that opens with a URL scheme is parsed as a URL and either accepted as a task URL
+# on the configured instance or refused — never fed to the ticket-reference rules.
+_LOOKS_LIKE_URL = re.compile(r"^[a-z][a-z0-9+.-]*://", re.IGNORECASE)
+
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
 _REF_FORMS = (
     'a global task id (473, or the string "473"), '
-    'a ticket reference ("#454"), '
-    'or the combined form forge writes ("#456 (id 475)")'
+    'a ticket reference ("#454" or "vikunja#454"), '
+    'the combined form forge writes ("#456 (id 475)", checked against Vikunja), '
+    'or a task URL on this Vikunja instance ("<VIKUNJA_URL>/tasks/475")'
 )
 
 
 async def _resolve_index(index: int, token: str) -> int:
     """Resolve a per-project ticket number to the global task id, server-side.
+
+    A thin wrapper over :func:`_lookup_index`, which returns the whole task row.
+    """
+    return int((await _lookup_index(index, token))["id"])
+
+
+async def _lookup_index(index: int, token: str) -> dict[str, Any]:
+    """Find the one task carrying a per-project ticket number, server-side.
 
     One filtered call, no cache. ``index`` is a first-class filterable field — probed live
     with a negative control (``bogusfield = 1`` returns 400, so Vikunja rejects unknown
@@ -1494,7 +1518,106 @@ async def _resolve_index(index: int, token: str) -> int:
             "global task id you meant, or set VIKUNJA_DEFAULT_PROJECT_ID to scope "
             "resolution to one project."
         )
-    return int(matches[0]["id"])
+    return matches[0]
+
+
+def _describe_task(task: dict[str, Any]) -> str:
+    """``#525 "title" (project 7)`` — how a mismatch message names one side of a pair."""
+    return f"#{task.get('index')} {task.get('title', '')!r} (project {task.get('project_id')})"
+
+
+def _task_id_from_url(url: str, ref: Any, field: str) -> int:
+    """Read the global id out of a task URL this server would have handed out.
+
+    The exact inverse of :func:`_task_url`: ``<VIKUNJA_URL>/tasks/<id>``, optionally with a
+    trailing ``/`` or a ``#fragment``. A URL already names a global id unambiguously, so
+    there is no lookup.
+
+    Accepted **only** when scheme, host and port match the configured ``VIKUNJA_URL``, and
+    the path is exactly that base path plus ``/tasks/<digits>``. Everything else raises,
+    including a query string (refused, never stripped), userinfo, and a percent-encoded
+    id. A deployment whose ``VIKUNJA_URL`` is an internal address therefore refuses the
+    public URL the UI shows — a refusal, not a guess, which is the point.
+    """
+    base_url = get_settings().url.rstrip("/")
+    base = urlparse(base_url)
+    try:
+        parsed = urlparse(url)
+        port = parsed.port or _DEFAULT_PORTS.get(parsed.scheme.lower())
+    except ValueError as exc:
+        raise ValueError(f"{field} {ref!r} is not a valid URL ({exc}).") from exc
+    base_port = base.port or _DEFAULT_PORTS.get(base.scheme.lower())
+
+    if not url.isascii() or any(c.isspace() for c in url):
+        raise ValueError(f"{field} {ref!r}: a task URL must be plain ASCII with no spaces.")
+    if "?" in url or parsed.params or parsed.username is not None or parsed.password is not None:
+        raise ValueError(
+            f"{field} {ref!r}: a task URL must not carry a query string, parameters or "
+            f"credentials. Pass the URL exactly as {base_url}/tasks/<id>, or the bare id."
+        )
+    if (
+        not base.hostname
+        or parsed.scheme.lower() != base.scheme.lower()
+        or parsed.hostname != base.hostname
+        or port != base_port
+    ):
+        raise ValueError(
+            f"{field} {ref!r} is not a task URL on this Vikunja instance ({base_url}). A "
+            "URL on another host names a different tracker — pass the global id instead."
+        )
+    match = re.fullmatch(re.escape(base.path.rstrip("/")) + r"/tasks/([0-9]+)/?", parsed.path)
+    if not match:
+        raise ValueError(
+            f"{field} {ref!r} is a URL on this Vikunja instance but not a task URL. "
+            f"Expected {base_url}/tasks/<id>."
+        )
+    return int(match.group(1))
+
+
+async def _verify_pair(index: int, task_id: int, ref: Any, token: str, field: str) -> int:
+    """Check that ``#index (id task_id)`` names one ticket, and return the id if it does.
+
+    One ``GET /tasks/{task_id}`` — the documented route by id, not the undocumented
+    ``index`` filter — whose ``index`` must equal ``index`` and, when
+    ``VIKUNJA_DEFAULT_PROJECT_ID`` is set, whose ``project_id`` must equal it. Without that
+    setting the project comparison is skipped; the index check still runs.
+
+    On a mismatch it raises, naming what each half actually is: the id's real ticket number
+    and title, and — via one more lookup — the id ``#index`` really belongs to. **It never
+    picks one.** If that second lookup fails, the message still names the id's real ticket
+    and says the ``#N`` half could not be resolved.
+    """
+    scope = get_settings().default_project_id
+    try:
+        task = await request("GET", f"/tasks/{task_id}", token)
+    except VikunjaAPIError as exc:
+        if exc.status_code == 404:
+            raise ValueError(
+                f"{field} {ref!r} names id {task_id}, which does not exist. The pair cannot "
+                "be checked, so it is refused — pass the id or the ticket number you mean."
+            ) from exc
+        raise
+    if not isinstance(task, dict) or not isinstance(task.get("index"), int):
+        raise ValueError(
+            f"{field} {ref!r}: Vikunja returned no ticket number for id {task_id}, so the "
+            "pair cannot be checked. Refusing rather than trusting the id."
+        )
+
+    if task["index"] == index and (scope is None or task.get("project_id") == scope):
+        return task_id
+
+    reason = f"id {task_id} is {_describe_task(task)}"
+    if task["index"] == index:
+        reason += f", which is not in project {scope}"
+    try:
+        other = await _lookup_index(index, token)
+        reason += f"; #{index} is id {other.get('id')} {other.get('title', '')!r}"
+    except (ValueError, VikunjaAPIError) as exc:
+        reason += f"; #{index} could not be resolved ({exc})"
+    raise ValueError(
+        f"{field} {ref!r} does not match: {reason}. Pass the one you mean — taking either "
+        "half of a mismatched pair would be a guess."
+    )
 
 
 async def _resolve_task_ref(
@@ -1509,15 +1632,18 @@ async def _resolve_task_ref(
 
     Accepted, in the order they are tried:
 
-    ==========================  ===============================================
-    ``473`` / ``"473"``         a global id, returned as-is. No API call.
-    ``"#454"``                  a ticket number — one filtered lookup.
-    ``"#456 (id 475)"``         the id is spelled out — take it. No API call.
-    ==========================  ===============================================
+    ==================================  ===============================================
+    ``473`` / ``"473"``                 a global id, returned as-is. No API call.
+    ``"<VIKUNJA_URL>/tasks/473"``       a task URL on this instance. No API call.
+    ``"#454"`` / ``"vikunja#454"``      a ticket number — one filtered lookup.
+    ``"#456 (id 475)"``                 a pair — verified with one ``GET /tasks/475``.
+    ==================================  ===============================================
 
-    The third form is only honoured on a string that *opens* with a ticket reference and
-    names exactly one ``id N``. Prose that merely mentions an id is refused, and a string
-    naming several raises rather than taking the first — position is not evidence.
+    The ``vikunja#`` prefix is optional and case-insensitive on every ticket form; no other
+    prefix is accepted. The pair form is only honoured on a string that *opens* with a
+    ticket reference and names exactly one ``id N``. Prose that merely mentions an id is
+    refused, and a string naming several raises rather than taking the first — position is
+    not evidence. A pair whose halves disagree raises and names both tickets.
 
     A **bare** number is always a global id, never a ticket number. That asymmetry is the
     whole safety property: the ``#`` is what makes a ticket reference recognisable, and
@@ -1528,7 +1654,7 @@ async def _resolve_task_ref(
     so the no-API-call paths stay usable outside an HTTP request context.
 
     Raises:
-        ValueError: on any other form, naming what is accepted.
+        ValueError: on any other form, naming what is accepted; on a mismatched pair.
     """
     # bool is an int subclass, and `task_id=True` reaching /tasks/1 is never intended.
     if isinstance(ref, bool):
@@ -1548,14 +1674,22 @@ async def _resolve_task_ref(
     if text.isascii() and text.isdigit():
         return int(text)
 
+    if _LOOKS_LIKE_URL.match(text):
+        return _task_id_from_url(text, ref, field)
+
+    text = _VIKUNJA_PREFIX.sub("", text, count=1)
+
     ticket = _TICKET_REF.match(text)
     if ticket:
         return await _resolve_index(int(ticket.group(1)), token or caller_token())
 
-    if _STARTS_WITH_TICKET_REF.match(text):
+    opening = _STARTS_WITH_TICKET_REF.match(text)
+    if opening:
         ids = set(_EMBEDDED_ID.findall(text))
         if len(ids) == 1:
-            return int(ids.pop())
+            return await _verify_pair(
+                int(opening.group(1)), int(ids.pop()), ref, token or caller_token(), field
+            )
         if len(ids) > 1:
             raise ValueError(
                 f"{field} {ref!r} names {len(ids)} different task ids "
@@ -2255,9 +2389,13 @@ async def team_member_remove(team_id: int, username: str) -> dict:
 
 
 @tool
-async def team_member_toggle_admin(team_id: int, user_id: int) -> dict:
-    """Toggle a team member's admin status."""
-    return await request("POST", f"/teams/{team_id}/members/{user_id}/admin", caller_token())
+async def team_member_toggle_admin(team_id: int, username: str) -> dict:
+    """Toggle a team member's admin status. Takes the member's username, not a user id."""
+    # v2's `{user}` here is a username (`pkg/routes/api/v2/team_members.go`); a numeric id
+    # 404s. Percent-encoded like every free-text path segment (IV-01).
+    return await request(
+        "POST", f"/teams/{team_id}/members/{quote(username, safe='')}/admin", caller_token()
+    )
 
 
 # ===========================================================================
@@ -2320,20 +2458,27 @@ async def project_user_add(project_id: int, username: str, permission: int = 0) 
 
 
 @tool
-async def project_user_update(project_id: int, user_id: int, permission: int) -> dict:
-    """Change a user's permission on a shared project. `permission`: 0=read, 1=write, 2=admin."""
+async def project_user_update(project_id: int, username: str, permission: int) -> dict:
+    """Change a user's permission on a shared project. `permission`: 0=read, 1=write, 2=admin.
+
+    Takes the username, not a user id.
+    """
+    # v2's `{user}` here is a username (`pkg/routes/api/v2/project_users.go`). Until 0.12.0
+    # this sent a numeric id and every call 404ed "The user does not exist" (#1022 (id 1105)).
     return await request(
         "PUT",
-        f"/projects/{project_id}/users/{user_id}",
+        f"/projects/{project_id}/users/{quote(username, safe='')}",
         caller_token(),
         json={"permission": permission},
     )
 
 
 @tool
-async def project_user_remove(project_id: int, user_id: int) -> dict:
-    """Stop sharing a project with a user."""
-    return await request("DELETE", f"/projects/{project_id}/users/{user_id}", caller_token())
+async def project_user_remove(project_id: int, username: str) -> dict:
+    """Stop sharing a project with a user. Takes the username, not a user id."""
+    return await request(
+        "DELETE", f"/projects/{project_id}/users/{quote(username, safe='')}", caller_token()
+    )
 
 
 @tool

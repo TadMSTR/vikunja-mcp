@@ -28,6 +28,8 @@ import pytest
 from fastmcp import Client
 from fastmcp.client.transports import StdioTransport
 
+from vikunja_mcp import __version__
+
 # Resolve the console script next to the running interpreter rather than via PATH: pytest
 # is commonly invoked as `.venv/bin/python -m pytest`, which does not put `.venv/bin` on
 # PATH, and a PATH lookup would silently skip this whole file.
@@ -77,6 +79,8 @@ async def test_stdio_serves_a_tool_call_over_a_real_pipe():
 
         transport = StdioTransport(command=str(SCRIPT), args=[], env=env)
         async with Client(transport) as client:
+            # #754 (id 837): the real handshake over a real pipe names this server's version.
+            assert client.server_info.version == __version__
             assert len(await client.list_tools()) > 0
             result = await client.call_tool("whoami", {})
 

@@ -359,3 +359,27 @@ async def test_main_stdio_transport(monkeypatch, _patch_calls):
     await call(server.whoami)
     assert _patch_calls.await_args.args[2] == "stdio-tok"
     config.reset_settings()
+
+
+# --- serverInfo -----------------------------------------------------------
+
+
+@pytest.mark.parametrize("mode", ["legacy", "auto"])
+async def test_server_info_reports_the_package_version_not_fastmcps(mode):
+    """#754 (id 837). With no `version=`, FastMCP reports its OWN version (4.0.10) here.
+
+    Both negotiation eras: `legacy` is the `initialize` handshake carrying `serverInfo`;
+    `auto` may adopt `server/discover`, which carries it differently. A client reading
+    either must see this server's version.
+    """
+    import fastmcp
+    from fastmcp import Client
+
+    from vikunja_mcp import __version__
+
+    async with Client(server.mcp, mode=mode) as client:
+        info = client.server_info
+
+    assert info.name == "vikunja-mcp"
+    assert info.version == __version__
+    assert info.version != fastmcp.__version__

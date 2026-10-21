@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import inspect
 import os
+import re
 from unittest.mock import AsyncMock
 
 import pytest
@@ -80,21 +81,24 @@ async def test_ticket_ref_resolves_via_the_index_filter(monkeypatch):
     assert fetch.args[:2] == ("GET", "/tasks/473")
 
 
-async def test_combined_forge_form_skips_the_api_call_entirely(monkeypatch):
-    """`"#456 (id 475)"` spells the id out — take it, do not go ask.
+async def test_combined_forge_form_is_verified_with_one_call_by_id(monkeypatch):
+    """`"#456 (id 475)"` is checked, not trusted: one GET of id 475, then the real call.
 
-    This is the format forge tickets, CLAUDE.md files and Matrix messages already use, so
-    it is what agents paste. Asserting the transport is never touched is the point of the
-    test: a resolver that "works" by making a redundant round-trip is not this behaviour.
+    Until 0.12.0 this test pinned the opposite — the id was taken with no call and the
+    `#456` ignored, so a swapped pair silently named the wrong ticket (#1195 (id 1278)).
+    The check uses the documented route by id, not the undocumented `index` filter.
     """
-    mock = AsyncMock(return_value=fixtures.task(id=475))
+    pair = fixtures.task(id=475, index=456)
+    mock = AsyncMock(side_effect=[pair, pair])
     monkeypatch.setattr(server, "request", mock)
     monkeypatch.setattr(server, "caller_token", lambda: "TOK")
 
     await call(server.task_get, task_id="#456 (id 475)")
 
-    assert mock.await_count == 1
-    assert mock.call_args.args[:2] == ("GET", "/tasks/475")
+    verify, fetch = mock.await_args_list
+    assert verify.args[:2] == ("GET", "/tasks/475")
+    assert "params" not in verify.kwargs  # by id, not by filter
+    assert fetch.args[:2] == ("GET", "/tasks/475")
 
 
 @pytest.mark.parametrize(
@@ -124,19 +128,27 @@ async def test_unrecognised_forms_raise_and_name_what_is_accepted(ref):
         await server._resolve_task_ref(ref)
 
 
-async def test_no_string_form_can_reach_the_url_path_unresolved():
+async def test_no_string_form_can_reach_the_url_path_unresolved(monkeypatch):
     """The security property behind widening `task_id` to `int | str` (IV-01/IV-19).
 
     `task_id` is interpolated into `f"/tasks/{task_id}"`, so accepting strings is only safe
     if `int()` is the resolver's sole exit. Anything else — a traversal segment, a query
     fragment, a filter clause — must raise rather than be handed to the URL builder.
     """
+    monkeypatch.setattr(server, "request", AsyncMock(return_value=fixtures.task(id=475, index=456)))
     for hostile in ("../../user", "473/../../projects/1", "%2e%2e%2fuser", "#454 && project = 2"):
         with pytest.raises(ValueError):
-            await server._resolve_task_ref(hostile)
+            await server._resolve_task_ref(hostile, token="TOK")
 
-    for accepted in (473, "473", " 473 ", "#456 (id 475)"):
-        resolved = await server._resolve_task_ref(accepted)
+    for accepted in (
+        473,
+        "473",
+        " 473 ",
+        "#456 (id 475)",
+        "vikunja#456 (id 475)",
+        "https://vikunja.test/tasks/475",
+    ):
+        resolved = await server._resolve_task_ref(accepted, token="TOK")
         assert type(resolved) is int, f"{accepted!r} resolved to {type(resolved).__name__}"
 
 
@@ -158,9 +170,10 @@ async def test_a_reference_naming_several_ids_raises_instead_of_taking_the_first
     mock.assert_not_awaited()
 
 
-async def test_repeating_the_same_id_is_not_ambiguous():
+async def test_repeating_the_same_id_is_not_ambiguous(monkeypatch):
     """Two mentions of one id name one task. Only *different* ids are a conflict."""
-    assert await server._resolve_task_ref("#456 (id 475) — see id 475") == 475
+    monkeypatch.setattr(server, "request", AsyncMock(return_value=fixtures.task(id=475, index=456)))
+    assert await server._resolve_task_ref("#456 (id 475) — see id 475", token="TOK") == 475
 
 
 async def test_boolean_is_refused_rather_than_read_as_task_1():
@@ -251,6 +264,232 @@ async def test_resolve_reads_the_pagination_envelope_not_just_a_bare_list(monkey
 
     with pytest.raises(ValueError, match="ambiguous"):
         await call(server.task_get, task_id="#1")
+
+
+# ===========================================================================
+# Resolution — a `#N (id M)` pair is verified, never trusted (0.12.0)
+# ===========================================================================
+
+
+def _routed(monkeypatch, by_id=None, by_index=None):
+    """A fake upstream that answers `GET /tasks/{id}` and the `index` filter from tables.
+
+    Routing on the request rather than on call order is what lets a test assert *which*
+    calls happened: a resolver that made an extra call, or the right calls in the wrong
+    order, would get an answer here and still be caught by the call-log assertions.
+    """
+    by_id = by_id or {}
+    by_index = by_index or {}
+
+    async def fake(method, path, token, **kwargs):
+        if path == "/tasks" and "params" in kwargs:
+            index = int(kwargs["params"]["filter"].rsplit("=", 1)[1])
+            return [by_index[index]] if index in by_index else []
+        task_id = int(path.rsplit("/", 1)[1])
+        if task_id not in by_id:
+            raise VikunjaAPIError(404, "The task does not exist.")
+        return by_id[task_id]
+
+    mock = AsyncMock(side_effect=fake)
+    monkeypatch.setattr(server, "request", mock)
+    monkeypatch.setattr(server, "caller_token", lambda: "TOK")
+    return mock
+
+
+# The swap #1195 (id 1278) recorded: `#608 (id 525)` written for the ticket that is
+# `#525 (id 608)`. Here id 525 is ticket #525, and ticket #608 is id 691.
+_ID_525 = fixtures.task(id=525, index=525, title="the ticket id 525 really is")
+_ID_691 = fixtures.task(id=691, index=608, title="the ticket #608 really is")
+
+
+async def test_a_matching_pair_returns_the_id(monkeypatch):
+    mock = _routed(monkeypatch, by_id={691: _ID_691})
+    assert await server._resolve_task_ref("#608 (id 691)") == 691
+    assert [c.args[1] for c in mock.await_args_list] == ["/tasks/691"]
+
+
+@pytest.mark.parametrize("ref", ["#608 (ID 691)", "#608 (Id 691)", "VIKUNJA#608 (ID 691)"])
+async def test_the_pair_check_is_case_insensitive(monkeypatch, ref):
+    _routed(monkeypatch, by_id={691: _ID_691})
+    assert await server._resolve_task_ref(ref) == 691
+
+
+async def test_a_swapped_pair_raises_and_names_both_tickets(monkeypatch):
+    """The #1195 (id 1278) case. 0.11.1 returned 525 here — the wrong ticket, silently."""
+    mock = _routed(monkeypatch, by_id={525: _ID_525, 691: _ID_691}, by_index={608: _ID_691})
+
+    with pytest.raises(ValueError) as excinfo:
+        await call(server.task_delete, task_id="#608 (id 525)")
+
+    message = str(excinfo.value)
+    assert "does not match" in message
+    assert "id 525 is #525 'the ticket id 525 really is'" in message
+    assert "#608 is id 691 'the ticket #608 really is'" in message
+    # The verify GET and the lookup that names the other half — and no DELETE of either.
+    assert [c.args[0] for c in mock.await_args_list] == ["GET", "GET"]
+
+
+async def test_a_pair_in_the_wrong_project_raises(monkeypatch):
+    monkeypatch.setenv("VIKUNJA_DEFAULT_PROJECT_ID", "7")
+    config.reset_settings()
+    elsewhere = fixtures.task(id=900, index=608, project_id=2, title="same number, other project")
+    _routed(monkeypatch, by_id={900: elsewhere}, by_index={608: _ID_691})
+
+    with pytest.raises(ValueError) as excinfo:
+        await server._resolve_task_ref("#608 (id 900)")
+
+    message = str(excinfo.value)
+    assert "(project 2), which is not in project 7" in message
+    assert "#608 is id 691" in message
+
+
+async def test_without_a_default_project_the_index_check_still_runs(monkeypatch):
+    elsewhere = fixtures.task(id=900, index=608, project_id=2)
+    _routed(monkeypatch, by_id={900: elsewhere, 525: _ID_525})
+    assert await server._resolve_task_ref("#608 (id 900)") == 900
+    with pytest.raises(ValueError, match="does not match"):
+        await server._resolve_task_ref("#608 (id 525)")
+
+
+async def test_a_pair_whose_id_does_not_exist_raises(monkeypatch):
+    mock = _routed(monkeypatch, by_index={608: _ID_691})
+    with pytest.raises(ValueError, match="names id 4040, which does not exist"):
+        await call(server.task_delete, task_id="#608 (id 4040)")
+    assert mock.await_count == 1  # the verify GET only; the tool body never ran
+
+
+async def test_a_mismatch_whose_other_half_cannot_be_resolved_still_raises(monkeypatch):
+    """The `#N` half failing to resolve must not turn into "so take the id"."""
+    mock = _routed(monkeypatch, by_id={525: _ID_525})  # no ticket #608 at all
+    with pytest.raises(ValueError) as excinfo:
+        await call(server.task_delete, task_id="#608 (id 525)")
+
+    message = str(excinfo.value)
+    assert "id 525 is #525" in message
+    assert "#608 could not be resolved" in message
+    assert all(c.args[0] == "GET" for c in mock.await_args_list)
+
+
+async def test_an_upstream_failure_on_the_verify_call_raises_and_never_falls_back(monkeypatch):
+    mock = AsyncMock(side_effect=VikunjaAPIError(500, "boom"))
+    monkeypatch.setattr(server, "request", mock)
+    monkeypatch.setattr(server, "caller_token", lambda: "TOK")
+    with pytest.raises(VikunjaAPIError):
+        await call(server.task_delete, task_id="#608 (id 691)")
+    assert mock.await_count == 1  # no DELETE /tasks/691 followed
+
+
+async def test_a_verify_response_with_no_index_is_refused(monkeypatch):
+    """If an upgrade stopped returning `index`, the check must fail closed, not pass."""
+    body = fixtures.task(id=691)
+    del body["index"]
+    _routed(monkeypatch, by_id={691: body})
+    with pytest.raises(ValueError, match="no ticket number"):
+        await server._resolve_task_ref("#608 (id 691)")
+
+
+async def test_a_bare_id_still_makes_no_call(monkeypatch):
+    """Invariant 7's first rule survives 0.12.0: a bare number is a global id, no lookup."""
+    mock = _routed(monkeypatch)
+    assert await server._resolve_task_ref("691") == 691
+    assert await server._resolve_task_ref(691) == 691
+    mock.assert_not_awaited()
+
+
+# ===========================================================================
+# Resolution — the `vikunja#` prefix and task URLs (0.12.0)
+# ===========================================================================
+
+
+@pytest.mark.parametrize("ref", ["vikunja#608", "Vikunja#608", "VIKUNJA#608", " vikunja#608 "])
+async def test_the_vikunja_prefix_is_a_ticket_reference(monkeypatch, ref):
+    mock = _routed(monkeypatch, by_index={608: _ID_691})
+    assert await server._resolve_task_ref(ref) == 691
+    assert mock.await_args_list[0].kwargs["params"] == {"filter": "index = 608"}
+
+
+async def test_the_prefixed_pair_is_verified_too(monkeypatch):
+    _routed(monkeypatch, by_id={525: _ID_525, 691: _ID_691}, by_index={608: _ID_691})
+    assert await server._resolve_task_ref("vikunja#608 (id 691)") == 691
+    with pytest.raises(ValueError, match="does not match"):
+        await server._resolve_task_ref("vikunja#608 (id 525)")
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://vikunja.test/tasks/1272",
+        "https://vikunja.test/tasks/1272/",
+        "https://vikunja.test/tasks/1272#comment-5",
+        "https://VIKUNJA.test/tasks/1272",
+        "HTTPS://vikunja.test/tasks/1272",
+        "https://vikunja.test:443/tasks/1272",
+    ],
+)
+async def test_a_task_url_on_this_instance_is_its_id_with_no_call(monkeypatch, url):
+    mock = _routed(monkeypatch)
+    assert await server._resolve_task_ref(url) == 1272
+    mock.assert_not_awaited()
+
+
+async def test_every_url_this_server_hands_out_round_trips():
+    """`_task_url` and the URL parser are inverses. A URL we print must be one we accept."""
+    assert await server._resolve_task_ref(server._task_url(1272)) == 1272
+
+
+@pytest.mark.parametrize(
+    "base",
+    ["https://vikunja.test/", "http://10.0.0.5:3456", "https://example.test/vikunja"],
+)
+async def test_the_round_trip_holds_for_other_base_urls(monkeypatch, base):
+    monkeypatch.setenv("VIKUNJA_URL", base)
+    config.reset_settings()
+    assert await server._resolve_task_ref(server._task_url(1272)) == 1272
+
+
+@pytest.mark.parametrize(
+    ("ref", "reason"),
+    [
+        ("https://other.test/tasks/1272", "not a task URL on this Vikunja instance"),
+        ("https://vikunja.test.evil.test/tasks/1272", "not a task URL on this Vikunja"),
+        ("http://vikunja.test/tasks/1272", "not a task URL on this Vikunja instance"),
+        ("https://vikunja.test:8443/tasks/1272", "not a task URL on this Vikunja instance"),
+        ("https://vikunja.test/tasks/1272?x=1", "must not carry a query string"),
+        ("https://vikunja.test/tasks/1272/?", "must not carry a query string"),
+        ("https://u:p@vikunja.test/tasks/1272", "must not carry a query string"),
+        ("https://vikunja.test@other.test/tasks/1272", "must not carry"),
+        ("https://vikunja.test/tasks/%31272", "not a task URL"),
+        ("https://vikunja.test/tasks/1272/comments", "not a task URL"),
+        ("https://vikunja.test/projects/7", "not a task URL"),
+        ("https://vikunja.test/tasks/", "not a task URL"),
+        ("https://vikunja.test/tasks/12 72", "plain ASCII with no spaces"),
+        ("https://vikunja.test/tasks/١٢", "plain ASCII"),
+        ("https://vikunja.test:99999/tasks/1272", "not a valid URL"),
+    ],
+)
+async def test_a_url_that_is_not_a_task_on_this_instance_is_refused(monkeypatch, ref, reason):
+    mock = _routed(monkeypatch)
+    with pytest.raises(ValueError, match=reason):
+        await server._resolve_task_ref(ref)
+    mock.assert_not_awaited()
+
+
+async def test_a_url_under_a_base_path_must_keep_the_base_path(monkeypatch):
+    monkeypatch.setenv("VIKUNJA_URL", "https://example.test/vikunja")
+    config.reset_settings()
+    with pytest.raises(ValueError, match="not a task URL"):
+        await server._resolve_task_ref("https://example.test/tasks/1272")
+
+
+@pytest.mark.parametrize(
+    "ref",
+    ["foo#456", "owner/repo#456", "vikunja#", "vikunja #456", "vikunjavikunja#456", "jira#456"],
+)
+async def test_other_trackers_prefixes_are_refused(monkeypatch, ref):
+    mock = _routed(monkeypatch)
+    with pytest.raises(ValueError, match="task_id must be"):
+        await server._resolve_task_ref(ref)
+    mock.assert_not_awaited()
 
 
 # ===========================================================================
@@ -765,4 +1004,42 @@ async def test_widened_far_end_refuses_hostile_input(_upstream, hostile):
             relation_kind="related",
             other_task_id=hostile,
         )
+    assert _upstream.await_count == 0, "a hostile ref reached the upstream call"
+
+
+# The 0.12.0 forms widened what a string may look like on its way in, so the hostile set
+# grows with them — URL-shaped and prefix-shaped inputs that must still never reach a path.
+_HOSTILE_NEW_FORMS = [
+    "https://other.test/tasks/1",
+    "https://vikunja.test/tasks/1?filter=done",
+    "https://vikunja.test/tasks/1/../../projects/1",
+    "https://vikunja.test/tasks/..%2f..%2fadmin",
+    "https://vikunja.test@other.test/tasks/1",
+    "javascript://vikunja.test/tasks/1",
+    "file:///tasks/1",
+    "owner/repo#454",
+    "vikunja#",
+    "vikunja#454; DROP",
+    "vikunja#454 && project = 2",
+    "vikunja/../#454",
+]
+
+
+def _hostile_call(field, hostile):
+    if field == "task_id":
+        return call(server.task_delete, task_id=hostile)
+    if field == "other_task_id":
+        return call(
+            server.task_relation_remove, task_id=100, relation_kind="related", other_task_id=hostile
+        )
+    return call(server.tasks_bulk_update, task_ids=[100, hostile], values={"done": True})
+
+
+@pytest.mark.parametrize("field", ["task_id", "other_task_id", "task_ids[1]"])
+@pytest.mark.parametrize("hostile", _HOSTILE_NEW_FORMS)
+async def test_new_forms_refuse_hostile_input_on_every_ref_field(_upstream, field, hostile):
+    """`task_id`, `other_task_id` and `task_ids[i]` share one resolver, so one list covers
+    all three — and the parametrisation proves they really do share it."""
+    with pytest.raises(ValueError, match=re.escape(field)):
+        await _hostile_call(field, hostile)
     assert _upstream.await_count == 0, "a hostile ref reached the upstream call"

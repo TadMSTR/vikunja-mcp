@@ -6,6 +6,42 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.12.0] — 2026-10-21
+
+### Breaking
+- **`project_user_update`, `project_user_remove` and `team_member_toggle_admin` take
+  `username: str`, not `user_id: int`** (#1022 (id 1105)). Vikunja v2's `{user}` path
+  segment on all three routes is a username (`pkg/routes/api/v2/project_users.go`,
+  `team_members.go`), so every call these tools have ever made returned 404 "The user does
+  not exist". The username is percent-encoded into the path. A proxy that froze the old
+  input schema (scoped-mcp's `mcp_proxy` does, at start) must be restarted to see the new
+  one. `team_member_toggle_admin` was not in the ticket; it was found by reading every
+  user-in-path route file while fixing it. `task_assignee_remove` was checked the same way
+  and is correct: its `{user}` is a numeric id (`task_assignees.go`).
+
+### Changed
+- **A `#N (id M)` reference is verified, not trusted.** Until now the resolver took the id
+  with no API call and ignored `#N`, so a swapped pair silently named the wrong ticket —
+  #1195 (id 1278) records `#608 (id 525)` written for the ticket that is `#525 (id 608)`,
+  which 0.11.1 resolved to id 525. Now one `GET /tasks/{M}` (the documented route by id)
+  must return ticket number N, and the default project when `VIKUNJA_DEFAULT_PROJECT_ID`
+  is set. A mismatch raises and names both tickets with titles; a 404, or a body with no
+  `index`, raises too. Cost: one call per paired reference, where there was none. A bare
+  id (`473`, `"473"`) is still a global id with no call.
+
+### Added
+- **The `vikunja#` prefix** on ticket references: `vikunja#454` and
+  `vikunja#456 (id 475)`, case-insensitive. That is how plans, handoffs and task
+  descriptions cite tickets, and agents were stripping it by hand. No other prefix is
+  accepted.
+- **Task URLs** as a task reference: `<VIKUNJA_URL>/tasks/<id>`, the exact inverse of the
+  `url` field this server returns. No API call. Scheme, host, port and base path must match
+  `VIKUNJA_URL`; a query string, userinfo or another host is refused.
+
+### Fixed
+- **`serverInfo.version` reports vikunja-mcp's version** (#754 (id 837)). It was reporting
+  FastMCP's (4.0.10), because `FastMCP(...)` was constructed without `version=`.
+
 ## [0.11.1] — 2026-10-06
 
 Dependency release. No application code changed.

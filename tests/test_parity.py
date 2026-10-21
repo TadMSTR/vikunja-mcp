@@ -171,6 +171,46 @@ async def test_team_member_remove_username_is_encoded(_patch_calls):
     assert _patch_calls.call_args.args[:2] == ("DELETE", "/teams/3/members/a%2Fb")
 
 
+# #1022 (id 1105): v2 takes a USERNAME in these three paths, not a user id. Each tool sent a
+# numeric id and every call 404ed. The username below has a non-digit and characters that
+# need encoding, and the path is asserted exactly — a mock accepting any path, or a test
+# passing a digit-only username, is what let the original bug through.
+@pytest.mark.parametrize(
+    ("tool", "kwargs", "expected"),
+    [
+        (
+            server.project_user_update,
+            {"project_id": 7, "username": "ops team/a b", "permission": 2},
+            ("PUT", "/projects/7/users/ops%20team%2Fa%20b"),
+        ),
+        (
+            server.project_user_remove,
+            {"project_id": 7, "username": "ops team/a b"},
+            ("DELETE", "/projects/7/users/ops%20team%2Fa%20b"),
+        ),
+        (
+            server.team_member_toggle_admin,
+            {"team_id": 3, "username": "ops team/a b"},
+            ("POST", "/teams/3/members/ops%20team%2Fa%20b/admin"),
+        ),
+    ],
+)
+async def test_user_in_path_tools_send_the_encoded_username(_patch_calls, tool, kwargs, expected):
+    await call(tool, **kwargs)
+    assert _patch_calls.call_args.args[:2] == expected
+
+
+@pytest.mark.parametrize(
+    "name", ["project_user_update", "project_user_remove", "team_member_toggle_admin"]
+)
+async def test_user_in_path_tools_publish_a_string_username_and_no_user_id(name):
+    """The published schema is what the broker freezes, so pin it rather than the signature."""
+    tool = await server.mcp.get_tool(name)
+    props = tool.parameters["properties"]
+    assert props["username"]["type"] == "string"
+    assert "user_id" not in props
+
+
 # --- reminders ------------------------------------------------------------
 
 
@@ -257,8 +297,8 @@ async def test_tasks_bulk_update_sends_ids_fields_and_values(_patch_calls):
         (server.team_delete, {"team_id": 3}, ("DELETE", "/teams/3")),
         (
             server.team_member_toggle_admin,
-            {"team_id": 3, "user_id": 5},
-            ("POST", "/teams/3/members/5/admin"),
+            {"team_id": 3, "username": "agent-writer"},
+            ("POST", "/teams/3/members/agent-writer/admin"),
         ),
         (server.project_team_list, {"project_id": 1}, ("GET", "/projects/1/teams")),
         (
@@ -269,13 +309,13 @@ async def test_tasks_bulk_update_sends_ids_fields_and_values(_patch_calls):
         (server.project_user_list, {"project_id": 1}, ("GET", "/projects/1/users")),
         (
             server.project_user_update,
-            {"project_id": 1, "user_id": 2, "permission": 1},
-            ("PUT", "/projects/1/users/2"),
+            {"project_id": 1, "username": "agent-writer", "permission": 1},
+            ("PUT", "/projects/1/users/agent-writer"),
         ),
         (
             server.project_user_remove,
-            {"project_id": 1, "user_id": 2},
-            ("DELETE", "/projects/1/users/2"),
+            {"project_id": 1, "username": "agent-writer"},
+            ("DELETE", "/projects/1/users/agent-writer"),
         ),
         (server.project_share_list, {"project_id": 1}, ("GET", "/projects/1/shares")),
         (

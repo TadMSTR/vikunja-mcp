@@ -92,7 +92,7 @@ logic, no caching, no persistence.
    `tasks_bulk_update` mutates). The latter two were `int`-only until vikunja#458/#459, so
    the near end of a relation accepted a ticket reference while the far end refused it at
    schema validation. All three route through the same resolver so they cannot diverge in
-   what they accept. Three rules that are load-bearing, not stylistic:
+   what they accept. Four rules that are load-bearing, not stylistic:
 
    - **A bare number is always a global id.** `"454"` without a `#` is never a ticket
      number. The `#` is the only thing that distinguishes the two, so guessing without it
@@ -101,6 +101,20 @@ logic, no caching, no persistence.
    - **An ambiguous resolve raises and names every candidate.** Never pick one. Ticket
      numbers are unique per project, not globally (`index = 1` matches id 9 in project 7
      and id 344 in project 2, live).
+   - **A paired reference is verified, never trusted.** `"#456 (id 475)"` costs one
+     `GET /tasks/475` (the documented route by id, not the `index` filter), whose `index`
+     must be 456 and, with `VIKUNJA_DEFAULT_PROJECT_ID` set, whose `project_id` must match.
+     A mismatch, a 404, or a body with no `index` raises; it never returns either half.
+     Until 0.12.0 the id was taken with no call, so the format that *looks* verified was
+     the one input never checked — and swapped pairs happen: #1195 (id 1278) records
+     `#608 (id 525)` written for the ticket that is `#525 (id 608)`, which 0.11.1 resolved
+     to id 525 silently.
+
+   Accepted spellings, all through the same resolver: the optional, case-insensitive
+   `vikunja#` prefix on either ticket form (no other prefix — `owner/repo#N` is another
+   tracker), and a task URL on the configured instance — the exact inverse of `_task_url`,
+   matching scheme, host, port and base path, with no query string or userinfo. A URL is
+   already a global id, so it costs no call. Four rules, then, not three.
 
    The annotation `task_id: int | str` is the enabling change, not cosmetic — FastMCP
    derives the schema from `wrapper.__signature__`, so `task_id: int` rejects `"#454"`
