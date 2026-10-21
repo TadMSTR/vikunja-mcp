@@ -39,6 +39,12 @@ All notable changes to this project are documented here. Format follows
   `VIKUNJA_URL`; a query string, userinfo or another host is refused.
 
 ### Security
+- **`"."`, `".."` and `""` are refused as a username or `relation_kind` path segment**
+  (IV-23, found by the pre-audit baseline). `quote(..., safe="")` leaves dots intact and
+  httpx resolves dot segments, so `project_user_remove(project_id=7, username="..")` would
+  have sent `DELETE /api/v2/projects/7` — and `team_member_remove(team_id=3, username="..")`
+  has sent `DELETE /teams/3` since it was written. One helper, `_path_segment`, now guards
+  all five call sites.
 - **certifi 2026.7.22 → 2026.10.19** (PYSEC-2026-4320), in both the runtime and dev lock
   sets. Published after 0.11.1; CI's dependency audit failed on it for this branch and
   would for `main`. Only certifi's lock entry changed.

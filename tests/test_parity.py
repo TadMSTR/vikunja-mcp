@@ -353,3 +353,38 @@ async def test_tasks_bulk_update_sends_ids_fields_and_values(_patch_calls):
 async def test_verb_path_mappings(_patch_calls, tool, kwargs, expected):
     await call(tool, **kwargs)
     assert _patch_calls.call_args.args[:2] == expected
+
+
+# IV-23: `quote(..., safe="")` leaves "." and ".." intact, and httpx resolves dot segments
+# before sending. Unguarded, `project_user_remove(7, "..")` went out as DELETE /projects/7
+# and `team_member_remove(3, "..")` as DELETE /teams/3 — deleting the parent resource from
+# a tool scoped to one member of it.
+_SEGMENT_TOOLS = [
+    (server.project_user_update, {"project_id": 7, "permission": 2}, "username"),
+    (server.project_user_remove, {"project_id": 7}, "username"),
+    (server.team_member_remove, {"team_id": 3}, "username"),
+    (server.team_member_toggle_admin, {"team_id": 3}, "username"),
+    (server.task_relation_remove, {"task_id": 7, "other_task_id": 8}, "relation_kind"),
+]
+
+
+@pytest.mark.parametrize("bad", ["", ".", ".."])
+@pytest.mark.parametrize(("tool", "kwargs", "field"), _SEGMENT_TOOLS)
+async def test_dot_segments_are_refused_before_any_request(_patch_calls, tool, kwargs, field, bad):
+    with pytest.raises(ValueError, match=field):
+        await call(tool, **kwargs, **{field: bad})
+    _patch_calls.assert_not_awaited()
+
+
+@pytest.mark.parametrize("ok", ["...", ".hidden", "a..b", "..x"])
+async def test_names_that_merely_contain_dots_still_work(_patch_calls, ok):
+    await call(server.project_user_remove, project_id=7, username=ok)
+    assert _patch_calls.call_args.args[1] == f"/projects/7/users/{ok}"
+
+
+def test_why_the_guard_exists_httpx_resolves_dot_segments():
+    """Pins the premise. If httpx ever stops resolving them, the guard is merely redundant."""
+    import httpx
+
+    url = httpx.Request("DELETE", "https://vikunja.test/api/v2/projects/7/users/..").url
+    assert url.raw_path == b"/api/v2/projects/7"

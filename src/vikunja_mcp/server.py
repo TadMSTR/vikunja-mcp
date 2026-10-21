@@ -461,6 +461,27 @@ _SUMMARY_FIELDS = (
 _COUNTED_COLLECTIONS = {"attachments": "attachment_count", "reactions": "reaction_count"}
 
 
+def _path_segment(value: str, field: str) -> str:
+    """Percent-encode a caller-supplied string for use as ONE URL path segment.
+
+    ``quote(value, safe="")`` encodes ``/``, ``?``, ``#`` and ``%``, but not ``.``, so
+    ``".."`` and ``"."`` survive it unchanged — and httpx resolves dot segments before
+    sending. ``project_user_remove(project_id=7, username="..")`` would otherwise go out as
+    ``DELETE /api/v2/projects/7``: delete the project, from a tool granted only to unshare
+    it. The same held for ``team_member_remove`` (``DELETE /teams/{id}``) since it was
+    written. An empty string is refused too, since it collapses the segment away.
+
+    Raises:
+        ValueError: on ``""``, ``"."`` or ``".."``, naming the parameter.
+    """
+    if value in ("", ".", ".."):
+        raise ValueError(
+            f"{field} {value!r} is not allowed: it would be resolved as a path segment and "
+            "send the request to a different endpoint."
+        )
+    return quote(value, safe="")
+
+
 def _task_url(task_id: Any) -> str:
     """The browser URL for a task.
 
@@ -2213,12 +2234,11 @@ async def task_relation_remove(
     task_id: int | str, relation_kind: str, other_task_id: int | str
 ) -> dict:
     """Remove a relation between two tasks. `relation_kind` must match the existing relation."""
-    # relation_kind is a free-text path segment — percent-encode it so a value like
-    # "../.." cannot traverse to a different API path (IV-01).
+    # relation_kind is a free-text path segment: percent-encoded, and "."/".." refused,
+    # so no value can traverse to a different API path (IV-01, IV-23).
+    kind = _path_segment(relation_kind, "relation_kind")
     return await request(
-        "DELETE",
-        f"/tasks/{task_id}/relations/{quote(relation_kind, safe='')}/{other_task_id}",
-        caller_token(),
+        "DELETE", f"/tasks/{task_id}/relations/{kind}/{other_task_id}", caller_token()
     )
 
 
@@ -2384,7 +2404,7 @@ async def team_member_remove(team_id: int, username: str) -> dict:
     """Remove a user from a team."""
     # username is a free-text path segment — percent-encode it (IV-01).
     return await request(
-        "DELETE", f"/teams/{team_id}/members/{quote(username, safe='')}", caller_token()
+        "DELETE", f"/teams/{team_id}/members/{_path_segment(username, 'username')}", caller_token()
     )
 
 
@@ -2394,7 +2414,9 @@ async def team_member_toggle_admin(team_id: int, username: str) -> dict:
     # v2's `{user}` here is a username (`pkg/routes/api/v2/team_members.go`); a numeric id
     # 404s. Percent-encoded like every free-text path segment (IV-01).
     return await request(
-        "POST", f"/teams/{team_id}/members/{quote(username, safe='')}/admin", caller_token()
+        "POST",
+        f"/teams/{team_id}/members/{_path_segment(username, 'username')}/admin",
+        caller_token(),
     )
 
 
@@ -2467,7 +2489,7 @@ async def project_user_update(project_id: int, username: str, permission: int) -
     # this sent a numeric id and every call 404ed "The user does not exist" (#1022 (id 1105)).
     return await request(
         "PUT",
-        f"/projects/{project_id}/users/{quote(username, safe='')}",
+        f"/projects/{project_id}/users/{_path_segment(username, 'username')}",
         caller_token(),
         json={"permission": permission},
     )
@@ -2477,7 +2499,9 @@ async def project_user_update(project_id: int, username: str, permission: int) -
 async def project_user_remove(project_id: int, username: str) -> dict:
     """Stop sharing a project with a user. Takes the username, not a user id."""
     return await request(
-        "DELETE", f"/projects/{project_id}/users/{quote(username, safe='')}", caller_token()
+        "DELETE",
+        f"/projects/{project_id}/users/{_path_segment(username, 'username')}",
+        caller_token(),
     )
 
 
