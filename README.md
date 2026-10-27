@@ -455,8 +455,13 @@ The separator is a space, an em dash (U+2014), and a space.
   anything is written**.
 - An already-done task is a no-op: `already_done: true`, nothing written.
 - If the relation or close step fails after the comment is posted, the reply says so with
-  `failed_step` and `error` instead of raising. The ticket is left open with its evidence,
-  and a human can finish the close.
+  `failed_step` and `error` instead of raising. When Vikunja refused the step, the ticket
+  is left open with its evidence, and a human can finish the close.
+- **A timeout is not reported as a failure.** Vikunja may have applied the write before
+  the response was lost. After a timed-out step `task_close` reads the task back and
+  reports what it shows (`outcome: "reread"`), or `done: null` with `outcome: "unknown"`
+  if it can't. A timed-out comment is looked for before anything is raised, so a raise
+  still means no closing comment was written.
 
 The reply is `{id, identifier, done, verdict, comment_id, relation_added, already_done}`.
 

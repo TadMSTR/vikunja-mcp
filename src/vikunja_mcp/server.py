@@ -857,13 +857,17 @@ async def _all_pages(path: str, token: str, params: dict[str, Any]) -> list[dict
         VikunjaAPIError: on any upstream failure, or on a body that is not a list envelope
             (no readable ``total``/``total_pages``) — a page whose extent cannot be read
             cannot be shown to be the last one.
-        _ResultSetChanged: ``total`` moved between pages, an id arrived twice, or the rows
-            do not add up to ``total``.
+            The same applies to a first page claiming more pages than its ``total``
+            needs: that is refused before page 2, so an inconsistent envelope cannot drive
+            an unbounded walk.
+        _ResultSetChanged: ``total`` or ``total_pages`` moved between pages, a page came
+            back empty before ``total`` was reached, an id arrived twice, or the rows do
+            not add up to ``total``.
     """
     rows: list[dict] = []
     seen: set[Any] = set()
     total: int | None = None
-    total_pages = 1
+    total_pages = first_pages = 1
     page = 1
     while page <= total_pages:
         body = await request(
@@ -884,9 +888,28 @@ async def _all_pages(path: str, token: str, params: dict[str, Any]) -> list[dict
                 "the last page cannot be read; refusing to return a possibly partial list",
             ) from exc
         if total is None:
-            total = page_total
+            total, first_pages = page_total, total_pages
+            # The walk is bounded by `total_pages`, and that number comes from upstream. A
+            # body claiming far more pages than `total` needs would drive one request per
+            # claimed page before the row-count check after the loop could object, so it is
+            # checked against `total` here, before page 2 is requested.
+            if total_pages > max(1, -(-total // _MAX_PAGE_SIZE)):
+                raise VikunjaAPIError(
+                    0,
+                    f"{path}: upstream reported {total_pages} pages for {total} rows at "
+                    f"{_MAX_PAGE_SIZE} per page; refusing to walk an extent that does not "
+                    "match its own total",
+                )
         elif page_total != total:
             raise _ResultSetChanged(path, f"total {total} -> {page_total}")
+        elif total_pages != first_pages:
+            raise _ResultSetChanged(path, f"total_pages {first_pages} -> {total_pages}")
+        if not items and len(rows) < total:
+            # An empty page before `total` is reached cannot be followed by the missing
+            # rows in any consistent listing.
+            raise _ResultSetChanged(
+                path, f"page {page} was empty with {len(rows)} of {total} rows read"
+            )
         for item in items:
             if not isinstance(item, dict):
                 continue
@@ -2591,6 +2614,73 @@ def _has_relation(task: dict[str, Any], kind: str, other_id: int) -> bool:
     return any(isinstance(t, dict) and t.get("id") == other_id for t in (related.get(kind) or []))
 
 
+# How many of the newest comments are searched for a closing comment whose POST timed out.
+# The one being looked for was written seconds ago, so it is on the first page unless
+# dozens of comments landed on the same ticket in that window.
+_CLOSE_REREAD_COMMENTS = 50
+
+
+def _is_ambiguous(exc: BaseException) -> bool:
+    """True if a failed write may still have landed.
+
+    ``request`` raises status 0 when the request never completed: a timeout or a dropped
+    connection. Vikunja may have applied the write before the response was lost, so status
+    0 on a write means "unknown", not "failed". Any HTTP status means Vikunja answered, and
+    its answer is definite.
+    """
+    return isinstance(exc, VikunjaAPIError) and exc.status_code == 0
+
+
+async def _find_closing_comment(task_id: int, body: str, token: str) -> dict[str, Any] | None:
+    """The newest comment on ``task_id`` whose stored body is ``body``, or ``None``.
+
+    Used only after a comment POST timed out, to learn whether it landed. A match may also
+    be an earlier close attempt with the same verdict and evidence. Either way the ticket
+    carries that closing comment, which is the state the caller asked for.
+    """
+    result = await request(
+        "GET",
+        f"/tasks/{task_id}/comments",
+        token,
+        params={"order_by": "desc", "per_page": _CLOSE_REREAD_COMMENTS, "page": 1},
+    )
+    for comment in _unwrap_items(result):
+        if isinstance(comment, dict) and comment.get("comment") == body:
+            return comment
+    return None
+
+
+async def _post_closing_comment(task_id: int, body: str, token: str) -> dict[str, Any]:
+    """POST the closing comment. After a timeout, re-read to find out whether it landed.
+
+    Raising from here has to mean "no closing comment was written", because that is what
+    ``task_close`` tells its caller a raise means, and a caller who believes it will retry
+    and post a second one. So on an ambiguous failure the comments are read back: found
+    means posted and the close continues, not found means not posted and the error is
+    raised. If the read-back fails too, the error says plainly that the outcome is unknown.
+    """
+    try:
+        comment = await request("POST", f"/tasks/{task_id}/comments", token, json={"comment": body})
+    except VikunjaAPIError as exc:
+        if not _is_ambiguous(exc):
+            raise
+        try:
+            found = await _find_closing_comment(task_id, body, token)
+        except Exception as reread_exc:
+            raise VikunjaAPIError(
+                0,
+                f"task {task_id}: the closing comment POST did not complete ({exc.message}) "
+                f"and reading the comments back also failed ({reread_exc}). The comment "
+                "may or may not exist. Check comment_list before retrying, or a retry may "
+                "post it twice.",
+            ) from exc
+        if found is None:
+            raise
+        log.info("vikunja_close_comment_found_after_timeout", task_id=task_id)
+        return found
+    return comment if isinstance(comment, dict) else {}
+
+
 async def _close_task(
     task_id: int, verdict: str, evidence: str, target: int | None, token: str
 ) -> dict[str, Any]:
@@ -2603,6 +2693,13 @@ async def _close_task(
     Once the comment is posted, nothing raises. A failure after it returns the partial
     outcome, ``failed_step`` and ``error``, because an exception would tell the caller
     "nothing happened" when a comment was written.
+
+    A failure that may still have landed (a timeout, see :func:`_is_ambiguous`) is never
+    reported as definite. The comment step reads the comments back before deciding
+    (:func:`_post_closing_comment`). The relation and done steps re-read the task and
+    report the state they observe, with ``outcome: "reread"``. If that read fails too,
+    ``done`` is ``None`` and ``outcome`` is ``"unknown"``, because guessing either way is
+    what produces a duplicate comment or a sweep that counts a close that did not happen.
     """
     current = await request("GET", f"/tasks/{task_id}", token)
     if not isinstance(current, dict):
@@ -2625,13 +2722,9 @@ async def _close_task(
         # otherwise fail at the relation step, after the comment is already posted.
         await request("GET", f"/tasks/{target}", token)
 
-    comment = await request(
-        "POST",
-        f"/tasks/{task_id}/comments",
-        token,
-        json={"comment": _closing_comment_html(_closing_line(verdict, evidence))},
-    )
-    outcome["comment_id"] = comment.get("id") if isinstance(comment, dict) else None
+    body = _closing_comment_html(_closing_line(verdict, evidence))
+    comment = await _post_closing_comment(task_id, body, token)
+    outcome["comment_id"] = comment.get("id")
 
     step = "relation"
     try:
@@ -2652,7 +2745,35 @@ async def _close_task(
         log.warning("vikunja_close_partial", task_id=task_id, step=step, error=str(exc))
         outcome["failed_step"] = step
         outcome["error"] = str(exc)
+        if _is_ambiguous(exc):
+            await _reread_after_timeout(outcome, task_id, kind, target, token)
     return outcome
+
+
+async def _reread_after_timeout(
+    outcome: dict[str, Any], task_id: int, kind: str | None, target: int | None, token: str
+) -> None:
+    """Replace a timed-out step's assumed result in ``outcome`` with the observed one.
+
+    Sets ``outcome["outcome"]`` to ``"reread"`` with ``done`` and ``relation_added`` as
+    the task now shows them, or to ``"unknown"`` with ``done: None`` if the task cannot
+    be read either.
+    """
+    try:
+        current = await request("GET", f"/tasks/{task_id}", token)
+    except Exception as exc:
+        log.warning("vikunja_close_reread_failed", task_id=task_id, error=str(exc))
+        outcome["done"] = None
+        outcome["outcome"] = "unknown"
+        return
+    if not isinstance(current, dict):
+        outcome["done"] = None
+        outcome["outcome"] = "unknown"
+        return
+    outcome["done"] = bool(current.get("done"))
+    if kind is not None and target is not None and not outcome["relation_added"]:
+        outcome["relation_added"] = _has_relation(current, kind, target)
+    outcome["outcome"] = "reread"
 
 
 @tool
@@ -2689,9 +2810,18 @@ async def task_close(
     Returns `{id, identifier, done, verdict, comment_id, relation_added, already_done}`.
     - **Already done:** nothing is written and `already_done` is true.
     - **A later step failed after the comment was posted:** the reply adds `failed_step`
-      (`relation` or `done`) and `error`, and `done` is false. The ticket is open, with
-      the evidence comment on it. Retrying writes a second comment, so it is better to
-      finish the failed step with `task_relation_add` or `task_update(done=true)`.
+      (`relation` or `done`) and `error`. If Vikunja refused the step, `done` is false
+      and the ticket is open, with the evidence comment on it. Retrying writes a second
+      comment, so it is better to finish the failed step with `task_relation_add` or
+      `task_update(done=true)`.
+    - **A step timed out** (Vikunja may have applied it anyway): the task is read back.
+      `done` and `relation_added` then report what the task shows, and `outcome` is
+      `"reread"`. If that read fails too, `done` is `null` and `outcome` is `"unknown"`:
+      check with `task_get` before doing anything else.
+    - **The comment itself** failing raises, and a raise means no closing comment was
+      written. After a timeout on the comment the comments are read back first. A
+      comment that landed lets the close continue, and if the read-back fails the error
+      says the comment may exist.
 
     This is an explicit, per-ticket decision by its caller. Nothing here closes a ticket
     because a PR merged (see `task_link_commit`).

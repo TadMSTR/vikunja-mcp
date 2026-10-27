@@ -66,6 +66,9 @@ class Upstream:
 @pytest.fixture
 def upstream(monkeypatch):
     fake = Upstream()
+    # A tiny page size, so a multi-page walk takes a handful of fixture rows rather than
+    # thousands. The real value is pinned by test_page_size_is_the_v2_maximum.
+    monkeypatch.setattr(server, "_MAX_PAGE_SIZE", 2)
     monkeypatch.setattr(server, "request", fake)
     monkeypatch.setattr(server, "caller_token", lambda: "TOK")
     return fake
@@ -129,7 +132,7 @@ async def test_export_pages_through_every_page_and_count_matches(upstream):
     assert upstream.calls() == [("GET", "/tasks")] * 3
     params = [kwargs["params"] for _, _, kwargs in upstream.sent]
     assert [p["page"] for p in params] == [1, 2, 3]
-    assert {p["per_page"] for p in params} == {1000}
+    assert {p["per_page"] for p in params} == {server._MAX_PAGE_SIZE}
     assert {(p["sort_by"], p["order_by"]) for p in params} == {("id", "asc")}
     assert all(kwargs["unwrap_list"] is False for _, _, kwargs in upstream.sent)
 
@@ -176,7 +179,7 @@ async def test_export_restarts_once_when_the_set_moves_and_then_succeeds(upstrea
 
 
 async def test_export_gives_up_when_the_set_keeps_moving(upstream):
-    counter = iter(range(100))
+    counter = iter(range(3, 100))
     upstream.on(
         "GET",
         "/tasks",
@@ -186,6 +189,43 @@ async def test_export_gives_up_when_the_set_keeps_moving(upstream):
     with pytest.raises(VikunjaAPIError, match="changed while it was being paged"):
         await call(server.tasks_export, project_id=7)
     assert len(upstream.calls()) == 2 * server._EXPORT_ATTEMPTS
+
+
+def test_page_size_is_the_v2_maximum():
+    # v2's schema caps per_page at 1000 and answers 1001 with a 422 (measured live).
+    assert server._MAX_PAGE_SIZE == 1000
+
+
+async def test_export_refuses_a_page_count_its_total_does_not_need(upstream):
+    # F-02: an envelope claiming 10**9 pages for 0 rows drove one request per claimed page.
+    upstream.on("GET", "/tasks", lambda kw: _envelope([], total=0, total_pages=10**9))
+
+    with pytest.raises(VikunjaAPIError, match="does not match its own total"):
+        await call(server.tasks_export, project_id=7)
+    assert len(upstream.calls()) == 1
+
+
+async def test_export_refuses_a_page_count_that_moves_between_pages(upstream):
+    pages = [
+        _envelope(_tasks([1, 2]), total=4, total_pages=2, page=1),
+        _envelope(_tasks([3, 4]), total=4, total_pages=3, page=2),
+    ]
+    upstream.on("GET", "/tasks", _pager(pages))
+
+    with pytest.raises(VikunjaAPIError, match="total_pages 2 -> 3"):
+        await call(server.tasks_export, project_id=7)
+    assert len(upstream.calls()) == 2 * server._EXPORT_ATTEMPTS
+
+
+async def test_export_refuses_an_empty_page_before_total_is_reached(upstream):
+    pages = [
+        _envelope(_tasks([1, 2]), total=4, total_pages=2, page=1),
+        _envelope([], total=4, total_pages=2, page=2),
+    ]
+    upstream.on("GET", "/tasks", _pager(pages))
+
+    with pytest.raises(VikunjaAPIError, match="page 2 was empty with 2 of 4 rows read"):
+        await call(server.tasks_export, project_id=7)
 
 
 async def test_export_refuses_an_id_that_arrives_twice(upstream):
@@ -506,7 +546,7 @@ async def test_close_relation_failure_reports_steps_and_does_not_close(upstream)
 
 
 async def test_close_done_failure_reports_the_relation_that_did_land(upstream):
-    _close_routes(upstream, target=480, done=VikunjaAPIError(0, "timeout"))
+    _close_routes(upstream, target=480, done=VikunjaAPIError(503, "unavailable"))
 
     out = await call(
         server.task_close, task_id=473, verdict="duplicate", evidence="dup", duplicate_of=480
@@ -514,6 +554,95 @@ async def test_close_done_failure_reports_the_relation_that_did_land(upstream):
 
     assert (out["failed_step"], out["relation_added"], out["done"]) == ("done", True, False)
     assert out["comment_id"] == 9001
+    # A definite HTTP refusal is not re-read: Vikunja said no.
+    assert "outcome" not in out
+    assert upstream.calls().count(("GET", "/tasks/473")) == 1
+
+
+def _reads_of_task(task_after: dict | BaseException):
+    """GET /tasks/473: the open task on the first read, ``task_after`` on every later one."""
+    reads = iter([_open_task()])
+    return lambda kw: next(reads, task_after)
+
+
+async def test_close_done_timeout_reports_the_state_it_reads_back(upstream):
+    # F-03: the PATCH timed out but landed. Reporting `done: false` would be wrong.
+    _close_routes(upstream, done=VikunjaAPIError(0, "timeout"))
+    upstream.on("GET", "/tasks/473", _reads_of_task({**_open_task(), "done": True}))
+
+    out = await call(server.task_close, task_id=473, verdict="obsolete", evidence="gone")
+
+    assert out == {
+        "id": 473,
+        "identifier": "#454",
+        "done": True,
+        "verdict": "obsolete",
+        "comment_id": 9001,
+        "relation_added": False,
+        "already_done": False,
+        "failed_step": "done",
+        "error": "Vikunja API error 0: timeout",
+        "outcome": "reread",
+    }
+
+
+async def test_close_relation_timeout_reads_back_whether_the_relation_landed(upstream):
+    _close_routes(upstream, target=480, relation=VikunjaAPIError(0, "timeout"))
+    landed = _open_task(related_tasks={"duplicateof": [{"id": 480}]})
+    upstream.on("GET", "/tasks/473", _reads_of_task(landed))
+
+    out = await call(
+        server.task_close, task_id=473, verdict="duplicate", evidence="d", duplicate_of=480
+    )
+
+    assert (out["failed_step"], out["relation_added"], out["done"]) == ("relation", True, False)
+    assert out["outcome"] == "reread"
+
+
+async def test_close_done_timeout_with_failed_reread_reports_unknown(upstream):
+    _close_routes(upstream, done=VikunjaAPIError(0, "timeout"))
+    upstream.on("GET", "/tasks/473", _reads_of_task(VikunjaAPIError(0, "still down")))
+
+    out = await call(server.task_close, task_id=473, verdict="obsolete", evidence="gone")
+
+    assert (out["done"], out["outcome"], out["failed_step"]) == (None, "unknown", "done")
+
+
+def _comments_back(*bodies: str):
+    return lambda kw: [{"id": 9100 + i, "comment": b} for i, b in enumerate(bodies)]
+
+
+async def test_close_comment_timeout_that_landed_continues_the_close(upstream):
+    # F-03: the comment POST timed out, but the comment is there. Raising would tell the
+    # caller nothing was written, and a retry would post it twice.
+    _close_routes(upstream, comment=VikunjaAPIError(0, "timeout"))
+    body = "<p>Closing: OBSOLETE \u2014 gone</p>"
+    upstream.on("GET", "/tasks/473/comments", _comments_back("<p>other</p>", body))
+
+    out = await call(server.task_close, task_id=473, verdict="obsolete", evidence="gone")
+
+    assert (out["comment_id"], out["done"]) == (9101, True)
+    assert upstream.writes() == [("POST", "/tasks/473/comments"), ("PATCH", "/tasks/473")]
+    reread = upstream.sent[2][2]["params"]
+    assert (reread["order_by"], reread["page"]) == ("desc", 1)
+
+
+async def test_close_comment_timeout_that_did_not_land_raises(upstream):
+    _close_routes(upstream, comment=VikunjaAPIError(0, "timeout"))
+    upstream.on("GET", "/tasks/473/comments", _comments_back("<p>other</p>"))
+
+    with pytest.raises(VikunjaAPIError, match="timeout"):
+        await call(server.task_close, task_id=473, verdict="obsolete", evidence="gone")
+    assert upstream.writes() == [("POST", "/tasks/473/comments")]
+
+
+async def test_close_comment_timeout_with_failed_reread_says_outcome_unknown(upstream):
+    _close_routes(upstream, comment=VikunjaAPIError(0, "timeout"))
+    upstream.on("GET", "/tasks/473/comments", lambda kw: VikunjaAPIError(0, "still down"))
+
+    with pytest.raises(VikunjaAPIError, match="may or may not exist"):
+        await call(server.task_close, task_id=473, verdict="obsolete", evidence="gone")
+    assert upstream.writes() == [("POST", "/tasks/473/comments")]
 
 
 async def test_close_comment_failure_raises_because_nothing_was_written(upstream):
@@ -774,7 +903,7 @@ async def test_task_get_include_comments_compacts_every_comment(upstream):
         },
     ]
     params = upstream.sent[1][2]["params"]
-    assert (params["order_by"], params["per_page"]) == ("asc", 1000)
+    assert (params["order_by"], params["per_page"]) == ("asc", server._MAX_PAGE_SIZE)
     assert "description" in out  # the projection is otherwise unchanged
 
 

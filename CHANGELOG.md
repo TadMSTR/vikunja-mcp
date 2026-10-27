@@ -48,6 +48,25 @@ be restarted to see the two new tools and the new parameters.
   comment as `{id, author, created, text, truncated}`, where `text` is plain text cut at
   500 characters.
 
+### Security
+- **The page walk is bounded by its own `total`** (pre-release audit, Low). The walker
+  behind `tasks_export` and `task_get(include_comments=True)` refuses three things, each
+  of which raises like the other consistency checks:
+  - a first page whose `total_pages` exceeds what `total` needs, checked before page 2 is
+    requested;
+  - a `total_pages` that changes between pages;
+  - an empty page before `total` rows have arrived.
+
+  Before this, an envelope claiming 10⁹ pages for 0 rows drove one request per claimed
+  page.
+- **`task_close` does not report a timeout as a definite failure** (pre-release audit,
+  Info). A write that times out may still have landed.
+  - After a timed-out relation or close, the task is read back and reported as observed
+    (`outcome: "reread"`), or as `done: null` with `outcome: "unknown"`.
+  - After a timed-out comment, the newest comments are searched for the closing line
+    before anything is raised. A raise therefore still means no closing comment was
+    written, and a retry can't post it twice.
+
 ### Measured (Vikunja v2.5, recorded for downstream tooling)
 - A comment, a label add, a field edit, and a relation add on a task all move that task's
   `updated`.
