@@ -461,7 +461,9 @@ The separator is a space, an em dash (U+2014), and a space.
   the response was lost. After a timed-out step `task_close` reads the task back and
   reports what it shows (`outcome: "reread"`), or `done: null` with `outcome: "unknown"`
   if it can't. A timed-out comment is looked for before anything is raised, so a raise
-  still means no closing comment was written.
+  still means no closing comment was written. Only an identical comment created within
+  30 seconds before the POST, or later, counts as the one that landed. An older one,
+  from an earlier close for example, is never adopted.
 
 The reply is `{id, identifier, done, verdict, comment_id, relation_added, already_done}`.
 

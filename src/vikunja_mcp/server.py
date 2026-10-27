@@ -904,12 +904,7 @@ async def _all_pages(path: str, token: str, params: dict[str, Any]) -> list[dict
             raise _ResultSetChanged(path, f"total {total} -> {page_total}")
         elif total_pages != first_pages:
             raise _ResultSetChanged(path, f"total_pages {first_pages} -> {total_pages}")
-        if not items and len(rows) < total:
-            # An empty page before `total` is reached cannot be followed by the missing
-            # rows in any consistent listing.
-            raise _ResultSetChanged(
-                path, f"page {page} was empty with {len(rows)} of {total} rows read"
-            )
+        kept_before = len(rows)
         for item in items:
             if not isinstance(item, dict):
                 continue
@@ -917,6 +912,15 @@ async def _all_pages(path: str, token: str, params: dict[str, Any]) -> list[dict
                 raise _ResultSetChanged(path, f"id {item.get('id')} arrived twice")
             seen.add(item.get("id"))
             rows.append(item)
+        if len(rows) == kept_before and len(rows) < total:
+            # A page that adds no row before `total` is reached cannot be followed by the
+            # missing rows in any consistent listing. Counted on rows *kept*, not items
+            # returned: a page of non-task filler is as empty as an empty page, and
+            # counting items would let it keep the walk going. This is what bounds the
+            # walk by the rows actually received, whatever `total` claims.
+            raise _ResultSetChanged(
+                path, f"page {page} added no rows with {len(rows)} of {total} read"
+            )
         page += 1
     if len(rows) != (total or 0):
         raise _ResultSetChanged(path, f"{len(rows)} rows read, upstream reported {total}")
@@ -2624,6 +2628,11 @@ def _has_relation(task: dict[str, Any], kind: str, other_id: int) -> bool:
 # dozens of comments landed on the same ticket in that window.
 _CLOSE_REREAD_COMMENTS = 50
 
+# Slack allowed between this server's clock and Vikunja's when deciding whether a comment
+# found after a timed-out POST was written by that POST. Generous enough for ordinary clock
+# drift between two hosts; short enough that a close from minutes earlier cannot match.
+_CLOSE_CLOCK_SKEW = timedelta(seconds=30)
+
 
 def _is_ambiguous(exc: BaseException) -> bool:
     """True if a failed write may still have landed.
@@ -2636,12 +2645,20 @@ def _is_ambiguous(exc: BaseException) -> bool:
     return isinstance(exc, VikunjaAPIError) and exc.status_code == 0
 
 
-async def _find_closing_comment(task_id: int, body: str, token: str) -> dict[str, Any] | None:
-    """The newest comment on ``task_id`` whose stored body is ``body``, or ``None``.
+async def _find_closing_comment(
+    task_id: int, body: str, not_before: datetime, token: str
+) -> dict[str, Any] | None:
+    """The newest comment on ``task_id`` with body ``body``, created at or after ``not_before``.
 
-    Used only after a comment POST timed out, to learn whether it landed. A match may also
-    be an earlier close attempt with the same verdict and evidence. Either way the ticket
-    carries that closing comment, which is the state the caller asked for.
+    Used only after a comment POST timed out, to learn whether it landed. The body match
+    alone is not enough: an identical closing comment written earlier (a close from before
+    the ticket was reopened, or the same line typed through ``comment_create``) would be
+    adopted as this call's comment. ``not_before`` is taken just before the POST, minus
+    :data:`_CLOSE_CLOCK_SKEW`, so only a comment from this call's window can match.
+
+    What remains: an identical comment written by someone else inside that window. Then
+    ``comment_id`` names their comment, and the ticket carries the closing line asked for.
+    The ``task_close`` docstring says so.
     """
     result = await request(
         "GET",
@@ -2650,7 +2667,10 @@ async def _find_closing_comment(task_id: int, body: str, token: str) -> dict[str
         params={"order_by": "desc", "per_page": _CLOSE_REREAD_COMMENTS, "page": 1},
     )
     for comment in _unwrap_items(result):
-        if isinstance(comment, dict) and comment.get("comment") == body:
+        if not isinstance(comment, dict) or comment.get("comment") != body:
+            continue
+        created = _parse_timestamp(comment.get("created"))
+        if created is not None and created >= not_before:
             return comment
     return None
 
@@ -2664,13 +2684,14 @@ async def _post_closing_comment(task_id: int, body: str, token: str) -> dict[str
     means posted and the close continues, not found means not posted and the error is
     raised. If the read-back fails too, the error says plainly that the outcome is unknown.
     """
+    not_before = datetime.now(UTC) - _CLOSE_CLOCK_SKEW
     try:
         comment = await request("POST", f"/tasks/{task_id}/comments", token, json={"comment": body})
     except VikunjaAPIError as exc:
         if not _is_ambiguous(exc):
             raise
         try:
-            found = await _find_closing_comment(task_id, body, token)
+            found = await _find_closing_comment(task_id, body, not_before, token)
         except Exception as reread_exc:
             raise VikunjaAPIError(
                 0,
@@ -2824,9 +2845,11 @@ async def task_close(
       `"reread"`. If that read fails too, `done` is `null` and `outcome` is `"unknown"`:
       check with `task_get` before doing anything else.
     - **The comment itself** failing raises, and a raise means no closing comment was
-      written. After a timeout on the comment the comments are read back first. A
-      comment that landed lets the close continue, and if the read-back fails the error
-      says the comment may exist.
+      written. After a timeout on the comment the comments are read back first. An
+      identical comment created in this call's window (30 s of clock slack) counts as
+      landed and the close continues. So after a timeout, `comment_id` can name an
+      identical comment someone else wrote in that window. If the read-back fails, the
+      error says the comment may exist.
 
     This is an explicit, per-ticket decision by its caller. Nothing here closes a ticket
     because a PR merged (see `task_link_commit`).

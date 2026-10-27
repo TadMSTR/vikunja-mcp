@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import copy
 import json
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
@@ -224,8 +225,23 @@ async def test_export_refuses_an_empty_page_before_total_is_reached(upstream):
     ]
     upstream.on("GET", "/tasks", _pager(pages))
 
-    with pytest.raises(VikunjaAPIError, match="page 2 was empty with 2 of 4 rows read"):
+    with pytest.raises(VikunjaAPIError, match="page 2 added no rows with 2 of 4 read"):
         await call(server.tasks_export, project_id=7)
+
+
+async def test_export_refuses_a_page_of_non_task_filler(upstream):
+    # R2-01: a page that returns items but no task rows makes no progress. Counting items
+    # instead of rows kept let 10**9 such pages walk, one request each.
+    upstream.on(
+        "GET",
+        "/tasks",
+        lambda kw: _envelope([0], total=10**12, total_pages=10**12 // server._MAX_PAGE_SIZE),
+    )
+
+    with pytest.raises(VikunjaAPIError, match="page 1 added no rows"):
+        await call(server.tasks_export, project_id=7)
+    # One request per attempt: refused on page 1 each time, never walked.
+    assert len(upstream.calls()) == server._EXPORT_ATTEMPTS
 
 
 async def test_export_refuses_an_id_that_arrives_twice(upstream):
@@ -608,8 +624,24 @@ async def test_close_done_timeout_with_failed_reread_reports_unknown(upstream):
     assert (out["done"], out["outcome"], out["failed_step"]) == (None, "unknown", "done")
 
 
-def _comments_back(*bodies: str):
-    return lambda kw: [{"id": 9100 + i, "comment": b} for i, b in enumerate(bodies)]
+def _comments_back(*bodies: str, created: str | None = None):
+    """Comments as the read-back sees them, created now unless ``created`` says otherwise."""
+    stamp = created or f"{datetime.now(UTC):%Y-%m-%dT%H:%M:%SZ}"
+    return lambda kw: [
+        {"id": 9100 + i, "comment": b, "created": stamp} for i, b in enumerate(bodies)
+    ]
+
+
+async def test_close_comment_timeout_never_adopts_an_older_identical_comment(upstream):
+    # R2-02: an identical closing comment from an earlier close (before a reopen, say) is
+    # not this call's comment. Adopting it would mark the ticket done on old evidence.
+    _close_routes(upstream, comment=VikunjaAPIError(0, "timeout"))
+    body = "<p>Closing: OBSOLETE \u2014 gone</p>"
+    upstream.on("GET", "/tasks/473/comments", _comments_back(body, created="2025-01-01T00:00:00Z"))
+
+    with pytest.raises(VikunjaAPIError, match="timeout"):
+        await call(server.task_close, task_id=473, verdict="obsolete", evidence="gone")
+    assert upstream.writes() == [("POST", "/tasks/473/comments")]
 
 
 async def test_close_comment_timeout_that_landed_continues_the_close(upstream):

@@ -65,7 +65,11 @@ be restarted to see the two new tools and the new parameters.
     (`outcome: "reread"`), or as `done: null` with `outcome: "unknown"`.
   - After a timed-out comment, the newest comments are searched for the closing line
     before anything is raised. A raise therefore still means no closing comment was
-    written, and a retry can't post it twice.
+    written, and a retry can't post it twice. Only a comment created in this call's
+    window (30 s of clock slack) can match, so an identical older one is never adopted.
+- **The page walk must make progress on rows kept, not items returned** (re-check, Info).
+  A page that adds no task row before `total` is reached is refused, so a page of
+  non-object filler can no longer keep a walk going.
 
 ### Measured (Vikunja v2.5, recorded for downstream tooling)
 - A comment, a label add, a field edit, and a relation add on a task all move that task's
