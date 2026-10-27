@@ -37,12 +37,12 @@ classifiers = [
 # Note there is no renovate.json or dependabot.yml in this repo, so nothing will propose
 # bumps automatically. Raising these is a deliberate act, which is the intent.
 dependencies = [
-    "fastmcp>=4.0.10,<5",
+    "fastmcp>=4.1.1,<5",
     "httpx>=0.28,<0.29",
-    "pydantic>=2.13,<3",
+    "pydantic>=2.14.0,<3",
     "pydantic-settings>=2.15,<3",
     "structlog>=26.1,<27",
-    "markdown>=3.10,<4",
+    "markdown>=3.11,<4",
     "nh3>=0.3,<0.4",
     # Direct import (Request/JSONResponse for the /health custom route), not just a
     # fastmcp transitive — declared so a future fastmcp that vendors or drops it fails
@@ -53,8 +53,8 @@ dependencies = [
 
 [project.optional-dependencies]
 telemetry = [
-    "opentelemetry-sdk>=1.45.0,<2",
-    "opentelemetry-exporter-otlp-proto-grpc>=1.44,<2",
+    "opentelemetry-sdk>=1.45.1,<2",
+    "opentelemetry-exporter-otlp-proto-grpc>=1.45.1,<2",
     # forge runs influxdb:3-core — the v3 write API (imports as influxdb_client_3).
     # Pre-1.0 and moving fast: capped at the next minor, so an upgrade is a visible bump
     # rather than something that arrives with an unrelated rebuild. This extra IS
@@ -72,7 +72,7 @@ dev = [
     # Already exact, and the reason lint never drifted while everything else did. The
     # bounds above generalise this, they do not replace it: a formatter must be exact
     # because two patch versions can disagree about whitespace and fail `--check`.
-    "ruff==0.16.10",
+    "ruff==0.17.2",
 ]
 
 [project.urls]
