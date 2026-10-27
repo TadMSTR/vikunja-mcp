@@ -6,6 +6,79 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.13.0] — 2026-10-27
+
+Tools for incremental ticket sweeps. Every default is unchanged, so existing callers see no
+difference. A proxy that froze the tool list at start (scoped-mcp's `mcp_proxy` does) must
+be restarted to see the two new tools and the new parameters.
+
+### Added
+- **`tasks_export(project_id, include_done=true, since=None)`**: every task in a project
+  as one compact row each (`id`, `identifier`, `title`, `done`, `done_at`, `created`,
+  `updated`, `priority`, `labels`, `created_by`, `relations`, `linked_refs`), with no
+  description.
+  - Complete or it fails. It pages at 1,000, the v2 maximum, and checks rows against
+    `total`. An error on any page raises. A result set that changes mid-walk is retried
+    once, then raises.
+  - `since` filters `updated >=` on the server and is echoed back in UTC.
+  - Exclusions come from `VIKUNJA_SUMMARY_EXCLUDE_IDS` through the same helper
+    `backlog_summary` now uses.
+  - Measured: two requests and ~0.55 MB for a 1,286-task project.
+- **`task_close(task_id, verdict, evidence, duplicate_of=None, superseded_by=None)`**:
+  comment, relation, close, in that order, in one call.
+  - The comment's first line is the parsed contract
+    `Closing: <VERDICT> — <evidence>` (space, em dash U+2014, space), stored escaped
+    rather than rendered so it reads back byte for byte.
+  - `verdict` is `resolved`, `superseded`, `duplicate`, `obsolete` or `wontfix`.
+    `duplicate` requires `duplicate_of` (adds `duplicateof`). `superseded_by` adds
+    `related`.
+  - Every argument, and the relation target's existence, is checked before any write.
+  - Already done: a no-op.
+  - A failure after the comment is posted returns `failed_step` and `error` instead of
+    raising.
+  - Added to the audit-log tool set and to ticket-reference resolution (`duplicate_of` and
+    `superseded_by` accept `#N (id M)`).
+- **`return_mode="minimal"`** on `task_update` (`{id, identifier, done, updated}`),
+  `tasks_bulk_update` (`{count, ids, fields}` from Vikunja's reply), `comment_create`
+  (`{id, created}`), `task_label_add` (`{task_id, label_id, created}`) and
+  `task_relation_add` (`{task_id, other_task_id, relation_kind, created}`). An unknown mode
+  is refused before any call.
+- **`task_get(fields=[...], include_comments=false)`**. `fields` returns only the named
+  keys plus `id`, listing absent names in `unknown_fields`. `include_comments` adds every
+  comment as `{id, author, created, text, truncated}`, where `text` is plain text cut at
+  500 characters.
+
+### Security
+- **The page walk is bounded by its own `total`** (pre-release audit, Low). The walker
+  behind `tasks_export` and `task_get(include_comments=True)` refuses three things, each
+  of which raises like the other consistency checks:
+  - a first page whose `total_pages` exceeds what `total` needs, checked before page 2 is
+    requested;
+  - a `total_pages` that changes between pages;
+  - an empty page before `total` rows have arrived.
+
+  Before this, an envelope claiming 10⁹ pages for 0 rows drove one request per claimed
+  page.
+- **`task_close` does not report a timeout as a definite failure** (pre-release audit,
+  Info). A write that times out may still have landed.
+  - After a timed-out relation or close, the task is read back and reported as observed
+    (`outcome: "reread"`), or as `done: null` with `outcome: "unknown"`.
+  - After a timed-out comment, the newest comments are searched for the closing line
+    before anything is raised. A raise therefore still means no closing comment was
+    written, and a retry can't post it twice. Only a comment created in this call's
+    window (30 s of clock slack) can match, so an identical older one is never adopted.
+- **The page walk must make progress on rows kept, not items returned** (re-check, Info).
+  A page that adds no task row before `total` is reached is refused, so a page of
+  non-object filler can no longer keep a walk going.
+
+### Measured (Vikunja v2.5, recorded for downstream tooling)
+- A comment, a label add, a field edit, and a relation add on a task all move that task's
+  `updated`.
+- A relation added from the other task does **not** move it.
+- `updated`, `created` and `done_at` all filter server-side with `>`/`>=` and an RFC 3339
+  string.
+- `per_page` is capped at 1000 (1001 returns 422).
+
 ## [0.12.0] — 2026-10-21
 
 ### Breaking

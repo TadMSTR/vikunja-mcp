@@ -39,6 +39,7 @@ import base64
 import binascii
 import contextlib
 import functools
+import html
 import inspect
 import ipaddress
 import os
@@ -47,6 +48,7 @@ import socket
 import sys
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
+from html.parser import HTMLParser
 from typing import Any
 from urllib.parse import quote, urlparse
 
@@ -159,6 +161,41 @@ def _drop_none(**fields: Any) -> dict[str, Any]:
     but v2 offers ``PATCH`` and task updates now go through it like everything else.
     """
     return {k: v for k, v in fields.items() if v is not None}
+
+
+# `return_mode` values accepted by the write tools that offer it. "full" is the default
+# everywhere, so a caller that never passes it gets exactly the response it always got.
+_RETURN_MODES = ("full", "minimal")
+
+# What a minimal reply carries for a task. Enough to confirm the write landed on the task
+# the caller meant (`id` + `identifier`), whether it is closed, and when it last moved —
+# which is what a sweep records. Not the description: the 2026-10 sweep's first fifteen
+# `task_update` closes cost ~60k tokens of bodies the caller had not asked to see.
+_MINIMAL_TASK_FIELDS = ("id", "identifier", "done", "updated")
+
+
+def _check_return_mode(return_mode: str) -> None:
+    """Refuse an unknown ``return_mode`` before any upstream call. ``ValueError``.
+
+    Refused rather than treated as "full": a typo'd ``"minmal"`` that silently returned the
+    whole ticket would cost exactly the tokens the caller asked not to spend, and nothing
+    would tell them why.
+    """
+    if return_mode not in _RETURN_MODES:
+        raise ValueError(
+            f"return_mode must be one of {', '.join(_RETURN_MODES)}; got {return_mode!r}"
+        )
+
+
+def _pick(result: Any, keys: tuple[str, ...]) -> Any:
+    """``result`` reduced to ``keys``, or ``result`` untouched if it is not a dict.
+
+    Every key is present in the output, ``None`` when upstream did not send it, so a
+    minimal reply has the same key set every time and a consumer can rely on it.
+    """
+    if not isinstance(result, dict):
+        return result
+    return {key: result.get(key) for key in keys}
 
 
 # A line that begins with a ticket reference — `#333 ...` or `- #333 ...` — is parsed by
@@ -722,6 +759,206 @@ def _project(result: Any, projection: Callable[[dict[str, Any]], dict[str, Any]]
     return apply(result)
 
 
+# v2's `per_page` ceiling on every list endpoint: the OpenAPI schema says `maximum: 1000`,
+# and 1001 is refused with a 422 (measured live 2026-10-27). Used by the tools that page
+# through a whole collection, where a larger page is strictly fewer round-trips.
+_MAX_PAGE_SIZE = 1000
+
+# How much of each comment `task_get(include_comments=True)` returns. A sweep checker
+# reads a comment to see whether it says "fixed in <sha>" or "Closing: ..."; both are in
+# the opening lines, and a comment that pastes a whole log is exactly the one not to inline.
+_COMMENT_PREVIEW_CHARS = 500
+
+# Tags after which the text that follows belongs on a new line. Without them the
+# `<p>a</p><p>b</p>` that every rendered comment is made of collapses to "ab".
+_BLOCK_TAGS = frozenset(
+    {"p", "br", "li", "div", "pre", "tr", "blockquote", "h1", "h2", "h3", "h4", "h5", "h6"}
+)
+
+
+class _TextExtractor(HTMLParser):
+    """Collect the text of an HTML fragment, one line per block element."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag in _BLOCK_TAGS:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in _BLOCK_TAGS:
+            self.parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        self.parts.append(data)
+
+
+def _html_text(fragment: Any) -> str:
+    """The plain text of a stored rich-text field, entities decoded, blank lines dropped.
+
+    Comments are stored as HTML, so the raw field reads ``<p>Closing: RESOLVED &amp;
+    ...</p>``. A consumer matching on the first line wants the text, and asking each one to
+    strip tags itself is how two consumers end up disagreeing about what a comment says.
+    """
+    if not isinstance(fragment, str) or not fragment:
+        return ""
+    parser = _TextExtractor()
+    parser.feed(fragment)
+    parser.close()
+    lines = (line.strip() for line in "".join(parser.parts).split("\n"))
+    return "\n".join(line for line in lines if line)
+
+
+def _compact_comment(comment: dict[str, Any]) -> dict[str, Any]:
+    """One comment as ``{id, author, created, text, truncated}``.
+
+    ``author`` is the username alone: the full user object repeats on every comment and
+    says nothing a sweep needs. ``truncated`` is explicit so a cut-off preview cannot be
+    mistaken for the whole comment.
+    """
+    author = comment.get("author")
+    text = _html_text(comment.get("comment"))
+    return {
+        "id": comment.get("id"),
+        "author": author.get("username") if isinstance(author, dict) else None,
+        "created": comment.get("created"),
+        "text": text[:_COMMENT_PREVIEW_CHARS],
+        "truncated": len(text) > _COMMENT_PREVIEW_CHARS,
+    }
+
+
+class _ResultSetChanged(VikunjaAPIError):
+    """The set being paged through changed between two pages.
+
+    v2 paginates by offset, so a task created, deleted or newly matching mid-walk shifts
+    every later row by one: one row is read twice and another never. That is detectable
+    (``total`` moves, or an id repeats) but not repairable from inside the walk, so the
+    caller restarts it — see ``tasks_export``.
+    """
+
+    def __init__(self, path: str, detail: str) -> None:
+        super().__init__(
+            0,
+            f"{path}: the result set changed while it was being paged ({detail}), so the "
+            "pages do not add up to one consistent list",
+        )
+
+
+async def _all_pages(path: str, token: str, params: dict[str, Any]) -> list[dict]:
+    """Every row of a v2 list endpoint, checked against the ``total`` upstream reported.
+
+    Pages at :data:`_MAX_PAGE_SIZE` until ``total_pages`` is reached. Any upstream error
+    propagates: a caller of this wants *every* row, and a list that silently stopped at the
+    page that failed is the truncation this exists to avoid.
+
+    Raises:
+        VikunjaAPIError: on any upstream failure, or on a body that is not a list envelope
+            (no readable ``total``/``total_pages``) — a page whose extent cannot be read
+            cannot be shown to be the last one.
+            The same applies to a first page claiming more pages than its ``total``
+            needs: that is refused before page 2, so an inconsistent envelope cannot drive
+            an unbounded walk.
+        _ResultSetChanged: ``total`` or ``total_pages`` moved between pages, a page came
+            back empty before ``total`` was reached, an id arrived twice, or the rows do
+            not add up to ``total``.
+    """
+    rows: list[dict] = []
+    seen: set[Any] = set()
+    total: int | None = None
+    total_pages = first_pages = 1
+    page = 1
+    while page <= total_pages:
+        body = await request(
+            "GET",
+            path,
+            token,
+            params={**params, "per_page": _MAX_PAGE_SIZE, "page": page},
+            unwrap_list=False,
+        )
+        try:
+            page_total = int(body["total"])
+            total_pages = int(body["total_pages"])
+            items = body["items"] or []
+        except (KeyError, TypeError, ValueError) as exc:
+            raise VikunjaAPIError(
+                0,
+                f"{path} page {page} was not a paginated list envelope, so whether it is "
+                "the last page cannot be read; refusing to return a possibly partial list",
+            ) from exc
+        if total is None:
+            total, first_pages = page_total, total_pages
+            # The walk is bounded by `total_pages`, and that number comes from upstream. A
+            # body claiming far more pages than `total` needs would drive one request per
+            # claimed page before the row-count check after the loop could object, so it is
+            # checked against `total` here, before page 2 is requested.
+            if total_pages > max(1, -(-total // _MAX_PAGE_SIZE)):
+                raise VikunjaAPIError(
+                    0,
+                    f"{path}: upstream reported {total_pages} pages for {total} rows at "
+                    f"{_MAX_PAGE_SIZE} per page; refusing to walk an extent that does not "
+                    "match its own total",
+                )
+        elif page_total != total:
+            raise _ResultSetChanged(path, f"total {total} -> {page_total}")
+        elif total_pages != first_pages:
+            raise _ResultSetChanged(path, f"total_pages {first_pages} -> {total_pages}")
+        kept_before = len(rows)
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            if item.get("id") in seen:
+                raise _ResultSetChanged(path, f"id {item.get('id')} arrived twice")
+            seen.add(item.get("id"))
+            rows.append(item)
+        if len(rows) == kept_before and len(rows) < total:
+            # A page that adds no row before `total` is reached cannot be followed by the
+            # missing rows in any consistent listing. Counted on rows *kept*, not items
+            # returned: a page of non-task filler is as empty as an empty page, and
+            # counting items would let it keep the walk going. This is what bounds the
+            # walk by the rows actually received, whatever `total` claims.
+            raise _ResultSetChanged(
+                path, f"page {page} added no rows with {len(rows)} of {total} read"
+            )
+        page += 1
+    if len(rows) != (total or 0):
+        raise _ResultSetChanged(path, f"{len(rows)} rows read, upstream reported {total}")
+    return rows
+
+
+async def _comments_for(task_id: int, token: str) -> list[dict[str, Any]]:
+    """Every comment on a task, oldest first, compacted."""
+    rows = await _all_pages(f"/tasks/{task_id}/comments", token, {"order_by": "asc"})
+    return [_compact_comment(row) for row in rows]
+
+
+def _check_fields(fields: Any) -> None:
+    """Refuse a ``fields`` argument that is not a list of non-empty strings. ``ValueError``."""
+    if not isinstance(fields, list) or not all(isinstance(f, str) and f for f in fields):
+        raise ValueError(f"fields must be a list of field names; got {fields!r}")
+
+
+def _select_fields(task: dict[str, Any], fields: list[str]) -> dict[str, Any]:
+    """``task`` reduced to ``id`` plus the requested ``fields``.
+
+    ``id`` is always kept, so a projected reply still says which task it describes. A
+    requested field the task does not carry is named in ``unknown_fields`` rather than
+    returned as ``None``: ``None`` would read as "this field is empty", which is a claim
+    about the ticket, where the truth is a claim about the request.
+    """
+    out = {"id": task.get("id")}
+    unknown = []
+    for name in fields:
+        if name in task:
+            out[name] = task[name]
+        elif name != "id":
+            unknown.append(name)
+    if unknown:
+        out["unknown_fields"] = unknown
+    return out
+
+
 @tool
 async def task_list(
     page: int = 1,
@@ -792,7 +1029,12 @@ async def task_search(query: str, page: int = 1, per_page: int = 50, verbose: bo
 
 
 @tool
-async def task_get(task_id: int | str, verbose: bool = False) -> dict:
+async def task_get(
+    task_id: int | str,
+    verbose: bool = False,
+    fields: list[str] | None = None,
+    include_comments: bool = False,
+) -> dict:
     """Get a single task, including its description, labels and assignees.
 
     `task_id` accepts the global id (`473`), the ticket number (`"#454"`), or the
@@ -814,9 +1056,34 @@ async def task_get(task_id: int | str, verbose: bool = False) -> dict:
     description as a claim about the past and verify before acting on it. Both fields are
     `null` when `updated` is missing or is Vikunja's `0001-01-01` zero value; `null` means
     unknown, not fresh.
+
+    **`fields`** returns only the named keys, plus `id` (always). Use it when you need one
+    or two facts — `fields=["done", "updated", "labels"]` — rather than the description.
+    A name the task does not carry is listed in `unknown_fields`, never returned as
+    `null`. Derived keys (`url`, `stale`, `linked_refs`, ...) are selectable like any other.
+
+    **`include_comments`** adds `comments`: every comment, oldest first, as
+    `{id, author, created, text, truncated}`. `author` is the username; `text` is the
+    comment's plain text (HTML stripped, entities decoded) cut to the first 500
+    characters, and `truncated` says whether it was cut. It saves the separate
+    `comment_list` call a reviewer makes for every ticket. `comments` is kept when
+    `fields` is also given.
     """
-    result = await request("GET", f"/tasks/{task_id}", caller_token())
-    return _project(result, _with_staleness if verbose else _compact_task)
+    if fields is not None:
+        _check_fields(fields)
+    token = caller_token()
+    result = await request("GET", f"/tasks/{task_id}", token)
+    result = _project(result, _with_staleness if verbose else _compact_task)
+    if not isinstance(result, dict):
+        return result
+    if include_comments:
+        result["comments"] = await _comments_for(task_id, token)
+    if fields is not None:
+        selected = _select_fields(result, fields)
+        if include_comments:
+            selected["comments"] = result["comments"]
+        return selected
+    return result
 
 
 # How many candidate rows an idempotency lookup will confirm before giving up. The filter
@@ -1087,6 +1354,18 @@ async def _all_labels() -> tuple[list[dict], int]:
     return labels, max(total, len(labels))
 
 
+def _exclusion_predicates(excluded: list[int]) -> list[str]:
+    """One ``id != N`` filter predicate per ``VIKUNJA_SUMMARY_EXCLUDE_IDS`` entry.
+
+    Shared by ``backlog_summary`` and ``tasks_export`` so the two can never disagree about
+    which tasks are not real tickets. A deployment's vocabulary anchor (see
+    ``config.summary_exclude_ids``) counted by one and exported by the other would make the
+    export's ``count`` and the summary's ``total`` differ by exactly the anchor, which is
+    the cross-check a sweep runs first.
+    """
+    return [f"id != {task_id}" for task_id in excluded]
+
+
 def _unwrap_items(result: Any) -> list[Any]:
     """The rows from a list response, whether or not it arrived in the envelope."""
     if isinstance(result, dict) and "items" in result:
@@ -1161,7 +1440,7 @@ async def backlog_summary(
         for p in (
             f"project = {project_id}" if project_id is not None else "",
             filter,
-            *(f"id != {task_id}" for task_id in excluded),
+            *_exclusion_predicates(excluded),
         )
         if p
     ]
@@ -1317,6 +1596,175 @@ async def backlog_summary(
         "labels_truncated": bool(labels_not_counted or never_fetched or unbucketable),
         "calls": len(_PRIORITIES) + len(kept_titles) + 5 + label_pages,
         "notes": notes,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Export — every ticket in a project, compactly
+# ---------------------------------------------------------------------------
+
+# How many times `tasks_export` walks the pages before giving up on a moving result set.
+# One restart absorbs the ordinary case — someone filed or closed a ticket during the
+# walk — and a set still moving on the second pass is better reported than chased.
+_EXPORT_ATTEMPTS = 2
+
+
+def _timestamp_or_none(value: Any) -> Any:
+    """``value`` unchanged if it is a real timestamp, ``None`` for absent or zero-valued.
+
+    ``done_at`` on an open task is Vikunja's ``0001-01-01T00:00:00Z``. Exported verbatim it
+    sorts before every real date, and a script asking "closed since X?" has to know the
+    sentinel to avoid misreading it.
+    """
+    return value if _parse_timestamp(value) is not None else None
+
+
+def _normalise_since(since: str) -> str:
+    """``since`` as a UTC ``YYYY-MM-DDTHH:MM:SSZ`` string, or ``ValueError``.
+
+    The value is interpolated into a filter expression, so it is **re-rendered** from the
+    parsed datetime rather than passed through: whatever the caller wrote, what reaches
+    the filter can only be digits, dashes, colons, ``T`` and ``Z``. Sub-second precision is
+    dropped, which widens the window by under a second (``>=`` is inclusive) and never
+    narrows it.
+    """
+    parsed = _parse_timestamp(since)
+    if parsed is None:
+        raise ValueError(
+            f"since must be an ISO-8601 / RFC 3339 timestamp, e.g. 2026-10-27T20:00:00Z; "
+            f"got {since!r}"
+        )
+    return f"{parsed.astimezone(UTC):%Y-%m-%dT%H:%M:%SZ}"
+
+
+def _relation_ids(related: Any) -> dict[str, list[Any]]:
+    """``related_tasks`` as ``{kind: [id, ...]}``, empty kinds dropped."""
+    if not isinstance(related, dict):
+        return {}
+    out: dict[str, list[Any]] = {}
+    for kind, entries in related.items():
+        ids = [t.get("id") for t in (entries or []) if isinstance(t, dict) and t.get("id")]
+        if ids:
+            out[kind] = ids
+    return out
+
+
+# The export row's keys, in order. Every row carries every key, so a consumer can read
+# the export as a table: `None` / `[]` / `{}` mean "none", never "not fetched".
+_EXPORT_ROW_FIELDS = (
+    "id",
+    "identifier",
+    "title",
+    "done",
+    "done_at",
+    "created",
+    "updated",
+    "priority",
+    "labels",
+    "created_by",
+    "relations",
+    "linked_refs",
+)
+
+
+def _export_row(task: dict[str, Any]) -> dict[str, Any]:
+    """One ticket as an export row: what a sweep decides on, without the description.
+
+    ``linked_refs`` is read from the description (where ``task_link_commit`` stores it)
+    before the description is dropped, through the same re-validating parser ``task_get``
+    uses. Unlike ``task_get``, an export row carries the key even when it is empty: in a
+    fixed-shape table, an absent column is a schema change, not a signal. ``[]`` here
+    means "no backlink marker present", which is all it can mean.
+    """
+    labels = [label.get("title") for label in (task.get("labels") or []) if isinstance(label, dict)]
+    created_by = task.get("created_by")
+    return {
+        "id": task.get("id"),
+        "identifier": task.get("identifier"),
+        "title": task.get("title"),
+        "done": task.get("done"),
+        "done_at": _timestamp_or_none(task.get("done_at")),
+        "created": task.get("created"),
+        "updated": task.get("updated"),
+        "priority": task.get("priority"),
+        "labels": labels,
+        "created_by": created_by.get("username") if isinstance(created_by, dict) else None,
+        "relations": _relation_ids(task.get("related_tasks")),
+        "linked_refs": _linked_refs(task).get("linked_refs", []),
+    }
+
+
+async def _export_rows(filter_expr: str, token: str) -> list[dict[str, Any]]:
+    """Every task matching ``filter_expr`` as export rows, restarting once if the set moves.
+
+    Sorted by ``id`` so the walk has a stable order: a ticket *edited* mid-walk keeps its
+    position. What can still move the set is a ticket created, deleted or (with a
+    ``since``/``done`` predicate) newly matching, which :func:`_all_pages` detects.
+    """
+    params = {"filter": filter_expr, "sort_by": "id", "order_by": "asc"}
+    for attempt in range(1, _EXPORT_ATTEMPTS + 1):
+        try:
+            tasks = await _all_pages("/tasks", token, params)
+        except _ResultSetChanged as exc:
+            log.info("vikunja_export_restarted", attempt=attempt, reason=str(exc))
+            if attempt == _EXPORT_ATTEMPTS:
+                raise
+            continue
+        return [_export_row(task) for task in tasks]
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
+@tool
+async def tasks_export(
+    project_id: int, include_done: bool = True, since: str | None = None
+) -> dict:
+    """Every task in a project as one compact row each — the input to a ticket sweep.
+
+    Returns `{project_id, generated_at, since, include_done, excluded_task_ids, count, rows}`.
+    **`rows` is complete or the call fails.** It pages through Vikunja internally (1000 per
+    page, the API's maximum) and checks the rows against the `total` Vikunja reports. There
+    is no `truncated` flag to miss: an upstream error on any page, or a result set that
+    keeps changing while it is read, raises instead of returning part of the list.
+
+    Each row: `id`, `identifier`, `title`, `done`, `done_at` (`null` while open), `created`,
+    `updated`, `priority`, `labels` (titles), `created_by` (username), `relations`
+    (`{kind: [task id, ...]}`) and `linked_refs` (the `task_link_commit` backlinks). No
+    description — `task_get` the rows you need to read.
+
+    **`since`** (ISO-8601, e.g. `2026-10-27T20:00:00Z`) keeps only tasks whose `updated` is
+    at or after it, filtered server-side. It is echoed back normalised to UTC. What moves
+    `updated`, measured on Vikunja v2.5: any field edit, a new comment, a label added, and
+    a relation added **on that task**. A relation added from the *other* task does not
+    move it, even though Vikunja shows the relation on both. So `since` finds every task
+    that was touched directly, and misses one whose only change is an inbound relation.
+
+    **`include_done=false`** exports open tasks only. Ids in `VIKUNJA_SUMMARY_EXCLUDE_IDS`
+    are left out, exactly as `backlog_summary` leaves them out, so `count` matches that
+    tool's `total` for the same scope.
+
+    **Cost and size.** One request per 1,000 tasks. On a measured 1,286-task project that
+    was two requests, at ~64 ms of Vikunja time each for a full page (v2.5). A row is
+    ~410 bytes, so that export is about 0.55 MB. That is more than most agents' inline
+    tool-result limit, and that is the intended use: the client saves the result to a
+    file, and the caller reads the file with `jq`, not into context.
+    """
+    since_norm = _normalise_since(since) if since is not None else None
+    excluded = get_settings().excluded_task_ids
+    filter_expr = _compose(
+        f"project = {project_id}",
+        "" if include_done else "done = false",
+        f'updated >= "{since_norm}"' if since_norm else "",
+        *_exclusion_predicates(excluded),
+    )
+    rows = await _export_rows(filter_expr, caller_token())
+    return {
+        "project_id": project_id,
+        "generated_at": f"{datetime.now(UTC):%Y-%m-%dT%H:%M:%SZ}",
+        "since": since_norm,
+        "include_done": include_done,
+        "excluded_task_ids": excluded,
+        "count": len(rows),
+        "rows": rows,
     }
 
 
@@ -1734,12 +2182,14 @@ async def _resolve_task_ref_kwarg(kwargs: dict[str, Any]) -> dict[str, Any]:
     rather than on whichever tools someone remembered. A tool call carrying none of these
     keys passes through untouched.
 
-    Three parameters, resolved by the same function so they cannot diverge in what they
+    Five parameters, resolved by the same function so they cannot diverge in what they
     accept:
 
     ``task_id``         every tool in ``_TASK_REF_TOOLS``
     ``other_task_id``   the far end of a relation (vikunja#458)
     ``task_ids``        the list ``tasks_bulk_update`` mutates (vikunja#459)
+    ``duplicate_of``    ``task_close``'s duplicate target
+    ``superseded_by``   ``task_close``'s superseding ticket
 
     ``other_task_id`` and ``task_ids`` were previously ``int``-only, so a ``"#452"`` was
     refused at schema validation — loud and safe, but inconsistent: the *near* end of a
@@ -1754,6 +2204,10 @@ async def _resolve_task_ref_kwarg(kwargs: dict[str, Any]) -> dict[str, Any]:
         kwargs["other_task_id"] = await _resolve_task_ref(
             kwargs["other_task_id"], field="other_task_id"
         )
+    # `task_close`'s relation targets. Optional, so an explicit None passes through.
+    for name in ("duplicate_of", "superseded_by"):
+        if kwargs.get(name) is not None:
+            kwargs[name] = await _resolve_task_ref(kwargs[name], field=name)
     if "task_ids" in kwargs:
         refs = kwargs["task_ids"]
         # A bare string is a sequence, so `for r in refs` over "#454" would iterate its
@@ -1798,6 +2252,7 @@ _TASK_REF_TOOLS = (
     "task_relation_remove",
     "task_reminders_set",
     "task_link_commit",
+    "task_close",
     "attachment_list",
     "attachment_upload",
     "attachment_delete",
@@ -1835,6 +2290,7 @@ _AUDITED_TOOLS = (
     "task_update",
     "tasks_bulk_update",
     "task_delete",
+    "task_close",
     "project_create",
     "project_delete",
     "team_create",
@@ -1937,12 +2393,18 @@ async def task_update(
     priority: int | None = None,
     due_date: str | None = None,
     percent_done: float | None = None,
+    return_mode: str = "full",
 ) -> dict:
     """Update a task. Only the fields you pass change. Set `done=true` to complete it.
 
     One `PATCH`, no read first: the fields you pass are written and every other column is
     left alone by the server (see ``_apply_task_update``).
+
+    `return_mode="minimal"` returns `{id, identifier, done, updated}` instead of the whole
+    updated task. Closing a ticket with evidence? `task_close` does the comment and the
+    close in one call.
     """
+    _check_return_mode(return_mode)
     changes = _drop_none(
         title=title,
         description=_md_to_html(description),
@@ -1951,7 +2413,8 @@ async def task_update(
         due_date=due_date,
         percent_done=percent_done,
     )
-    return await _apply_task_update(task_id, caller_token(), changes)
+    result = await _apply_task_update(task_id, caller_token(), changes)
+    return _pick(result, _MINIMAL_TASK_FIELDS) if return_mode == "minimal" else result
 
 
 def _validate_ref_url(ref_url: str) -> None:
@@ -2052,6 +2515,351 @@ async def task_link_commit(task_id: int | str, ref_type: str, ref_url: str) -> d
     )
 
 
+# ---------------------------------------------------------------------------
+# Evidence close
+# ---------------------------------------------------------------------------
+
+# Why a ticket is being closed. Closed vocabulary because a sweep counts them: "fixed" vs
+# "resolved" vs "done" as free text would split one outcome three ways.
+_CLOSE_VERDICTS = ("resolved", "superseded", "duplicate", "obsolete", "wontfix")
+
+# The relation `task_close` adds for a verdict that names another ticket.
+_CLOSE_RELATION = {"duplicate": "duplicateof", "superseded": "related"}
+
+# Long enough for "fixed in <40-char sha> (PR <url>), verified by <check>"; short enough
+# that the evidence stays a line someone reads rather than a report pasted into a comment.
+_EVIDENCE_MAX_CHARS = 1000
+
+# The separator in the closing line. An em dash (U+2014), with a space either side.
+_CLOSING_SEPARATOR = " — "
+
+
+def _closing_line(verdict: str, evidence: str) -> str:
+    """The first line of every ``task_close`` comment. **A contract — do not reformat.**
+
+    ``Closing: <VERDICT> — <evidence>``: the literal ``Closing: ``, the verdict in upper
+    case, a space, an em dash (U+2014), a space, then the evidence verbatim. Downstream
+    tooling parses exactly this, e.g. with
+    ``^Closing: (RESOLVED|SUPERSEDED|DUPLICATE|OBSOLETE|WONTFIX) — (.+)$``.
+
+    Changing a byte of this breaks every consumer silently, since their match just stops
+    finding closes. ``test_closing_line_is_byte_exact`` pins it.
+    """
+    # SECURITY[accepted]: the line has no provenance. Any caller of `comment_create` can
+    # write the same bytes, and the comment author is the same per-agent token either way.
+    # This tool only emits the line; a consumer must read it as an unverified claim by its
+    # author and join it with the task's `done`/`done_at` (and the audit log, where one is
+    # kept) before counting it as a close. Audit: 2026-10-27/ticket-lifecycle-2026-10-p1.
+    return f"Closing: {verdict.upper()}{_CLOSING_SEPARATOR}{evidence}"
+
+
+def _closing_comment_html(line: str) -> str:
+    """The comment body ``task_close`` stores: the closing line as one escaped paragraph.
+
+    **Not** rendered as markdown. Markdown would rewrite the evidence — ``fix_the_thing``
+    becomes emphasis, a backticked sha becomes ``<code>`` — so the stored text would no
+    longer be the line a parser is looking for. Escaping instead keeps the text exact, and
+    it is also the sanitisation: with ``<``, ``>`` and ``&`` escaped there is no markup in
+    the body for ``nh3`` to remove. Read back through ``task_get(include_comments=True)``,
+    the comment's ``text`` is the closing line, byte for byte.
+    """
+    return f"<p>{html.escape(line, quote=False)}</p>"
+
+
+def _check_close_args(
+    task_id: int,
+    verdict: Any,
+    evidence: Any,
+    duplicate_of: int | None,
+    superseded_by: int | None,
+) -> tuple[str, str, int | None]:
+    """Validate ``task_close``'s arguments before any upstream call.
+
+    Returns ``(verdict, evidence, relation_target)``, normalised. Every refusal here costs
+    nothing upstream, which is the point: a close that fails validation after its comment
+    is posted leaves a "Closing:" comment on a ticket that is still open.
+
+    Raises:
+        ValueError: naming the argument and what is accepted.
+    """
+    verdict = verdict.strip().lower() if isinstance(verdict, str) else verdict
+    if verdict not in _CLOSE_VERDICTS:
+        raise ValueError(f"verdict must be one of {', '.join(_CLOSE_VERDICTS)}; got {verdict!r}")
+    if not isinstance(evidence, str) or not evidence.strip():
+        raise ValueError(
+            "evidence is required: say what shows the ticket can close — a commit, a PR, a "
+            "check you ran, or the ticket that replaces it"
+        )
+    evidence = evidence.strip()
+    # `splitlines` rather than `"\n" in`: it also splits on \r, \v, \f, \x1c-\x1e, \x85,
+    # U+2028 and U+2029, any of which would end the closing line early for some parser.
+    if len(evidence.splitlines()) > 1:
+        raise ValueError(
+            "evidence must be one line: it becomes the closing line that tooling parses, "
+            "and a line break would cut it short there"
+        )
+    if len(evidence) > _EVIDENCE_MAX_CHARS:
+        raise ValueError(
+            f"evidence is {len(evidence)} characters; the limit is {_EVIDENCE_MAX_CHARS}. "
+            "Link to the long form rather than pasting it."
+        )
+    if verdict == "duplicate" and duplicate_of is None:
+        raise ValueError("verdict 'duplicate' requires duplicate_of: the ticket this duplicates")
+    if duplicate_of is not None and verdict != "duplicate":
+        raise ValueError(f"duplicate_of is only valid with verdict 'duplicate'; got {verdict!r}")
+    if superseded_by is not None and verdict != "superseded":
+        raise ValueError(f"superseded_by is only valid with verdict 'superseded'; got {verdict!r}")
+    target = duplicate_of if duplicate_of is not None else superseded_by
+    if target is not None and target == task_id:
+        raise ValueError(f"task {task_id} cannot be closed as a {verdict} of itself")
+    return verdict, evidence, target
+
+
+def _has_relation(task: dict[str, Any], kind: str, other_id: int) -> bool:
+    """True if ``task`` already carries a ``kind`` relation to ``other_id``."""
+    related = task.get("related_tasks")
+    if not isinstance(related, dict):
+        return False
+    return any(isinstance(t, dict) and t.get("id") == other_id for t in (related.get(kind) or []))
+
+
+# How many of the newest comments are searched for a closing comment whose POST timed out.
+# The one being looked for was written seconds ago, so it is on the first page unless
+# dozens of comments landed on the same ticket in that window.
+_CLOSE_REREAD_COMMENTS = 50
+
+# Slack allowed between this server's clock and Vikunja's when deciding whether a comment
+# found after a timed-out POST was written by that POST. Generous enough for ordinary clock
+# drift between two hosts; short enough that a close from minutes earlier cannot match.
+_CLOSE_CLOCK_SKEW = timedelta(seconds=30)
+
+
+def _is_ambiguous(exc: BaseException) -> bool:
+    """True if a failed write may still have landed.
+
+    ``request`` raises status 0 when the request never completed: a timeout or a dropped
+    connection. Vikunja may have applied the write before the response was lost, so status
+    0 on a write means "unknown", not "failed". Any HTTP status means Vikunja answered, and
+    its answer is definite.
+    """
+    return isinstance(exc, VikunjaAPIError) and exc.status_code == 0
+
+
+async def _find_closing_comment(
+    task_id: int, body: str, not_before: datetime, token: str
+) -> dict[str, Any] | None:
+    """The newest comment on ``task_id`` with body ``body``, created at or after ``not_before``.
+
+    Used only after a comment POST timed out, to learn whether it landed. The body match
+    alone is not enough: an identical closing comment written earlier (a close from before
+    the ticket was reopened, or the same line typed through ``comment_create``) would be
+    adopted as this call's comment. ``not_before`` is taken just before the POST, minus
+    :data:`_CLOSE_CLOCK_SKEW`, so only a comment from this call's window can match.
+
+    What remains: an identical comment written by someone else inside that window. Then
+    ``comment_id`` names their comment, and the ticket carries the closing line asked for.
+    The ``task_close`` docstring says so.
+    """
+    result = await request(
+        "GET",
+        f"/tasks/{task_id}/comments",
+        token,
+        params={"order_by": "desc", "per_page": _CLOSE_REREAD_COMMENTS, "page": 1},
+    )
+    for comment in _unwrap_items(result):
+        if not isinstance(comment, dict) or comment.get("comment") != body:
+            continue
+        created = _parse_timestamp(comment.get("created"))
+        if created is not None and created >= not_before:
+            return comment
+    return None
+
+
+async def _post_closing_comment(task_id: int, body: str, token: str) -> dict[str, Any]:
+    """POST the closing comment. After a timeout, re-read to find out whether it landed.
+
+    Raising from here has to mean "no closing comment was written", because that is what
+    ``task_close`` tells its caller a raise means, and a caller who believes it will retry
+    and post a second one. So on an ambiguous failure the comments are read back: found
+    means posted and the close continues, not found means not posted and the error is
+    raised. If the read-back fails too, the error says plainly that the outcome is unknown.
+    """
+    not_before = datetime.now(UTC) - _CLOSE_CLOCK_SKEW
+    try:
+        comment = await request("POST", f"/tasks/{task_id}/comments", token, json={"comment": body})
+    except VikunjaAPIError as exc:
+        if not _is_ambiguous(exc):
+            raise
+        try:
+            found = await _find_closing_comment(task_id, body, not_before, token)
+        except Exception as reread_exc:
+            raise VikunjaAPIError(
+                0,
+                f"task {task_id}: the closing comment POST did not complete ({exc.message}) "
+                f"and reading the comments back also failed ({reread_exc}). The comment "
+                "may or may not exist. Check comment_list before retrying, or a retry may "
+                "post it twice.",
+            ) from exc
+        if found is None:
+            raise
+        log.info("vikunja_close_comment_found_after_timeout", task_id=task_id)
+        return found
+    return comment if isinstance(comment, dict) else {}
+
+
+async def _close_task(
+    task_id: int, verdict: str, evidence: str, target: int | None, token: str
+) -> dict[str, Any]:
+    """Comment, relate, close — in that order — and report every step's outcome.
+
+    The order puts the evidence first: if a later step fails, the ticket is still open and
+    carries a comment saying why it should close, which is a state a human can finish by
+    hand. The reverse (closed, no evidence) is the state this tool exists to prevent.
+
+    Once the comment is posted, nothing raises. A failure after it returns the partial
+    outcome, ``failed_step`` and ``error``, because an exception would tell the caller
+    "nothing happened" when a comment was written.
+
+    A failure that may still have landed (a timeout, see :func:`_is_ambiguous`) is never
+    reported as definite. The comment step reads the comments back before deciding
+    (:func:`_post_closing_comment`). The relation and done steps re-read the task and
+    report the state they observe, with ``outcome: "reread"``. If that read fails too,
+    ``done`` is ``None`` and ``outcome`` is ``"unknown"``, because guessing either way is
+    what produces a duplicate comment or a sweep that counts a close that did not happen.
+    """
+    current = await request("GET", f"/tasks/{task_id}", token)
+    if not isinstance(current, dict):
+        raise VikunjaAPIError(0, f"task {task_id}: upstream returned no task body")
+    outcome: dict[str, Any] = {
+        "id": current.get("id", task_id),
+        "identifier": current.get("identifier"),
+        "done": bool(current.get("done")),
+        "verdict": verdict,
+        "comment_id": None,
+        "relation_added": False,
+        "already_done": bool(current.get("done")),
+    }
+    if outcome["already_done"]:
+        return outcome
+
+    kind = _CLOSE_RELATION.get(verdict) if target is not None else None
+    if kind is not None:
+        # Existence check before the first write. A target that does not exist would
+        # otherwise fail at the relation step, after the comment is already posted.
+        await request("GET", f"/tasks/{target}", token)
+
+    body = _closing_comment_html(_closing_line(verdict, evidence))
+    comment = await _post_closing_comment(task_id, body, token)
+    outcome["comment_id"] = comment.get("id")
+
+    step = "relation"
+    try:
+        if kind is not None and not _has_relation(current, kind, target):
+            await request(
+                "POST",
+                f"/tasks/{task_id}/relations",
+                token,
+                json={"other_task_id": target, "relation_kind": kind},
+            )
+            outcome["relation_added"] = True
+        step = "done"
+        closed = await _apply_task_update(task_id, token, {"done": True})
+        outcome["done"] = bool(closed.get("done")) if isinstance(closed, dict) else True
+    except Exception as exc:
+        # Broad by design: whatever failed, the comment is already written, and the caller
+        # needs to hear that rather than a bare exception.
+        log.warning("vikunja_close_partial", task_id=task_id, step=step, error=str(exc))
+        outcome["failed_step"] = step
+        outcome["error"] = str(exc)
+        if _is_ambiguous(exc):
+            await _reread_after_timeout(outcome, task_id, kind, target, token)
+    return outcome
+
+
+async def _reread_after_timeout(
+    outcome: dict[str, Any], task_id: int, kind: str | None, target: int | None, token: str
+) -> None:
+    """Replace a timed-out step's assumed result in ``outcome`` with the observed one.
+
+    Sets ``outcome["outcome"]`` to ``"reread"`` with ``done`` and ``relation_added`` as
+    the task now shows them, or to ``"unknown"`` with ``done: None`` if the task cannot
+    be read either.
+    """
+    try:
+        current = await request("GET", f"/tasks/{task_id}", token)
+    except Exception as exc:
+        log.warning("vikunja_close_reread_failed", task_id=task_id, error=str(exc))
+        outcome["done"] = None
+        outcome["outcome"] = "unknown"
+        return
+    if not isinstance(current, dict):
+        outcome["done"] = None
+        outcome["outcome"] = "unknown"
+        return
+    outcome["done"] = bool(current.get("done"))
+    if kind is not None and target is not None and not outcome["relation_added"]:
+        outcome["relation_added"] = _has_relation(current, kind, target)
+    outcome["outcome"] = "reread"
+
+
+@tool
+async def task_close(
+    task_id: int | str,
+    verdict: str,
+    evidence: str,
+    duplicate_of: int | str | None = None,
+    superseded_by: int | str | None = None,
+) -> dict:
+    """Close a ticket with a recorded verdict and the evidence for it, in one call.
+
+    Posts one comment whose first (and only) line is
+
+        Closing: <VERDICT> — <evidence>
+
+    then adds the relation the verdict implies, if any, then marks the ticket done. That
+    line is a **parsed format**: sweep tooling reads it back to learn why each ticket
+    closed. Its exact bytes are documented on ``_closing_line``.
+
+    - `task_id`, `duplicate_of`, `superseded_by` accept every form `task_get` does
+      (`473`, `"#454"`, `"#454 (id 473)"`, a task URL), with the same verification.
+    - `verdict`: `resolved` | `superseded` | `duplicate` | `obsolete` | `wontfix`.
+      `duplicate` **requires** `duplicate_of` and adds a `duplicateof` relation.
+      `superseded` takes an optional `superseded_by` and adds a `related` relation.
+      Either target with any other verdict is refused. A relation that already exists is
+      left as it is, and `relation_added` stays false.
+    - `evidence`: required, one line, at most 1000 characters. Write what shows the ticket
+      can close: `fixed in a1b2c3d (PR #12), test_foo covers it`.
+
+    Validation happens before any write, and so does a check that the relation target
+    exists, so a refused close writes nothing.
+
+    Returns `{id, identifier, done, verdict, comment_id, relation_added, already_done}`.
+    - **Already done:** nothing is written and `already_done` is true.
+    - **A later step failed after the comment was posted:** the reply adds `failed_step`
+      (`relation` or `done`) and `error`. If Vikunja refused the step, `done` is false
+      and the ticket is open, with the evidence comment on it. Retrying writes a second
+      comment, so it is better to finish the failed step with `task_relation_add` or
+      `task_update(done=true)`.
+    - **A step timed out** (Vikunja may have applied it anyway): the task is read back.
+      `done` and `relation_added` then report what the task shows, and `outcome` is
+      `"reread"`. If that read fails too, `done` is `null` and `outcome` is `"unknown"`:
+      check with `task_get` before doing anything else.
+    - **The comment itself** failing raises, and a raise means no closing comment was
+      written. After a timeout on the comment the comments are read back first. An
+      identical comment created in this call's window (30 s of clock slack) counts as
+      landed and the close continues. So after a timeout, `comment_id` can name an
+      identical comment someone else wrote in that window. If the read-back fails, the
+      error says the comment may exist.
+
+    This is an explicit, per-ticket decision by its caller. Nothing here closes a ticket
+    because a PR merged (see `task_link_commit`).
+    """
+    verdict, evidence, target = _check_close_args(
+        task_id, verdict, evidence, duplicate_of, superseded_by
+    )
+    return await _close_task(task_id, verdict, evidence, target, caller_token())
+
+
 @tool
 async def task_delete(task_id: int | str) -> dict:
     """Delete a task. Irreversible."""
@@ -2059,7 +2867,9 @@ async def task_delete(task_id: int | str) -> dict:
 
 
 @tool
-async def tasks_bulk_update(task_ids: list[int | str], values: dict) -> dict:
+async def tasks_bulk_update(
+    task_ids: list[int | str], values: dict, return_mode: str = "full"
+) -> dict:
     """Apply the same field changes to many tasks in one call (migration throughput).
 
     `values` is a partial task object, e.g. `{"done": true}` or `{"priority": 4}`; it is
@@ -2070,7 +2880,12 @@ async def tasks_bulk_update(task_ids: list[int | str], values: dict) -> dict:
     This is the bulk counterpart to ``_apply_task_update``. The single-task path is a
     ``PATCH``; the bulk path has no ``PATCH`` to use, so it names the columns explicitly
     in ``fields`` — same outcome, server-side, without N requests.
+
+    The full reply carries every updated task's whole body: ~150k characters for one
+    15-ticket close. `return_mode="minimal"` returns `{count, ids, fields}` instead. `ids`
+    and `fields` are what Vikunja reports it wrote, not an echo of the request.
     """
+    _check_return_mode(return_mode)
     # `PUT /tasks/bulk` is a full replace *per task*: without `fields`, every column absent
     # from `values` is reset to its zero value on every task in the list (ticket #333 /
     # task 347 — same root cause as #173, verified destroying description, priority and
@@ -2083,7 +2898,25 @@ async def tasks_bulk_update(task_ids: list[int | str], values: dict) -> dict:
     # only the named fields are written and the rest of each task is left untouched.
     # The undocumented dependency is discharged, not worked around.
     body = {"task_ids": task_ids, "fields": list(values.keys()), "values": values}
-    return await request("PUT", "/tasks/bulk", caller_token(), json=body)
+    result = await request("PUT", "/tasks/bulk", caller_token(), json=body)
+    return _minimal_bulk(result) if return_mode == "minimal" else result
+
+
+def _minimal_bulk(result: Any) -> dict[str, Any]:
+    """``{count, ids, fields}`` from a ``PUT /tasks/bulk`` reply.
+
+    Read from the reply (v2's ``BulkTask`` echoes ``task_ids`` and ``fields``), so the
+    minimal answer still reports what the server says it did. When the reply does not carry
+    them, the values are ``None`` rather than copied from the request. A minimal reply that
+    silently repeated the request would confirm nothing.
+    """
+    body = result if isinstance(result, dict) else {}
+    ids = body.get("task_ids")
+    return {
+        "count": len(ids) if isinstance(ids, list) else None,
+        "ids": ids if isinstance(ids, list) else None,
+        "fields": body.get("fields"),
+    }
 
 
 # ===========================================================================
@@ -2134,11 +2967,19 @@ async def label_delete(label_id: int) -> dict:
 
 
 @tool
-async def task_label_add(task_id: int | str, label_id: int) -> dict:
-    """Attach an existing label to a task."""
-    return await request(
+async def task_label_add(task_id: int | str, label_id: int, return_mode: str = "full") -> dict:
+    """Attach an existing label to a task.
+
+    `return_mode="minimal"` returns `{task_id, label_id, created}`. That has the same key
+    set as every other minimal reply, so a sweep can record each write the same way.
+    """
+    _check_return_mode(return_mode)
+    result = await request(
         "POST", f"/tasks/{task_id}/labels", caller_token(), json={"label_id": label_id}
     )
+    if return_mode == "minimal" and isinstance(result, dict):
+        return {"task_id": task_id, **_pick(result, ("label_id", "created"))}
+    return result
 
 
 @tool
@@ -2164,14 +3005,20 @@ async def comment_list(task_id: int | str, page: int = 1, per_page: int = 50) ->
 
 
 @tool
-async def comment_create(task_id: int | str, comment: str) -> dict:
-    """Add a comment to a task. `comment` may contain markdown or HTML."""
-    return await request(
+async def comment_create(task_id: int | str, comment: str, return_mode: str = "full") -> dict:
+    """Add a comment to a task. `comment` may contain markdown or HTML.
+
+    `return_mode="minimal"` returns `{id, created}` instead of the stored comment and its
+    author object.
+    """
+    _check_return_mode(return_mode)
+    result = await request(
         "POST",
         f"/tasks/{task_id}/comments",
         caller_token(),
         json={"comment": _md_to_html(comment)},
     )
+    return _pick(result, ("id", "created")) if return_mode == "minimal" else result
 
 
 @tool
@@ -2227,11 +3074,23 @@ async def task_assignee_remove(task_id: int | str, user_id: int) -> dict:
 
 @tool
 async def task_relation_add(
-    task_id: int | str, other_task_id: int | str, relation_kind: str
+    task_id: int | str, other_task_id: int | str, relation_kind: str, return_mode: str = "full"
 ) -> dict:
-    """Relate two tasks. `relation_kind` is e.g. `subtask`, `related`, `blocking`, `precedes`."""
+    """Relate two tasks. `relation_kind` is e.g. `subtask`, `related`, `blocking`, `precedes`.
+
+    `return_mode="minimal"` returns `{task_id, other_task_id, relation_kind, created}`,
+    without the `created_by` user object.
+
+    Only `task_id`'s `updated` moves. Vikunja shows the relation on both tasks but leaves
+    the other task's `updated` alone (measured on v2.5), so a `since`-based sweep sees the
+    change on this side only.
+    """
+    _check_return_mode(return_mode)
     body = {"other_task_id": other_task_id, "relation_kind": relation_kind}
-    return await request("POST", f"/tasks/{task_id}/relations", caller_token(), json=body)
+    result = await request("POST", f"/tasks/{task_id}/relations", caller_token(), json=body)
+    if return_mode == "minimal":
+        return _pick(result, ("task_id", "other_task_id", "relation_kind", "created"))
+    return result
 
 
 @tool

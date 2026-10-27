@@ -92,7 +92,8 @@ reach Vikunja as one identity, which silently destroys the per-agent attribution
 
 The server covers the full Vikunja resource surface, each tool pinned to the correct verb
 by a wire test and by a sweep against the live router — 71 as of v0.2.0, plus
-`backlog_summary` (v0.7.0) and `task_link_commit` (v0.8.0) for **73**.
+`backlog_summary` (v0.7.0), `task_link_commit` (v0.8.0), and `tasks_export` and
+`task_close` (v0.13.0) for **75**.
 
 | Group | Tools |
 |-------|-------|
@@ -103,6 +104,7 @@ by a wire test and by a sweep against the live router — 71 as of v0.2.0, plus
 | Assignees | `task_assignee_list`, `task_assignee_add`, `task_assignee_remove`, `task_assignees_add_bulk` |
 | Relations / reminders | `task_relation_add`, `task_relation_remove`, `task_reminders_set` |
 | Backlinks | `task_link_commit` |
+| Ticket sweeps | `tasks_export`, `task_close` |
 | Kanban buckets / views | `bucket_list`, `bucket_create`, `bucket_update`, `bucket_delete`, `task_bucket_move`, `view_list`, `view_get`, `view_create`, `view_update`, `view_delete` |
 | Labels | `label_list`, `label_get`, `label_create`, `label_update`, `label_delete`, `task_label_add`, `task_label_remove` |
 | Comments | `comment_list`, `comment_create`, `comment_delete` |
@@ -231,6 +233,25 @@ ambiguity — and the convenience `url` field is only added on the projected pat
 `{"truncated": true, "total_pages": N, "total": M, "count": K}` so one page is not mistaken
 for a whole answer. `total` is the size of the whole result set and `count` is the rows in
 *this* response — v1 could not report the former at all, and v2 does.
+
+**Narrower still (v0.13.0).** `task_get(fields=[...])` returns only the named keys plus
+`id`; a name the task lacks is listed in `unknown_fields` rather than returned as `null`.
+`task_get(include_comments=true)` adds every comment as `{id, author, created, text,
+truncated}`. `text` is plain text, cut at 500 characters. That saves a `comment_list`
+call per ticket.
+
+The write tools that echo a body accept `return_mode="minimal"`. It is opt-in, and `"full"`
+stays the default:
+
+| Tool | Minimal reply |
+|---|---|
+| `task_update` | `{id, identifier, done, updated}` |
+| `tasks_bulk_update` | `{count, ids, fields}`, as Vikunja reports them |
+| `comment_create` | `{id, created}` |
+| `task_label_add` | `{task_id, label_id, created}` |
+| `task_relation_add` | `{task_id, other_task_id, relation_kind, created}` |
+
+For scale: one 15-ticket `tasks_bulk_update` close returned ~150k characters in full mode.
 
 ## Markdown descriptions & comments
 
@@ -377,6 +398,76 @@ because a PR merged guesses at intent, and guessing wrong closes work that is no
 Both features store their metadata as a visible footer in the ticket description, under one
 shared convention — see [docs/markers.md](docs/markers.md), which is worth reading before
 touching the parser.
+
+### Ticket sweeps — `tasks_export` and `task_close`
+
+A periodic "is this ticket still open for a reason?" sweep needs two things: to know which
+tickets changed since the last pass, and to close the ones that are done with a reason
+recorded.
+
+**`tasks_export(project_id, include_done=true, since=None)`** returns every task in a
+project, one compact row each:
+
+```json
+{ "project_id": 7, "generated_at": "2026-10-27T21:00:00Z", "since": null,
+  "include_done": true, "excluded_task_ids": [], "count": 1286, "rows": [
+    { "id": 519, "identifier": "#500", "title": "...", "done": false, "done_at": null,
+      "created": "...", "updated": "...", "priority": 2, "labels": ["type:bug"],
+      "created_by": "agent-one", "relations": {"related": [480]},
+      "linked_refs": [{"ref_type": "pr", "ref_url": "https://github.com/o/r/pull/16"}] } ] }
+```
+
+- **Complete or it fails.** It pages internally at 1,000 rows, the API maximum, and checks
+  the rows against Vikunja's `total`. An error on any page raises. So does a result set
+  that changes mid-walk and is still changing on the retry. There is no `truncated` flag
+  to miss.
+- **`since`** keeps tasks whose `updated` is at or after it, filtered by the server.
+  Measured on v2.5, a new comment, a label, a field edit, and a relation added *on that
+  task* all move `updated`. A relation added from the *other* task does not.
+- **Size.** About 410 bytes per row. A 1,286-task project exported in two requests to
+  about 0.55 MB. That is meant to land in a file the caller reads with `jq`, not in
+  context.
+- **Exclusions.** Ids in `VIKUNJA_SUMMARY_EXCLUDE_IDS` are left out, exactly as in
+  `backlog_summary`, so `count` matches its `total`.
+
+**`task_close(task_id, verdict, evidence, duplicate_of=None, superseded_by=None)`** writes
+one comment whose first line is
+
+```
+Closing: RESOLVED — fixed in a1b2c3d (PR #12)
+```
+
+then adds the relation the verdict implies, then marks the task done. That line is a
+**parsed format**, stored as escaped text rather than rendered markdown so it reads back
+byte for byte:
+
+```
+^Closing: (RESOLVED|SUPERSEDED|DUPLICATE|OBSOLETE|WONTFIX) — (.+)$
+```
+
+The separator is a space, an em dash (U+2014), and a space.
+
+- `verdict` is one of `resolved`, `superseded`, `duplicate`, `obsolete`, `wontfix`.
+  `duplicate` requires `duplicate_of` and adds `duplicateof`. `superseded` optionally
+  takes `superseded_by` and adds `related`.
+- `evidence` is required, one line, at most 1,000 characters.
+- Every argument is validated, and the relation target is checked to exist, **before
+  anything is written**.
+- An already-done task is a no-op: `already_done: true`, nothing written.
+- If the relation or close step fails after the comment is posted, the reply says so with
+  `failed_step` and `error` instead of raising. When Vikunja refused the step, the ticket
+  is left open with its evidence, and a human can finish the close.
+- **A timeout is not reported as a failure.** Vikunja may have applied the write before
+  the response was lost. After a timed-out step `task_close` reads the task back and
+  reports what it shows (`outcome: "reread"`), or `done: null` with `outcome: "unknown"`
+  if it can't. A timed-out comment is looked for before anything is raised, so a raise
+  still means no closing comment was written. Only an identical comment created within
+  30 seconds before the POST, or later, counts as the one that landed. An older one,
+  from an earlier close for example, is never adopted.
+
+The reply is `{id, identifier, done, verdict, comment_id, relation_added, already_done}`.
+
+`task_close` is a write tool. Grant it per agent rather than by default.
 
 ### Duplicate detection
 
