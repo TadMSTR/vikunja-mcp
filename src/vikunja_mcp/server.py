@@ -2541,6 +2541,11 @@ def _closing_line(verdict: str, evidence: str) -> str:
     Changing a byte of this breaks every consumer silently, since their match just stops
     finding closes. ``test_closing_line_is_byte_exact`` pins it.
     """
+    # SECURITY[accepted]: the line has no provenance. Any caller of `comment_create` can
+    # write the same bytes, and the comment author is the same per-agent token either way.
+    # This tool only emits the line; a consumer must read it as an unverified claim by its
+    # author and join it with the task's `done`/`done_at` (and the audit log, where one is
+    # kept) before counting it as a close. Audit: 2026-10-27/ticket-lifecycle-2026-10-p1.
     return f"Closing: {verdict.upper()}{_CLOSING_SEPARATOR}{evidence}"
 
 
