@@ -27,7 +27,7 @@ flowchart TB
         direction TB
         AU[auth.py<br/>lift the bearer]
         HK1[hooks.py<br/>before handlers]
-        SV[server.py<br/>73 tool functions]
+        SV[server.py<br/>75 tool functions]
         HK2[hooks.py<br/>after handlers]
         CL[client.py<br/>HTTP to Vikunja]
         TE[telemetry.py<br/>best-effort sinks]
