@@ -26,7 +26,7 @@ claude mcp add vikunja \
        ghcr.io/tadmstr/vikunja-mcp:latest
 ```
 
-That is the whole single-user setup. `claude mcp list` should now show `vikunja`, with 73
+That is the whole single-user setup. `claude mcp list` should now show `vikunja`, with 75
 tools available.
 
 Something wrong? Ask the server what it thinks its configuration is — it answers without
@@ -238,7 +238,7 @@ for a whole answer. `total` is the size of the whole result set and `count` is t
 `id`; a name the task lacks is listed in `unknown_fields` rather than returned as `null`.
 `task_get(include_comments=true)` adds every comment as `{id, author, created, text,
 truncated}`. `text` is plain text, cut at 500 characters. That saves a `comment_list`
-call per ticket.
+call per ticket. The two combine: `comments` is kept when `fields` is also given.
 
 The write tools that echo a body accept `return_mode="minimal"`. It is opt-in, and `"full"`
 stays the default:
@@ -288,7 +288,7 @@ and handler signatures: [`docs/extension-hooks.md`](docs/extension-hooks.md).
 
 ## Signals for agents
 
-Three features exist because an agent decides what to do from whatever the tracker hands
+These features exist because an agent decides what to do from whatever the tracker hands
 back at that moment. A rule in a prompt file erodes under context pressure; a field in the
 response does not.
 
@@ -305,9 +305,9 @@ when the age is unknown, because "not known to be stale" and "known to be fresh"
 different claims.
 
 The limitation at its sharpest: a bulk import rewrites `updated` on every task at once.
-Forge's tracker was migrated on 2026-07-19, so a month later its oldest open ticket read as
-33 days old, including tickets whose text predated the import by months. Nothing was fresh;
-every timestamp was. Set `VIKUNJA_STALE_AFTER_DAYS` accordingly after an import.
+After a tracker migration, a month later the oldest open ticket read as 33 days old,
+including tickets whose text predated the import by months. Nothing was fresh; every
+timestamp was. Set `VIKUNJA_STALE_AFTER_DAYS` accordingly after an import.
 
 ### `backlog_summary`
 
@@ -340,9 +340,9 @@ know which case it is:
   `labels_not_counted` before trusting a zero.
 
 `by_label` is keyed by label **title**, and titles are not unique — every label sharing a title
-is one bucket, counted over all of their ids together. Forge's tracker carries `source:github`
-as both id 1 and id 38; before v0.10.0 the reported count for that title silently depended on
-where the cap happened to fall.
+is one bucket, counted over all of their ids together. A tracker can carry `source:github`
+under two ids; before v0.10.0 the reported count for that title silently depended on where
+the cap happened to fall.
 
 If your tracker has an "anchor" task carrying every label deliberately, name it in
 `VIKUNJA_SUMMARY_EXCLUDE_IDS` — otherwise it lands in every label bucket and inflates each
@@ -350,9 +350,7 @@ count by exactly one, which is worse than an obviously broken number.
 
 > **Breaking in v0.10.0:** `max_label_buckets`'s default changed from a fixed `25` to every
 > label in scope, and `labels_not_counted` was added to the response. Callers passing an
-> explicit `max_label_buckets` are unaffected. The two consumer skills that call this tool
-> (`ticket-batch-select`, `ticket-triage-sweep`) are already updated for it, in
-> `agent-platform-skills@2e6c122`.
+> explicit `max_label_buckets` are unaffected.
 
 ### Idempotency keys
 
@@ -423,7 +421,8 @@ project, one compact row each:
   to miss.
 - **`since`** keeps tasks whose `updated` is at or after it, filtered by the server.
   Measured on v2.5, a new comment, a label, a field edit, and a relation added *on that
-  task* all move `updated`. A relation added from the *other* task does not.
+  task* all move `updated`. A relation added from the *other* task does not, so a `since`
+  export misses a task whose only change is an inbound relation.
 - **Size.** About 410 bytes per row. A 1,286-task project exported in two requests to
   about 0.55 MB. That is meant to land in a file the caller reads with `jq`, not in
   context.
@@ -431,7 +430,7 @@ project, one compact row each:
   `backlog_summary`, so `count` matches its `total`.
 
 **`task_close(task_id, verdict, evidence, duplicate_of=None, superseded_by=None)`** writes
-one comment whose first line is
+one comment whose first line is `Closing: <VERDICT> — <evidence>`, for example
 
 ```
 Closing: RESOLVED — fixed in a1b2c3d (PR #12)
@@ -446,6 +445,11 @@ byte for byte:
 ```
 
 The separator is a space, an em dash (U+2014), and a space.
+
+The line is not proof that `task_close` wrote it. Anyone who can call `comment_create` can
+write the same bytes, and the comment's author is the same whichever tool posted it. A
+consumer should read the line as a claim by its author, and check the task's `done` and
+`done_at` (and the audit log, if one is kept) before counting it as a close.
 
 - `verdict` is one of `resolved`, `superseded`, `duplicate`, `obsolete`, `wontfix`.
   `duplicate` requires `duplicate_of` and adds `duplicateof`. `superseded` optionally
